@@ -196,8 +196,9 @@ function seedDatabase(db: DatabaseSync): void {
 
   const categories = [
     ['category-breakfast', 'Breakfast', 1],
-    ['category-lunch', 'Lunch', 2],
-    ['category-sides', 'Sides', 3]
+    ['category-burgers', 'Burgers', 2],
+    ['category-sides', 'Sides', 3],
+    ['category-drinks', 'Drinks', 4]
   ];
   for (const category of categories) {
     db.prepare(
@@ -205,10 +206,17 @@ function seedDatabase(db: DatabaseSync): void {
     ).run(...category);
   }
 
+  db.prepare('UPDATE menu_items SET category_id = ? WHERE menu_item_id = ?').run('category-burgers', 'item-burger');
+
   const items = [
     ['item-breakfast-wrap', 'category-breakfast', 'Breakfast Wrap', 'BRK-WRAP', 650],
-    ['item-burger', 'category-lunch', 'Classic Burger', 'LUNCH-BURGER', 825],
-    ['item-fries', 'category-sides', 'Seasoned Fries', 'SIDE-FRIES', 325]
+    ['item-burger', 'category-burgers', 'Classic Burger', 'LUNCH-BURGER', 825],
+    ['item-truffle-burger', 'category-burgers', 'Truffle Bistro Burger', 'BURGER-TRUFFLE', 1650],
+    ['item-double-smash-burger', 'category-burgers', 'Double Smash Burger', 'BURGER-DOUBLE', 1295],
+    ['item-fries', 'category-sides', 'Seasoned Fries', 'SIDE-FRIES', 325],
+    ['item-cola', 'category-drinks', 'Cola', 'DRINK-COLA', 250],
+    ['item-lemonade', 'category-drinks', 'Fresh Lemonade', 'DRINK-LEMONADE', 325],
+    ['item-iced-tea', 'category-drinks', 'Iced Tea', 'DRINK-TEA', 275]
   ];
   for (const item of items) {
     db.prepare(
@@ -227,6 +235,22 @@ function seedDatabase(db: DatabaseSync): void {
     'INSERT OR IGNORE INTO menu_item_modifier_groups (menu_item_id, modifier_group_id, display_order, min_selections, max_selections) VALUES (?, ?, ?, ?, ?)'
   ).run('item-burger', 'group-cheese', 1, 0, 1);
 
+  db.prepare('INSERT OR IGNORE INTO modifier_groups (modifier_group_id, group_name) VALUES (?, ?)').run(
+    'group-truffle-size',
+    'Size'
+  );
+  db.prepare(
+    'INSERT OR IGNORE INTO modifiers (modifier_id, modifier_group_id, modifier_name, modifier_sku, price_adjustment_minor) VALUES (?, ?, ?, ?, ?)'
+  ).run('modifier-truffle-double', 'group-truffle-size', 'Double', 'MOD-TRUFFLE-DOUBLE', 400);
+  db.prepare(
+    'INSERT OR IGNORE INTO menu_item_modifier_groups (menu_item_id, modifier_group_id, display_order, min_selections, max_selections) VALUES (?, ?, ?, ?, ?)'
+  ).run('item-truffle-burger', 'group-truffle-size', 1, 0, 1);
+  for (const menuItemId of ['item-burger', 'item-double-smash-burger']) {
+    db.prepare(
+      'INSERT OR IGNORE INTO menu_item_modifier_groups (menu_item_id, modifier_group_id, display_order, min_selections, max_selections) VALUES (?, ?, ?, ?, ?)'
+    ).run(menuItemId, 'group-truffle-size', 1, 0, 1);
+  }
+
   const schedules = [
     ['schedule-breakfast', 'Breakfast', '00:00', '10:59'],
     ['schedule-lunch', 'Lunch', '11:00', '23:59']
@@ -239,8 +263,19 @@ function seedDatabase(db: DatabaseSync): void {
   for (const mapping of [
     ['schedule-breakfast', 'item-breakfast-wrap'],
     ['schedule-breakfast', 'item-fries'],
+    ['schedule-breakfast', 'item-burger'],
+    ['schedule-breakfast', 'item-truffle-burger'],
+    ['schedule-breakfast', 'item-double-smash-burger'],
+    ['schedule-breakfast', 'item-cola'],
+    ['schedule-breakfast', 'item-lemonade'],
+    ['schedule-breakfast', 'item-iced-tea'],
     ['schedule-lunch', 'item-burger'],
-    ['schedule-lunch', 'item-fries']
+    ['schedule-lunch', 'item-truffle-burger'],
+    ['schedule-lunch', 'item-double-smash-burger'],
+    ['schedule-lunch', 'item-fries'],
+    ['schedule-lunch', 'item-cola'],
+    ['schedule-lunch', 'item-lemonade'],
+    ['schedule-lunch', 'item-iced-tea']
   ]) {
     db.prepare('INSERT OR IGNORE INTO menu_item_schedule (schedule_id, menu_item_id) VALUES (?, ?)').run(...mapping);
   }

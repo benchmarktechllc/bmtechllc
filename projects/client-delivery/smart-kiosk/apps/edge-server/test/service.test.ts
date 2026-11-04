@@ -3,6 +3,42 @@ import { openDatabase } from '../src/database.js';
 import { KioskService } from '../src/service.js';
 
 describe('KioskService', () => {
+  it('offers burger and drink items in the local menu', () => {
+    const database = openDatabase(':memory:');
+    const service = new KioskService(database);
+
+    const menu = service.getMenu('schedule-lunch');
+
+    expect(menu.categories.map((category) => category.category_name)).toEqual(['Burgers', 'Sides', 'Drinks']);
+    expect(menu.items.filter((item) => item.category_id === 'category-burgers')).toHaveLength(3);
+    expect(menu.items.filter((item) => item.category_id === 'category-drinks')).toHaveLength(3);
+    database.close();
+  });
+
+  it('prices the Truffle Bistro Burger double size option', () => {
+    const database = openDatabase(':memory:');
+    const service = new KioskService(database);
+
+    const quote = service.quote({
+      items: [{ menuItemId: 'item-truffle-burger', quantity: 1, modifiers: [{ modifierId: 'modifier-truffle-double', quantity: 1 }] }]
+    });
+
+    expect(quote.totalAmountMinor).toBe(2050);
+    database.close();
+  });
+
+  it('prices the double size option on each burger item', () => {
+    const database = openDatabase(':memory:');
+    const service = new KioskService(database);
+
+    const quote = service.quote({
+      items: [{ menuItemId: 'item-burger', quantity: 1, modifiers: [{ modifierId: 'modifier-truffle-double', quantity: 1 }] }]
+    });
+
+    expect(quote.totalAmountMinor).toBe(1225);
+    database.close();
+  });
+
   it('creates an idempotent order and completes mock dispatches after approval', () => {
     const database = openDatabase(':memory:');
     const service = new KioskService(database);
