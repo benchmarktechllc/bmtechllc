@@ -158,13 +158,25 @@ export class KioskService {
         this.db.prepare("UPDATE integration_dispatches SET dispatch_status = 'ACKNOWLEDGED', sent_at = ?, last_response_at = ? WHERE transaction_id = ? AND destination_type = 'POS'").run(now, now, transactionId);
         this.db.prepare("UPDATE orders SET order_status = 'COMPLETED', updated_at = ? WHERE transaction_id = ?").run(now, transactionId);
       } else {
-        this.db.prepare("UPDATE orders SET order_status = 'PAYMENT_FAILED', updated_at = ? WHERE transaction_id = ?").run(now, transactionId);
+        // A terminal response is a failed attempt, not a failed order. Keeping the
+        // order available for payment lets the kiosk offer a clear retry path.
+        this.db.prepare("UPDATE orders SET order_status = 'AWAITING_PAYMENT', updated_at = ? WHERE transaction_id = ?").run(now, transactionId);
       }
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;
     }
+    return this.getOrder(transactionId);
+  }
+
+  cancelOrder(transactionId: string) {
+    const order = this.getOrder(transactionId);
+    if (!order) throw new Error('Order not found');
+    if (order.order_status !== 'AWAITING_PAYMENT') throw new Error('Order can no longer be cancelled');
+
+    this.db.prepare("UPDATE orders SET order_status = 'CANCELLED', updated_at = ? WHERE transaction_id = ?")
+      .run(new Date().toISOString(), transactionId);
     return this.getOrder(transactionId);
   }
 

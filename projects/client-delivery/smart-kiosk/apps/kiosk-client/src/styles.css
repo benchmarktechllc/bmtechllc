@@ -49,6 +49,61 @@ button {
   font: inherit;
 }
 
+.kiosk-notice {
+  position: fixed;
+  z-index: 20;
+  top: 1.25rem;
+  left: 50%;
+  width: min(calc(100% - 2rem), 34rem);
+  margin: 0;
+  transform: translateX(-50%);
+  border: 1px solid #767779;
+  border-radius: 0.625rem;
+  padding: 0.85rem 1rem;
+  background: #2f3133;
+  color: #d9d9d9;
+  font-size: 0.9rem;
+  font-weight: 600;
+  text-align: center;
+  box-shadow: 0 0.75rem 2rem rgb(0 0 0 / 28%);
+}
+
+.kiosk-notice--error {
+  border-color: #ffb690;
+  color: #ffcfb6;
+}
+
+.kiosk-notice--info {
+  border-color: #789888;
+  color: #c8e5d4;
+}
+
+.kiosk-idle-warning {
+  position: fixed;
+  z-index: 30;
+  inset: 0;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 0.5rem;
+  padding: 2rem;
+  background: rgb(18 20 22 / 88%);
+  color: #d9d9d9;
+  text-align: center;
+}
+
+.kiosk-idle-warning p {
+  margin: 0;
+  color: #adcebd;
+  font-size: clamp(2rem, 5vw, 3rem);
+  font-weight: 600;
+}
+
+.kiosk-idle-warning span {
+  color: #aaabae;
+  font-size: 1rem;
+}
+
 .attract-screen {
   min-height: 100dvh;
   overflow: hidden;
@@ -702,6 +757,18 @@ button {
   line-height: 1.2;
 }
 
+.kiosk-upsell__card-content > div {
+  display: grid;
+  justify-items: center;
+  gap: 0.4rem;
+}
+
+.kiosk-upsell__card-content > div > span {
+  color: #adcebd;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
 .kiosk-upsell__card-content button {
   display: inline-flex;
   width: 13.2rem;
@@ -890,6 +957,11 @@ button {
   cursor: pointer;
 }
 
+.kiosk-checkout-payment__contactless:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
 .kiosk-checkout-payment__contactless img {
   display: block;
 }
@@ -931,6 +1003,12 @@ button {
   cursor: pointer;
 }
 
+.kiosk-checkout-payment__cancel:disabled,
+.kiosk-checkout-payment__scenarios button:disabled {
+  cursor: wait;
+  opacity: 0.5;
+}
+
 .kiosk-checkout-payment__scenarios {
   display: grid;
   width: min(100%, 28rem);
@@ -954,6 +1032,58 @@ button {
   font-size: 0.875rem;
   font-weight: 600;
   cursor: pointer;
+}
+
+.kiosk-checkout-payment__result {
+  display: grid;
+  width: min(100%, 28rem);
+  justify-items: center;
+  gap: 0.9rem;
+  border: 2px solid #767779;
+  border-radius: 1.25rem;
+  padding: 1.35rem;
+  background: #2f3133;
+}
+
+.kiosk-checkout-payment__result h2,
+.kiosk-checkout-payment__result p {
+  margin: 0;
+}
+
+.kiosk-checkout-payment__result h2 {
+  color: #ffcfb6;
+  font-size: 1.4rem;
+  font-weight: 600;
+}
+
+.kiosk-checkout-payment__result p {
+  color: #d9d9d9;
+  line-height: 1.4;
+}
+
+.kiosk-checkout-payment__result button,
+.kiosk-order-peek {
+  border: 2px solid #789888;
+  border-radius: 0.625rem;
+  background: #789888;
+  color: #121416;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.kiosk-checkout-payment__result button {
+  min-height: 3rem;
+  padding: 0.65rem 1.1rem;
+}
+
+.kiosk-order-peek {
+  position: fixed;
+  z-index: 10;
+  right: 1.5rem;
+  bottom: 1.5rem;
+  min-height: 3.25rem;
+  padding: 0.65rem 1rem;
+  box-shadow: 0 0.75rem 2rem rgb(0 0 0 / 28%);
 }
 
 .kiosk-completed-screen {
@@ -1120,6 +1250,13 @@ button {
 
   .kiosk-checkout-payment__cancel {
     margin-top: 2.5rem;
+  }
+
+  .kiosk-order-peek {
+    right: 1rem;
+    bottom: 1rem;
+    max-width: calc(100% - 2rem);
+    font-size: 0.8rem;
   }
 
   .kiosk-completed h1 {

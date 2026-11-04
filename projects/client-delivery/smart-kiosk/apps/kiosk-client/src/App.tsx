@@ -45,6 +45,8 @@ type Menu = {
 type Order = { transaction_id: string; order_status: string; total_amount_minor: number };
 type MenuItem = Menu['items'][number];
 type Customization = { item: MenuItem; quantity: number; size: 'single' | 'double' };
+type Notice = { tone: 'info' | 'error'; message: string };
+type ProcessingAction = 'checkout' | 'payment' | 'cancelling';
 
 const menuItemImages: Record<string, string> = {
   'item-breakfast-wrap': breakfastWrapImage,
@@ -71,6 +73,32 @@ const menuItemDescriptions: Record<string, string> = {
 const formatMoney = (amount: number, currency = 'USD') =>
   new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(amount / 100);
 
+const paymentResultCopy: Record<PaymentScenario, string> = {
+  APPROVED: 'Payment approved.',
+  DECLINED: 'Your payment was declined. Please try another card or payment method.',
+  CANCELLED: 'The payment was cancelled. You can try again when you are ready.',
+  TIMED_OUT: 'The payment terminal timed out. Please try again.',
+  FAILED: 'We could not complete that payment. Please try again or ask a team member for help.'
+};
+
+function displayOrderNumber(order: Order): string {
+  return order.transaction_id.replaceAll('-', '').slice(0, 8).toUpperCase();
+}
+
+function KioskOverlays({ notice, isIdleWarning }: { notice?: Notice; isIdleWarning: boolean }) {
+  return (
+    <>
+      {notice && <p className={`kiosk-notice kiosk-notice--${notice.tone}`} role={notice.tone === 'error' ? 'alert' : 'status'}>{notice.message}</p>}
+      {isIdleWarning && (
+        <section className="kiosk-idle-warning" role="alertdialog" aria-label="Your order will reset soon">
+          <p>Still choosing?</p>
+          <span>Touch anywhere to continue your order.</span>
+        </section>
+      )}
+    </>
+  );
+}
+
 function mergeCartLine(current: CartLine[], nextLine: CartLine): CartLine[] {
   const existing = current.find((line) =>
     line.menuItemId === nextLine.menuItemId
@@ -91,11 +119,16 @@ export function App() {
   const [quote, setQuote] = useState<OrderQuote>();
   const [activeCategory, setActiveCategory] = useState<string>();
   const [message, setMessage] = useState('Loading local menu…');
+  const [notice, setNotice] = useState<Notice>();
   const [order, setOrder] = useState<Order>();
   const [confirmedOrder, setConfirmedOrder] = useState<Order>();
   const [customization, setCustomization] = useState<Customization>();
   const [isUpselling, setIsUpselling] = useState(false);
   const [isCheckingOut, setIsCheckingOut] = useState(false);
+  const [isQuoting, setIsQuoting] = useState(false);
+  const [isProcessing, setIsProcessing] = useState<ProcessingAction>();
+  const [paymentResult, setPaymentResult] = useState<PaymentScenario>();
+  const [isIdleWarning, setIsIdleWarning] = useState(false);
 
   useEffect(() => {
     void loadMenu();
@@ -104,8 +137,11 @@ export function App() {
   useEffect(() => {
     if (cart.length === 0) {
       setQuote(undefined);
+      setIsQuoting(false);
       return;
     }
+    setIsQuoting(true);
+    setQuote(undefined);
     void fetch(`${edgeUrl}/v1/quotes`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -116,8 +152,52 @@ export function App() {
         return (await response.json()) as OrderQuote;
       })
       .then(setQuote)
-      .catch((error: unknown) => setMessage(error instanceof Error ? error.message : 'Unable to update total'));
+      .catch((error: unknown) => {
+        const errorMessage = error instanceof Error ? error.message : 'Unable to update total';
+        setMessage(errorMessage);
+        setNotice({ tone: 'error', message: errorMessage });
+      })
+      .finally(() => setIsQuoting(false));
   }, [cart]);
+
+  useEffect(() => {
+    if (isAttracting || confirmedOrder) {
+      setIsIdleWarning(false);
+      return undefined;
+    }
+
+    let warningTimer: number | undefined;
+    let resetTimer: number | undefined;
+    const armTimers = () => {
+      window.clearTimeout(warningTimer);
+      window.clearTimeout(resetTimer);
+      warningTimer = window.setTimeout(() => setIsIdleWarning(true), 45_000);
+      resetTimer = window.setTimeout(() => {
+        setCart([]);
+        setOrder(undefined);
+        setPaymentResult(undefined);
+        setCustomization(undefined);
+        setIsUpselling(false);
+        setIsCheckingOut(false);
+        setIsIdleWarning(false);
+        setIsAttracting(true);
+        setMessage('Order reset after inactivity');
+      }, 60_000);
+    };
+    const recordActivity = () => {
+      setIsIdleWarning(false);
+      armTimers();
+    };
+    armTimers();
+    window.addEventListener('pointerdown', recordActivity);
+    window.addEventListener('keydown', recordActivity);
+    return () => {
+      window.clearTimeout(warningTimer);
+      window.clearTimeout(resetTimer);
+      window.removeEventListener('pointerdown', recordActivity);
+      window.removeEventListener('keydown', recordActivity);
+    };
+  }, [confirmedOrder, isAttracting]);
 
   const visibleItems = useMemo(
     () => menu?.items.filter((item) => !activeCategory || item.category_id === activeCategory) ?? [],
@@ -136,11 +216,6 @@ export function App() {
       { categoryId: findCategory(/drink/i)?.category_id ?? 'category-drinks', icon: menuDrinkIcon, label: 'Drinks' }
     ];
   }, [menu]);
-
-  const displayItems = useMemo(() => {
-    if (visibleItems.length === 0) return [];
-    return Array.from({ length: Math.max(visibleItems.length, 3) }, (_, index) => visibleItems[index % visibleItems.length]!);
-  }, [visibleItems]);
 
   const activeCategoryLabel = categoryNavigation.find((category) => category.categoryId === activeCategory)?.label
     ?? menu?.categories.find((category) => category.category_id === activeCategory)?.category_name
@@ -173,9 +248,12 @@ export function App() {
       setIsUpselling(false);
       setIsCheckingOut(false);
       setConfirmedOrder(undefined);
+      setPaymentResult(undefined);
       setMessage(`Showing ${data.activeScheduleId.replace('schedule-', '')} menu`);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Local edge service is unavailable');
+      const errorMessage = error instanceof Error ? error.message : 'Local edge service is unavailable';
+      setMessage(errorMessage);
+      setNotice({ tone: 'error', message: errorMessage });
     }
   }
 
@@ -199,6 +277,7 @@ export function App() {
     const line = customizationLine(customization);
     setCart((current) => mergeCartLine(current, line));
     setMessage('Added to cart');
+    setNotice({ tone: 'info', message: `${customization.item.item_name} added to your order.` });
     setCustomization(undefined);
   }
 
@@ -209,80 +288,123 @@ export function App() {
       return quantity > 0 ? [{ ...line, quantity }] : [];
     }));
     setOrder(undefined);
+    setPaymentResult(undefined);
   }
 
   function addUpsellItem(menuItemId: string, itemName: string) {
     setCart((current) => mergeCartLine(current, { menuItemId, quantity: 1, modifiers: [] }));
     setMessage(`${itemName} added to cart`);
+    setNotice({ tone: 'info', message: `${itemName} added to your order.` });
   }
 
   function continueToCheckout() {
     setIsUpselling(false);
     setIsCheckingOut(true);
+    setPaymentResult(undefined);
+    setNotice(undefined);
   }
 
-  function cancelCheckout() {
-    if (order) {
+  async function cancelCheckout() {
+    if (!order) {
       setCart([]);
-      void pay('CANCELLED');
+      setIsCheckingOut(false);
+      setMessage('Order cancelled');
+      setNotice({ tone: 'info', message: 'Your order was cancelled.' });
       return;
     }
-    setCart([]);
-    setIsCheckingOut(false);
-    setMessage('Order cancelled');
+
+    setIsProcessing('cancelling');
+    try {
+      const response = await fetch(`${edgeUrl}/v1/orders/${order.transaction_id}/cancel`, { method: 'POST' });
+      if (!response.ok) throw new Error('Unable to cancel this order. Please ask a team member for help.');
+      setCart([]);
+      setOrder(undefined);
+      setPaymentResult(undefined);
+      setIsCheckingOut(false);
+      setMessage('Order cancelled');
+      setNotice({ tone: 'info', message: 'Your order was cancelled.' });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unable to cancel this order.';
+      setMessage(errorMessage);
+      setNotice({ tone: 'error', message: errorMessage });
+    } finally {
+      setIsProcessing(undefined);
+    }
   }
 
   async function checkout(items = cart) {
     if (items.length === 0) return;
-    const response = await fetch(`${edgeUrl}/v1/orders`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ items, idempotencyKey: crypto.randomUUID(), orderType: 'TAKE_OUT' })
-    });
-    if (!response.ok) return setMessage('Order could not be created. Review your cart and try again.');
-    const created = (await response.json()) as Order;
-    setOrder(created);
-    setIsUpselling(false);
-    setMessage('Order created. Choose a simulated payment outcome.');
+    setIsProcessing('checkout');
+    setNotice(undefined);
+    try {
+      const response = await fetch(`${edgeUrl}/v1/orders`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ items, idempotencyKey: crypto.randomUUID(), orderType: 'TAKE_OUT' })
+      });
+      if (!response.ok) throw new Error('Order could not be created. Review your cart and try again.');
+      const created = (await response.json()) as Order;
+      setOrder(created);
+      setPaymentResult(undefined);
+      setIsUpselling(false);
+      setMessage('Order created. Choose a simulated payment outcome.');
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Order could not be created.';
+      setMessage(errorMessage);
+      setNotice({ tone: 'error', message: errorMessage });
+    } finally {
+      setIsProcessing(undefined);
+    }
   }
 
   async function pay(scenario: PaymentScenario) {
     if (!order) return;
-    const response = await fetch(`${edgeUrl}/v1/orders/${order.transaction_id}/payment`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ scenario })
-    });
-    if (!response.ok) return setMessage('Payment could not be completed. Your cart remains available.');
-    const updated = (await response.json()) as Order;
-    setOrder(updated);
-    if (updated.order_status === 'COMPLETED') {
-      setMessage('Simulated payment approved. Mock kitchen and POS dispatches acknowledged.');
-      setCart([]);
-      setOrder(undefined);
-      setIsCheckingOut(false);
-      setConfirmedOrder(updated);
-    } else {
-      setMessage(`Simulated payment ${scenario.toLowerCase().replace('_', ' ')}. Your cart remains available.`);
-      setOrder(undefined);
-      setIsCheckingOut(false);
+    setIsProcessing('payment');
+    try {
+      const response = await fetch(`${edgeUrl}/v1/orders/${order.transaction_id}/payment`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ scenario })
+      });
+      if (!response.ok) throw new Error('Payment could not be completed. Your cart remains available.');
+      const updated = (await response.json()) as Order;
+      setOrder(updated);
+      if (updated.order_status === 'COMPLETED') {
+        setMessage('Simulated payment approved. Mock kitchen and POS dispatches acknowledged.');
+        setCart([]);
+        setOrder(undefined);
+        setIsCheckingOut(false);
+        setConfirmedOrder(updated);
+      } else {
+        setMessage(`Simulated payment ${scenario.toLowerCase().replace('_', ' ')}. Your cart remains available.`);
+        setPaymentResult(scenario);
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Payment could not be completed. Your cart remains available.';
+      setMessage(errorMessage);
+      setNotice({ tone: 'error', message: errorMessage });
+    } finally {
+      setIsProcessing(undefined);
     }
   }
 
   function startNewOrder() {
     setConfirmedOrder(undefined);
     setOrder(undefined);
+    setPaymentResult(undefined);
     setCustomization(undefined);
     setIsUpselling(false);
     setIsCheckingOut(false);
     setCart([]);
     setIsAttracting(true);
+    setNotice(undefined);
     setMessage('Ready for a new order');
   }
 
   if (isAttracting) {
     return (
       <main className="attract-screen">
+        <KioskOverlays notice={notice} isIdleWarning={isIdleWarning} />
         <button
           type="button"
           className="attract-screen__start"
@@ -300,8 +422,9 @@ export function App() {
   if (confirmedOrder) {
     return (
       <main className="kiosk-completed-screen" aria-labelledby="completed-order-title">
+        <KioskOverlays notice={notice} isIdleWarning={isIdleWarning} />
         <section className="kiosk-completed">
-          <h1 id="completed-order-title">Order #10005</h1>
+          <h1 id="completed-order-title">Order #{displayOrderNumber(confirmedOrder)}</h1>
           <p>Your receipt is printing.</p>
           <button type="button" onClick={startNewOrder}>Start New Order</button>
           <span className="sr-only" role="status">Order {confirmedOrder.transaction_id} completed successfully.</span>
@@ -318,6 +441,7 @@ export function App() {
 
     return (
       <main className="kiosk-customization-screen">
+        <KioskOverlays notice={notice} isIdleWarning={isIdleWarning} />
         <div className="kiosk-customization">
           <h1>Customize Order</h1>
           <div className="kiosk-customization__layout">
@@ -392,6 +516,11 @@ export function App() {
             </section>
           </div>
         </div>
+        {cart.length > 0 && (
+          <button type="button" className="kiosk-order-peek" onClick={() => setCustomization(undefined)}>
+            View Order · {cart.reduce((sum, line) => sum + line.quantity, 0)} items · {formatMoney(quote?.totalAmountMinor ?? 0, menu?.currencyCode)}
+          </button>
+        )}
       </main>
     );
   }
@@ -403,6 +532,7 @@ export function App() {
 
     return (
       <main className="kiosk-checkout-screen">
+        <KioskOverlays notice={notice} isIdleWarning={isIdleWarning} />
         <section className="kiosk-checkout-summary" aria-labelledby="order-summary-title">
           <header>
             <h1 id="order-summary-title">Order Summary</h1>
@@ -431,21 +561,35 @@ export function App() {
         </section>
         <section className="kiosk-checkout-payment" aria-labelledby="payment-title">
           {!order ? (
-            <button type="button" className="kiosk-checkout-payment__contactless" onClick={() => void checkout()} aria-label="Start payment">
+            <button
+              type="button"
+              className="kiosk-checkout-payment__contactless"
+              onClick={() => void checkout()}
+              aria-label="Start payment"
+              disabled={isProcessing === 'checkout' || isQuoting}
+            >
               <img src={checkoutContactless} alt="" />
             </button>
+          ) : paymentResult ? (
+            <div className="kiosk-checkout-payment__result" role="status">
+              <h2>Payment not completed</h2>
+              <p>{paymentResultCopy[paymentResult]}</p>
+              <button type="button" onClick={() => setPaymentResult(undefined)}>Try Another Payment</button>
+            </div>
           ) : (
             <div className="kiosk-checkout-payment__scenarios">
-              <span>Choose a simulated payment response</span>
+              <span>Test terminal response</span>
               {(['APPROVED', 'DECLINED', 'CANCELLED', 'TIMED_OUT', 'FAILED'] as PaymentScenario[]).map((scenario) => (
-                <button type="button" key={scenario} onClick={() => void pay(scenario)}>{scenario.replace('_', ' ')}</button>
+                <button type="button" key={scenario} disabled={isProcessing === 'payment'} onClick={() => void pay(scenario)}>{scenario.replace('_', ' ')}</button>
               ))}
             </div>
           )}
           <h1 id="payment-title">Payment</h1>
-          <p>Tap, insert, or swipe your preferred method below.</p>
+          <p>{isProcessing === 'checkout' ? 'Starting secure payment…' : 'Tap, insert, or swipe your preferred method below.'}</p>
           <span className="kiosk-checkout-payment__secure">Secure Encrypted Transaction</span>
-          <button type="button" className="kiosk-checkout-payment__cancel" onClick={cancelCheckout}>Cancel Order</button>
+          <button type="button" className="kiosk-checkout-payment__cancel" disabled={Boolean(isProcessing)} onClick={() => void cancelCheckout()}>
+            {isProcessing === 'cancelling' ? 'Cancelling Order…' : 'Cancel Order'}
+          </button>
         </section>
       </main>
     );
@@ -459,6 +603,7 @@ export function App() {
 
     return (
       <main className="kiosk-upsell-screen">
+        <KioskOverlays notice={notice} isIdleWarning={isIdleWarning} />
         <section className="kiosk-upsell" aria-labelledby="upsell-title">
           <h1 id="upsell-title">Complete Your Meal?</h1>
           <p>Perfect pairings to elevate your dining experience.</p>
@@ -467,7 +612,10 @@ export function App() {
               <article className="kiosk-upsell__card" key={item.menuItemId}>
                 <img className="kiosk-upsell__image" src={item.image} alt={item.alt} />
                 <div className="kiosk-upsell__card-content">
-                  <h2>{item.name}</h2>
+                  <div>
+                    <h2>{item.name}</h2>
+                    <span>{formatMoney(menu?.items.find((menuItem) => menuItem.menu_item_id === item.menuItemId)?.base_price_minor ?? 0, menu?.currencyCode)}</span>
+                  </div>
                   <button type="button" onClick={() => addUpsellItem(item.menuItemId, item.name)}>
                     <img src={upsellAddIcon} alt="" />
                     Add
@@ -480,12 +628,18 @@ export function App() {
             No Thanks, Continue to Checkout
           </button>
         </section>
+        {cart.length > 0 && (
+          <button type="button" className="kiosk-order-peek" onClick={() => setIsUpselling(false)}>
+            View Order · {cart.reduce((sum, line) => sum + line.quantity, 0)} items · {formatMoney(quote?.totalAmountMinor ?? 0, menu?.currencyCode)}
+          </button>
+        )}
       </main>
     );
   }
 
   return (
     <main className="kiosk-menu-screen">
+      <KioskOverlays notice={notice} isIdleWarning={isIdleWarning} />
       <aside className="kiosk-category-nav" aria-label="Menu categories">
         {categoryNavigation.map((category) => {
           const isActive = category.categoryId === activeCategory;
@@ -506,10 +660,10 @@ export function App() {
       <section className="kiosk-menu-content" aria-label={`${activeCategoryLabel} menu`}>
         <h1>{activeCategoryLabel}</h1>
         <p className="sr-only" role="status">{message}</p>
-        {displayItems.length > 0 ? (
+        {visibleItems.length > 0 ? (
           <div className="kiosk-menu-grid">
-            {displayItems.map((item, index) => (
-              <article className="kiosk-menu-card" key={`${item.menu_item_id}-${index}`}>
+            {visibleItems.map((item) => (
+              <article className="kiosk-menu-card" key={item.menu_item_id}>
                 <img className="kiosk-menu-card__image" src={menuItemImages[item.menu_item_id] ?? classicBurgerImage} alt={item.item_name} />
                 <div className="kiosk-menu-card__content">
                   <h2>{item.item_name}</h2>
@@ -554,11 +708,11 @@ export function App() {
         <footer className="kiosk-cart__footer">
           <div className="kiosk-cart__total">
             <span>Total</span>
-            <strong>{formatMoney(quote?.totalAmountMinor ?? 0, menu?.currencyCode)}</strong>
+            <strong>{isQuoting ? 'Updating…' : formatMoney(quote?.totalAmountMinor ?? 0, menu?.currencyCode)}</strong>
           </div>
           {!order ? (
-            <button type="button" disabled={!quote} onClick={() => setIsUpselling(true)}>
-              Checkout
+            <button type="button" disabled={!quote || isQuoting} onClick={() => setIsUpselling(true)}>
+              {isQuoting ? 'Updating Order…' : 'Checkout'}
             </button>
           ) : (
             <div className="kiosk-cart__payment">

@@ -60,7 +60,7 @@ describe('KioskService', () => {
     database.close();
   });
 
-  it('preserves a failed-payment order for retry', () => {
+  it('preserves a declined-payment order for retry', () => {
     const database = openDatabase(':memory:');
     const service = new KioskService(database);
     const order = service.createOrder({
@@ -70,8 +70,26 @@ describe('KioskService', () => {
     });
 
     const failed = service.startMockPayment(order.transaction_id, 'DECLINED');
-    expect(failed?.order_status).toBe('PAYMENT_FAILED');
+    expect(failed?.order_status).toBe('AWAITING_PAYMENT');
     expect(failed?.dispatches).toHaveLength(0);
+
+    const completed = service.startMockPayment(order.transaction_id, 'APPROVED');
+    expect(completed?.order_status).toBe('COMPLETED');
+    expect(completed?.payments).toHaveLength(2);
+    database.close();
+  });
+
+  it('cancels an awaiting-payment order', () => {
+    const database = openDatabase(':memory:');
+    const service = new KioskService(database);
+    const order = service.createOrder({
+      idempotencyKey: '4c1c317b-d950-44bc-9dc3-31ea42cb4f75',
+      orderType: 'TAKE_OUT',
+      items: [{ menuItemId: 'item-fries', quantity: 1, modifiers: [] }]
+    });
+
+    const cancelled = service.cancelOrder(order.transaction_id);
+    expect(cancelled?.order_status).toBe('CANCELLED');
     database.close();
   });
 });

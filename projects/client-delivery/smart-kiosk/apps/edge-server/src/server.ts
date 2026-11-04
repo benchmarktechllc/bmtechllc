@@ -66,6 +66,15 @@ app.post('/v1/orders/:transactionId/payment', async (request, reply) => {
   }
 });
 
+app.post('/v1/orders/:transactionId/cancel', async (request, reply) => {
+  const { transactionId } = request.params as { transactionId: string };
+  try {
+    return service.cancelOrder(transactionId);
+  } catch (error) {
+    return reply.code(409).send({ error: 'CANCEL_REJECTED', message: error instanceof Error ? error.message : 'Unable to cancel order' });
+  }
+});
+
 app.setErrorHandler((error, _request, reply) => {
   app.log.error({ err: error, requestId: randomUUID() }, 'Unhandled edge-service error');
   reply.code(500).send({ error: 'INTERNAL_ERROR' });
