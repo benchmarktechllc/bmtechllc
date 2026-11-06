@@ -63,11 +63,89 @@ The scheduled sync detects additions and edits in the range since its stored
 cursor. A deleted older Discord message is not yet removed from the corpus;
 that needs a future reconciliation pass or Discord gateway delete events.
 
+## Portal knowledge-base sync
+
+`benchmark-sync-portal` reads `portal/content/**/*.md` from this repo (the
+files behind the portal `/index.json` manifest). It does not crawl the built
+site. A page is indexed only when frontmatter `status` is `published` and the
+page is not stale. Stale uses the portal rule: whole calendar months since
+`updated` are at least `reviewCycleMonths` (default 6). Draft, archived, and
+stale pages are skipped. A page that was indexed earlier and is no longer
+eligible is deleted from `document_chunks` on the next real run.
+
+Each page is one source, `portal/<section>/<slug>.md`, with `source_type`
+`kb_page`. Edits replace that source, the same way a Discord channel is
+replaced. Chunk metadata includes the title, section, heading, tags, owner,
+visibility, and URL.
+
+Preview without embeddings or database writes:
+
+```bash
+benchmark-sync-portal --dry-run
+```
+
+From this directory the command finds `portal/content` by walking up from the
+working directory. Override it with `--content-dir` or `PORTAL_CONTENT_DIR`.
+`--index-json` (or `PORTAL_INDEX_JSON`) can further restrict the sync to a
+built `/index.json`: an entry must be `published` and not `isStale`.
+`PORTAL_BASE_URL` is optional; when set, chunk URLs use that prefix.
+
+```bash
+DATABASE_URL=...
+OPENAI_API_KEY=...
+PORTAL_BASE_URL=https://example.internal/bmtechllc/portal   # optional
+```
+
+Keep those values in the secret manager or the gitignored `.env` / `.env.local`
+files. The workflow `.github/workflows/portal-ingestion.yml` runs at 04:17 UTC
+daily, on manual dispatch, and when `portal/content` changes on `main`. It
+uses the existing GitHub environment `discord-ingestion` (the same one as
+Discord sync) for `DATABASE_URL` and `OPENAI_API_KEY`. No new environment is
+required.
+
+## Trello sync
+
+`benchmark-sync-trello` reads the BMTech General Board
+(`https://trello.com/b/tIvVZqio/bmtech-general-board`, short link `tIvVZqio`).
+Pass another board with `--board` or `TRELLO_BOARD_ID` (id or short link).
+
+The sync pulls open lists and cards, plus descriptions, checklists, and
+comments. Each card is one source, `trello/<shortLink>/<cardId>.md`, with
+`source_type` `trello`. Metadata includes the board, list/column (`list` and
+`column`), card id, labels, due date, and URL. Cards that leave the open
+board, including cards on archived lists, are removed from the corpus. A card
+whose `dateLastActivity` is unchanged skips the comment fetch and the
+embedding call.
+
+```bash
+TRELLO_API_KEY=...
+TRELLO_TOKEN=...
+TRELLO_BOARD_ID=tIvVZqio   # optional; this short link is the default
+DATABASE_URL=...
+OPENAI_API_KEY=...
+```
+
+Do not commit those values. The token needs read access to the board. Run a
+backfill with:
+
+```bash
+benchmark-sync-trello
+```
+
+`.github/workflows/trello-ingestion.yml` runs at 04:47 UTC daily and on
+manual dispatch. It uses the `discord-ingestion` environment, alongside the
+Discord and portal jobs. Add `TRELLO_API_KEY` and `TRELLO_TOKEN` as secrets
+there. `TRELLO_BOARD_ID` is an optional Actions variable; leave it empty to
+keep `tIvVZqio`. After the secrets are saved, run the workflow once by hand
+for the first backfill. The schedule then keeps the board current.
+
 ## Discord ask bot
 
 `benchmark-discord-ask` is a separate always-on gateway process. It calls
-`run_agent` and posts the reply. Ingestion stays on `benchmark-sync-discord`;
-this bot does not store Discord messages or rebuild the corpus.
+`run_agent` and posts the reply. Ingestion stays on the sync commands
+(`benchmark-sync-discord`, `benchmark-sync-portal`, and `benchmark-sync-trello`);
+this bot does not store source text or rebuild the corpus. Once those syncs
+write chunks, the bot can answer from them with no gateway change.
 
 People can ask in two ways:
 
@@ -222,7 +300,9 @@ src/benchmark_cli/
   storage/         PostgreSQL/pgvector + FTS schema and queries
   retrieval.py     Concurrent hybrid retrieval and pure RRF fusion
   evaluation/      Golden dataset loading, metrics, CLI
-  discord_sync.py  Scheduled channel ingestion
+  discord_sync.py  Scheduled Discord channel ingestion
+  portal_sync.py   Published portal knowledge-base ingestion
+  trello_sync.py   Trello board ingestion
   discord_ask.py   Gateway bot for #ask-bmtech and /ask
 tests/unit/        Chunking, embeddings, RRF, metric, and Discord reply tests
 data/evaluation/   30-query golden-dataset template

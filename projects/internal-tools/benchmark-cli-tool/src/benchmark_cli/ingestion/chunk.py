@@ -42,7 +42,9 @@ def token_count(text: str) -> int:
     encoding = _encoding()
     if encoding is None:
         return len(re.findall(r"\w+|[^\w\s]", text))
-    return len(encoding.encode(text))
+    # Knowledge-base pages quote tokenizer control tokens such as <|endoftext|>.
+    # Count those as ordinary characters so a documented token cannot abort ingestion.
+    return len(encoding.encode(text, disallowed_special=()))
 
 
 def _unit_boundary(previous: RawUnit, current: RawUnit) -> bool:

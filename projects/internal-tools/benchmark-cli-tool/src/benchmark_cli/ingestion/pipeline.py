@@ -117,9 +117,41 @@ def metadata_for(chunk: Chunk, path: Path, source_type: str) -> ChunkMetadata:
         )
         if first.extra.get("section"):
             common["section"] = str(first.extra["section"])
+    elif source_type == "kb_page":
+        tags = first.extra.get("tags") or []
+        common.update(
+            section=str(first.extra.get("section") or path.stem),
+            title=str(first.extra.get("title") or path.stem),
+            url=_optional_text(first.extra.get("url")),
+            owner=_optional_text(first.extra.get("owner")),
+            tags=[str(tag) for tag in tags] if isinstance(tags, list) else [],
+            visibility=_optional_text(first.extra.get("visibility")),
+            kb_section=_optional_text(first.extra.get("kb_section")),
+            kb_status=_optional_text(first.extra.get("kb_status")),
+        )
+    elif source_type == "trello":
+        labels = first.extra.get("labels") or []
+        common.update(
+            section=str(first.extra.get("section") or first.extra.get("column") or path.stem),
+            title=str(first.extra.get("title") or path.stem),
+            board=str(first.extra.get("board") or ""),
+            column=str(first.extra.get("column") or first.extra.get("section") or ""),
+            card_id=str(first.extra.get("card_id") or ""),
+            labels=[str(label) for label in labels] if isinstance(labels, list) else [],
+            due=_optional_text(first.extra.get("due")),
+            url=str(first.extra.get("url") or ""),
+            speakers=_speakers_in_order(chunk.units),
+        )
     else:
         common.update(section=str(first.extra.get("section", path.stem)))
     return ChunkMetadata.model_validate(common)
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def embedding_input(chunk: Chunk, metadata: ChunkMetadata, source_filename: str) -> str:
@@ -133,9 +165,28 @@ def embedding_prefix(metadata: ChunkMetadata, source_filename: str) -> str:
         header = f"Policy document: {source_filename}; section: {metadata.section}."
     elif metadata.source_type == "discord":
         timezone = f"; timezone: {metadata.timezone}" if metadata.timezone else ""
-        header = f"Discord channel: {metadata.channel}; dates: {metadata.date_start} to {metadata.date_end}{timezone}."
+        header = (
+            f"Discord channel: {metadata.channel}; "
+            f"dates: {metadata.date_start} to {metadata.date_end}{timezone}."
+        )
+    elif metadata.source_type == "kb_page":
+        section = metadata.kb_section or metadata.section
+        header = (
+            f"Knowledge base page: {metadata.title}; section: {section}; "
+            f"heading: {metadata.section}."
+        )
+    elif metadata.source_type == "trello":
+        labels = f"; labels: {', '.join(metadata.labels)}" if metadata.labels else ""
+        due = f"; due: {metadata.due}" if metadata.due else ""
+        header = (
+            f"Trello card: {metadata.title}; board: {metadata.board}; "
+            f"list: {metadata.column}{labels}{due}."
+        )
     else:
-        header = f"Meeting transcript: {metadata.meeting}; date: {metadata.date or 'unknown'}; section: {metadata.section or 'general'}."
+        header = (
+            f"Meeting transcript: {metadata.meeting}; date: {metadata.date or 'unknown'}; "
+            f"section: {metadata.section or 'general'}."
+        )
     return header
 
 
@@ -232,7 +283,7 @@ def ingest_units(
             "chunk_text": chunk.text,
             "content_sha256": content_hash(chunk.text),
             "token_count": chunk.token_count,
-            "metadata": metadata.model_dump(mode="json"),
+            "metadata": metadata.as_metadata(),
             "embedding": vectors_by_hash[content_hash(chunk.text)],
         }
         for chunk_index, chunk, metadata in row_entries

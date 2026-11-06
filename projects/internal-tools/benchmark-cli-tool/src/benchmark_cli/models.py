@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 class ChunkMetadata(BaseModel):
     """Provenance retained for a persisted document chunk."""
 
-    source_type: Literal["discord", "transcript", "policy_doc"]
+    source_type: Literal["discord", "transcript", "policy_doc", "kb_page", "trello"]
     date: str
     ingested_at: str
     section: str | None = None
@@ -23,6 +23,18 @@ class ChunkMetadata(BaseModel):
     message_count: int | None = Field(default=None, ge=1)
     split_unit: bool = False
     embed_prefix: str = ""
+    title: str | None = None
+    url: str | None = None
+    owner: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    visibility: str | None = None
+    kb_section: str | None = None
+    kb_status: str | None = None
+    board: str | None = None
+    column: str | None = None
+    card_id: str | None = None
+    labels: list[str] = Field(default_factory=list)
+    due: str | None = None
 
     @model_validator(mode="after")
     def validate_source_fields(self) -> ChunkMetadata:
@@ -32,7 +44,23 @@ class ChunkMetadata(BaseModel):
             raise ValueError("transcript chunk metadata requires meeting.")
         if self.source_type == "policy_doc" and not self.section:
             raise ValueError("policy_doc chunk metadata requires section.")
+        if self.source_type == "kb_page" and (not self.section or not self.title):
+            raise ValueError("kb_page chunk metadata requires section and title.")
+        if self.source_type == "trello" and not (
+            self.board and self.column and self.card_id and self.title and self.url
+        ):
+            raise ValueError(
+                "trello chunk metadata requires board, column, card_id, title, and url."
+            )
         return self
+
+    def as_metadata(self) -> dict[str, Any]:
+        """JSON object stored on ``document_chunks.metadata``."""
+        payload = self.model_dump(mode="json")
+        if self.source_type == "trello":
+            # ``column`` is the Trello list. Keep ``list`` as the name the board uses.
+            payload["list"] = self.column
+        return payload
 
 
 QueryCategory = Literal["lookup", "multi_chunk", "filter", "unanswerable"]
