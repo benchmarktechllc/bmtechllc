@@ -39,6 +39,23 @@ describe('KioskService', () => {
     database.close();
   });
 
+  it('applies configured promotions before tax and records the final total', () => {
+    const database = openDatabase(':memory:');
+    const service = new KioskService(database, {
+      taxRateBps: 825,
+      promotions: [{ code: 'WELCOME10', type: 'PERCENT_BPS', value: 1000 }]
+    });
+
+    const quote = service.quote({
+      items: [{ menuItemId: 'item-fries', quantity: 2, modifiers: [] }],
+      promotionCode: 'welcome10'
+    });
+    expect(quote).toMatchObject({ subtotalMinor: 650, discountAmountMinor: 65, taxAmountMinor: 48, totalAmountMinor: 633 });
+    expect(() => service.quote({ items: [{ menuItemId: 'item-fries', quantity: 1, modifiers: [] }], promotionCode: 'EXPIRED' }))
+      .toThrow('Promotion code is not available');
+    database.close();
+  });
+
   it('creates an idempotent order and completes mock dispatches after approval', () => {
     const database = openDatabase(':memory:');
     const service = new KioskService(database);
@@ -90,6 +107,47 @@ describe('KioskService', () => {
 
     const cancelled = service.cancelOrder(order.transaction_id);
     expect(cancelled?.order_status).toBe('CANCELLED');
+    database.close();
+  });
+
+  it('lets staff take an item offline and restore it', () => {
+    const database = openDatabase(':memory:');
+    const service = new KioskService(database);
+
+    expect(service.getMenu('schedule-lunch').items.some((item) => item.menu_item_id === 'item-fries')).toBe(true);
+    expect(service.setItemAvailability('item-fries', false)).toMatchObject({ itemName: 'Seasoned Fries', isAvailable: false });
+    expect(service.getMenu('schedule-lunch').items.some((item) => item.menu_item_id === 'item-fries')).toBe(false);
+
+    expect(service.setItemAvailability('item-fries', true)).toMatchObject({ itemName: 'Seasoned Fries', isAvailable: true });
+    expect(service.getMenu('schedule-lunch').items.some((item) => item.menu_item_id === 'item-fries')).toBe(true);
+    database.close();
+  });
+
+  it('returns an operational staff overview', () => {
+    const database = openDatabase(':memory:');
+    const service = new KioskService(database);
+    service.setItemAvailability('item-fries', false);
+    const order = service.createOrder({
+      idempotencyKey: '6b7a9c5c-2d50-4996-9a13-a6cdf0f0ecdc',
+      orderType: 'TAKE_OUT',
+      items: [{ menuItemId: 'item-cola', quantity: 1, modifiers: [] }]
+    });
+
+    const overview = service.getStaffOverview();
+    expect(overview.integrationMode).toBe('mock');
+    expect(overview.unavailableItems).toEqual([{ menu_item_id: 'item-fries', item_name: 'Seasoned Fries' }]);
+    expect(overview.menuItems.find((item) => item.menu_item_id === 'item-fries')?.is_available).toBe(0);
+    expect(overview.orderStatusCounts).toContainEqual({ status: 'AWAITING_PAYMENT', count: 1 });
+    expect(overview.recentOrders[0]?.transaction_id).toBe(order.transaction_id);
+    database.close();
+  });
+
+  it('lets staff update a menu price used by subsequent quotes', () => {
+    const database = openDatabase(':memory:');
+    const service = new KioskService(database);
+
+    expect(service.setItemPrice('item-fries', 400)).toMatchObject({ itemName: 'Seasoned Fries', basePriceMinor: 400 });
+    expect(service.quote({ items: [{ menuItemId: 'item-fries', quantity: 1, modifiers: [] }] }).totalAmountMinor).toBe(400);
     database.close();
   });
 });

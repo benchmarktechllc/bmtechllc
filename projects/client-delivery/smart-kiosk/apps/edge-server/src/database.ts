@@ -99,6 +99,7 @@ const schema = `
     order_status TEXT NOT NULL,
     currency_code TEXT NOT NULL,
     subtotal_minor INTEGER NOT NULL,
+    discount_amount_minor INTEGER NOT NULL DEFAULT 0,
     tax_amount_minor INTEGER NOT NULL,
     tip_amount_minor INTEGER NOT NULL DEFAULT 0,
     total_amount_minor INTEGER NOT NULL,
@@ -178,8 +179,16 @@ export function openDatabase(path: string): DatabaseSync {
       throw error;
     }
   }
+  ensureAdditiveColumns(db);
   seedDatabase(db);
   return db;
+}
+
+function ensureAdditiveColumns(db: DatabaseSync): void {
+  const orderColumns = db.prepare('PRAGMA table_info(orders)').all() as Array<{ name: string }>;
+  if (!orderColumns.some((column) => column.name === 'discount_amount_minor')) {
+    db.exec('ALTER TABLE orders ADD COLUMN discount_amount_minor INTEGER NOT NULL DEFAULT 0');
+  }
 }
 
 function seedDatabase(db: DatabaseSync): void {

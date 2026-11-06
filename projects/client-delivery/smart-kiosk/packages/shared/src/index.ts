@@ -14,7 +14,8 @@ export const cartLineSchema = z.object({
 });
 
 export const quoteRequestSchema = z.object({
-  items: z.array(cartLineSchema).min(1)
+  items: z.array(cartLineSchema).min(1),
+  promotionCode: z.string().trim().min(1).max(32).optional()
 });
 
 export const paymentScenarioSchema = z.enum([
@@ -55,11 +56,21 @@ export const startPaymentRequestSchema = z.object({
   scenario: paymentScenarioSchema
 });
 
+export const staffItemAvailabilityRequestSchema = z.object({
+  isAvailable: z.boolean()
+});
+
+export const staffItemPriceRequestSchema = z.object({
+  basePriceMinor: moneySchema
+});
+
 export type CartLine = z.infer<typeof cartLineSchema>;
 export type QuoteRequest = z.infer<typeof quoteRequestSchema>;
 export type CreateOrderRequest = z.infer<typeof createOrderRequestSchema>;
 export type PaymentScenario = z.infer<typeof paymentScenarioSchema>;
 export type PaymentStatus = z.infer<typeof paymentStatusSchema>;
+export type StaffItemAvailabilityRequest = z.infer<typeof staffItemAvailabilityRequestSchema>;
+export type StaffItemPriceRequest = z.infer<typeof staffItemPriceRequestSchema>;
 
 export interface PricedModifier {
   modifierId: string;
@@ -83,6 +94,7 @@ export interface PricedLine {
 export interface OrderQuote {
   currencyCode: string;
   subtotalMinor: number;
+  discountAmountMinor: number;
   taxAmountMinor: number;
   totalAmountMinor: number;
   lines: PricedLine[];

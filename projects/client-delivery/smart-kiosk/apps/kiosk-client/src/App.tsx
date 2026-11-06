@@ -27,6 +27,7 @@ import checkoutContactless from './assets/checkout-contactless.svg';
 // Use Vite's same-origin development proxy by default. Set VITE_EDGE_URL only
 // when the browser should connect directly to a separately hosted edge node.
 const edgeUrl = import.meta.env.VITE_EDGE_URL ?? '';
+const savedOrderKey = 'smart-kiosk:order:v1';
 
 type Menu = {
   currencyCode: string;
@@ -47,6 +48,15 @@ type MenuItem = Menu['items'][number];
 type Customization = { item: MenuItem; quantity: number; size: 'single' | 'double' };
 type Notice = { tone: 'info' | 'error'; message: string };
 type ProcessingAction = 'checkout' | 'payment' | 'cancelling';
+type StaffOverview = {
+  generatedAt: string;
+  integrationMode: 'mock';
+  orderStatusCounts: Array<{ status: string; count: number }>;
+  dispatchStatusCounts: Array<{ status: string; count: number }>;
+  unavailableItems: Array<{ menu_item_id: string; item_name: string }>;
+  menuItems: Array<{ menu_item_id: string; item_name: string; base_price_minor: number; is_available: number }>;
+  recentOrders: Array<{ transaction_id: string; order_status: string; total_amount_minor: number; created_at: string }>;
+};
 
 const menuItemImages: Record<string, string> = {
   'item-breakfast-wrap': breakfastWrapImage,
@@ -85,6 +95,23 @@ function displayOrderNumber(order: Order): string {
   return order.transaction_id.replaceAll('-', '').slice(0, 8).toUpperCase();
 }
 
+function readSavedOrder(): { cart: CartLine[]; promotionCode: string } {
+  try {
+    const parsed: unknown = JSON.parse(window.sessionStorage.getItem(savedOrderKey) ?? 'null');
+    if (!parsed || typeof parsed !== 'object') return { cart: [], promotionCode: '' };
+    const candidate = parsed as { version?: unknown; cart?: unknown; promotionCode?: unknown };
+    if (candidate.version !== 1 || !Array.isArray(candidate.cart)) return { cart: [], promotionCode: '' };
+    const cart = candidate.cart.filter((line): line is CartLine => (
+      line !== null && typeof line === 'object' && typeof (line as CartLine).menuItemId === 'string'
+      && Number.isInteger((line as CartLine).quantity) && (line as CartLine).quantity > 0
+      && Array.isArray((line as CartLine).modifiers)
+    ));
+    return { cart, promotionCode: typeof candidate.promotionCode === 'string' ? candidate.promotionCode.slice(0, 32) : '' };
+  } catch {
+    return { cart: [], promotionCode: '' };
+  }
+}
+
 function KioskOverlays({ notice, isIdleWarning }: { notice?: Notice; isIdleWarning: boolean }) {
   return (
     <>
@@ -96,6 +123,188 @@ function KioskOverlays({ notice, isIdleWarning }: { notice?: Notice; isIdleWarni
         </section>
       )}
     </>
+  );
+}
+
+function StaffConsole() {
+  const [accessToken, setAccessToken] = useState(() => window.sessionStorage.getItem('smart-kiosk-staff-token') ?? '');
+  const [draftToken, setDraftToken] = useState(accessToken);
+  const [overview, setOverview] = useState<StaffOverview>();
+  const [error, setError] = useState<string>();
+  const [isLoading, setIsLoading] = useState(false);
+  const [refreshVersion, setRefreshVersion] = useState(0);
+  const [priceEdits, setPriceEdits] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    if (!accessToken) return;
+    let isCurrent = true;
+    setIsLoading(true);
+    setError(undefined);
+    void fetch(`${edgeUrl}/v1/staff/overview`, { headers: { 'x-staff-token': accessToken } })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(response.status === 401 ? 'That staff access token is not valid.' : 'Unable to load kiosk operations.');
+        return (await response.json()) as StaffOverview;
+      })
+      .then((data) => {
+        if (isCurrent) setOverview(data);
+      })
+      .catch((loadError: unknown) => {
+        if (isCurrent) setError(loadError instanceof Error ? loadError.message : 'Unable to load kiosk operations.');
+      })
+      .finally(() => {
+        if (isCurrent) setIsLoading(false);
+      });
+    return () => { isCurrent = false; };
+  }, [accessToken, refreshVersion]);
+
+  function submitAccess(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const nextToken = draftToken.trim();
+    if (!nextToken) return setError('Enter a staff access token.');
+    window.sessionStorage.setItem('smart-kiosk-staff-token', nextToken);
+    setAccessToken(nextToken);
+  }
+
+  async function setAvailability(item: StaffOverview['menuItems'][number]) {
+    setIsLoading(true);
+    setError(undefined);
+    try {
+      const response = await fetch(`${edgeUrl}/v1/staff/menu-items/${item.menu_item_id}/availability`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-staff-token': accessToken },
+        body: JSON.stringify({ isAvailable: item.is_available === 0 })
+      });
+      if (!response.ok) throw new Error('Unable to update item availability.');
+      setRefreshVersion((current) => current + 1);
+    } catch (updateError) {
+      setError(updateError instanceof Error ? updateError.message : 'Unable to update item availability.');
+      setIsLoading(false);
+    }
+  }
+
+  async function updatePrice(item: StaffOverview['menuItems'][number]) {
+    const enteredPrice = Number(priceEdits[item.menu_item_id] ?? (item.base_price_minor / 100).toFixed(2));
+    const basePriceMinor = Math.round(enteredPrice * 100);
+    if (!Number.isFinite(enteredPrice) || enteredPrice < 0) return setError('Enter a valid non-negative price.');
+    setIsLoading(true);
+    setError(undefined);
+    try {
+      const response = await fetch(`${edgeUrl}/v1/staff/menu-items/${item.menu_item_id}/price`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-staff-token': accessToken },
+        body: JSON.stringify({ basePriceMinor })
+      });
+      if (!response.ok) throw new Error('Unable to update item price.');
+      setPriceEdits((current) => {
+        const next = { ...current };
+        delete next[item.menu_item_id];
+        return next;
+      });
+      setRefreshVersion((current) => current + 1);
+    } catch (updateError) {
+      setError(updateError instanceof Error ? updateError.message : 'Unable to update item price.');
+      setIsLoading(false);
+    }
+  }
+
+  async function cancelAwaitingOrder(transactionId: string) {
+    setIsLoading(true);
+    setError(undefined);
+    try {
+      const response = await fetch(`${edgeUrl}/v1/staff/orders/${transactionId}/cancel`, {
+        method: 'POST',
+        headers: { 'x-staff-token': accessToken }
+      });
+      if (!response.ok) throw new Error('Unable to cancel this order.');
+      setRefreshVersion((current) => current + 1);
+    } catch (cancelError) {
+      setError(cancelError instanceof Error ? cancelError.message : 'Unable to cancel this order.');
+      setIsLoading(false);
+    }
+  }
+
+  const awaitingPayment = overview?.orderStatusCounts.find(({ status }) => status === 'AWAITING_PAYMENT')?.count ?? 0;
+  const pendingDispatches = overview?.dispatchStatusCounts.find(({ status }) => status === 'PENDING')?.count ?? 0;
+
+  if (!accessToken) {
+    return (
+      <main className="staff-console staff-console--access">
+        <form className="staff-console__access" onSubmit={submitAccess}>
+          <a href="/">← Return to kiosk</a>
+          <p>Staff operations</p>
+          <h1>Sign in to this kiosk</h1>
+          <label htmlFor="staff-access-token">Staff access token</label>
+          <input id="staff-access-token" value={draftToken} onChange={(event) => setDraftToken(event.target.value)} type="password" autoComplete="current-password" />
+          {error && <p className="staff-console__error" role="alert">{error}</p>}
+          <button type="submit">Open Operations</button>
+        </form>
+      </main>
+    );
+  }
+
+  return (
+    <main className="staff-console">
+      <header className="staff-console__header">
+        <div>
+          <p>Staff operations</p>
+          <h1>Kiosk control center</h1>
+          <span>{overview ? `Updated ${new Date(overview.generatedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : 'Loading status…'}</span>
+        </div>
+        <div>
+          <button type="button" onClick={() => setRefreshVersion((current) => current + 1)} disabled={isLoading}>Refresh</button>
+          <button type="button" onClick={() => { window.sessionStorage.removeItem('smart-kiosk-staff-token'); setAccessToken(''); setOverview(undefined); }}>Sign Out</button>
+          <a href="/">Return to kiosk</a>
+        </div>
+      </header>
+      {error && <p className="staff-console__error" role="alert">{error}</p>}
+      <section className="staff-console__stats" aria-label="Kiosk status">
+        <article><span>Integration mode</span><strong>{overview?.integrationMode ?? '—'}</strong></article>
+        <article><span>Awaiting payment</span><strong>{awaitingPayment}</strong></article>
+        <article><span>Pending dispatches</span><strong>{pendingDispatches}</strong></article>
+        <article><span>Unavailable items</span><strong>{overview?.unavailableItems.length ?? 0}</strong></article>
+      </section>
+      <section className="staff-console__panel">
+        <div className="staff-console__panel-heading"><h2>Menu availability</h2><span>Hide sold-out items from the kiosk immediately.</span></div>
+        <div className="staff-console__menu-items">
+          {overview?.menuItems.map((item) => (
+            <article key={item.menu_item_id}>
+              <div><strong>{item.item_name}</strong><span>{formatMoney(item.base_price_minor)}</span></div>
+              <div className="staff-console__item-actions">
+                <label>
+                  <span className="sr-only">Price for {item.item_name}</span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    inputMode="decimal"
+                    value={priceEdits[item.menu_item_id] ?? (item.base_price_minor / 100).toFixed(2)}
+                    onChange={(event) => setPriceEdits((current) => ({ ...current, [item.menu_item_id]: event.target.value }))}
+                  />
+                </label>
+                <button type="button" disabled={isLoading} onClick={() => void updatePrice(item)}>Save price</button>
+                <button type="button" disabled={isLoading} onClick={() => void setAvailability(item)}>
+                  {item.is_available ? 'Mark unavailable' : 'Restore item'}
+                </button>
+              </div>
+            </article>
+          )) ?? <p>Loading menu items…</p>}
+        </div>
+      </section>
+      <section className="staff-console__panel">
+        <div className="staff-console__panel-heading"><h2>Recent orders</h2><span>Newest orders are shown first.</span></div>
+        <div className="staff-console__orders">
+          {overview?.recentOrders.map((order) => (
+            <article key={order.transaction_id}>
+              <strong>#{displayOrderNumber(order)}</strong>
+              <span>{order.order_status.replaceAll('_', ' ')}</span>
+              <time dateTime={order.created_at}>{new Date(order.created_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time>
+              <b>{formatMoney(order.total_amount_minor)}</b>
+              {order.order_status === 'AWAITING_PAYMENT' && <button type="button" disabled={isLoading} onClick={() => void cancelAwaitingOrder(order.transaction_id)}>Cancel</button>}
+            </article>
+          )) ?? <p>No orders yet.</p>}
+        </div>
+      </section>
+    </main>
   );
 }
 
@@ -113,9 +322,15 @@ function mergeCartLine(current: CartLine[], nextLine: CartLine): CartLine[] {
 }
 
 export function App() {
+  return new URLSearchParams(window.location.search).has('staff') ? <StaffConsole /> : <KioskApp />;
+}
+
+function KioskApp() {
   const [isAttracting, setIsAttracting] = useState(true);
   const [menu, setMenu] = useState<Menu>();
-  const [cart, setCart] = useState<CartLine[]>([]);
+  const [restoredOrder] = useState(readSavedOrder);
+  const [cart, setCart] = useState<CartLine[]>(restoredOrder.cart);
+  const [promotionCode, setPromotionCode] = useState(restoredOrder.promotionCode);
   const [quote, setQuote] = useState<OrderQuote>();
   const [activeCategory, setActiveCategory] = useState<string>();
   const [message, setMessage] = useState('Loading local menu…');
@@ -136,6 +351,25 @@ export function App() {
 
   useEffect(() => {
     if (cart.length === 0) {
+      window.sessionStorage.removeItem(savedOrderKey);
+      return;
+    }
+    window.sessionStorage.setItem(savedOrderKey, JSON.stringify({ version: 1, cart, promotionCode }));
+  }, [cart, promotionCode]);
+
+  useEffect(() => {
+    const onOffline = () => setNotice({ tone: 'error', message: 'Connection lost. Your order is saved on this kiosk until the connection returns.' });
+    const onOnline = () => setNotice({ tone: 'info', message: 'Connection restored.' });
+    window.addEventListener('offline', onOffline);
+    window.addEventListener('online', onOnline);
+    return () => {
+      window.removeEventListener('offline', onOffline);
+      window.removeEventListener('online', onOnline);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (cart.length === 0) {
       setQuote(undefined);
       setIsQuoting(false);
       return;
@@ -145,7 +379,7 @@ export function App() {
     void fetch(`${edgeUrl}/v1/quotes`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ items: cart })
+      body: JSON.stringify({ items: cart, ...(promotionCode.trim() ? { promotionCode: promotionCode.trim() } : {}) })
     })
       .then(async (response) => {
         if (!response.ok) throw new Error('Unable to update total');
@@ -158,7 +392,7 @@ export function App() {
         setNotice({ tone: 'error', message: errorMessage });
       })
       .finally(() => setIsQuoting(false));
-  }, [cart]);
+  }, [cart, promotionCode]);
 
   useEffect(() => {
     if (isAttracting || confirmedOrder) {
@@ -174,6 +408,7 @@ export function App() {
       warningTimer = window.setTimeout(() => setIsIdleWarning(true), 45_000);
       resetTimer = window.setTimeout(() => {
         setCart([]);
+        setPromotionCode('');
         setOrder(undefined);
         setPaymentResult(undefined);
         setCustomization(undefined);
@@ -244,7 +479,6 @@ export function App() {
           ?? data.categories.find((category) => /burger|lunch/i.test(category.category_name))?.category_id
           ?? 'category-burgers'
       );
-      setCart([]);
       setIsUpselling(false);
       setIsCheckingOut(false);
       setConfirmedOrder(undefined);
@@ -307,6 +541,7 @@ export function App() {
   async function cancelCheckout() {
     if (!order) {
       setCart([]);
+      setPromotionCode('');
       setIsCheckingOut(false);
       setMessage('Order cancelled');
       setNotice({ tone: 'info', message: 'Your order was cancelled.' });
@@ -318,6 +553,7 @@ export function App() {
       const response = await fetch(`${edgeUrl}/v1/orders/${order.transaction_id}/cancel`, { method: 'POST' });
       if (!response.ok) throw new Error('Unable to cancel this order. Please ask a team member for help.');
       setCart([]);
+      setPromotionCode('');
       setOrder(undefined);
       setPaymentResult(undefined);
       setIsCheckingOut(false);
@@ -340,7 +576,12 @@ export function App() {
       const response = await fetch(`${edgeUrl}/v1/orders`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ items, idempotencyKey: crypto.randomUUID(), orderType: 'TAKE_OUT' })
+        body: JSON.stringify({
+          items,
+          ...(promotionCode.trim() ? { promotionCode: promotionCode.trim() } : {}),
+          idempotencyKey: crypto.randomUUID(),
+          orderType: 'TAKE_OUT'
+        })
       });
       if (!response.ok) throw new Error('Order could not be created. Review your cart and try again.');
       const created = (await response.json()) as Order;
@@ -372,6 +613,7 @@ export function App() {
       if (updated.order_status === 'COMPLETED') {
         setMessage('Simulated payment approved. Mock kitchen and POS dispatches acknowledged.');
         setCart([]);
+        setPromotionCode('');
         setOrder(undefined);
         setIsCheckingOut(false);
         setConfirmedOrder(updated);
@@ -396,6 +638,7 @@ export function App() {
     setIsUpselling(false);
     setIsCheckingOut(false);
     setCart([]);
+    setPromotionCode('');
     setIsAttracting(true);
     setNotice(undefined);
     setMessage('Ready for a new order');
@@ -527,6 +770,7 @@ export function App() {
 
   if (isCheckingOut) {
     const subtotal = quote?.subtotalMinor ?? 0;
+    const discount = quote?.discountAmountMinor ?? 0;
     const tax = quote?.taxAmountMinor ?? 0;
     const total = quote?.totalAmountMinor ?? 0;
 
@@ -554,6 +798,7 @@ export function App() {
             <img src={checkoutDivider} alt="" />
             <dl>
               <div><dt>Subtotal</dt><dd>{formatMoney(subtotal, menu?.currencyCode)}</dd></div>
+              {discount > 0 && <div><dt>Promotion</dt><dd>−{formatMoney(discount, menu?.currencyCode)}</dd></div>}
               <div><dt>Tax</dt><dd>{formatMoney(tax, menu?.currencyCode)}</dd></div>
               <div className="kiosk-checkout-summary__grand-total"><dt>Total</dt><dd>{formatMoney(total, menu?.currencyCode)}</dd></div>
             </dl>
@@ -706,6 +951,18 @@ export function App() {
           <p className="kiosk-cart__empty">Your order is empty. Choose an item to get started.</p>
         )}
         <footer className="kiosk-cart__footer">
+          {cart.length > 0 && (
+            <label className="kiosk-cart__promo">
+              <span>Promo code</span>
+              <input
+                value={promotionCode}
+                onChange={(event) => setPromotionCode(event.target.value.toUpperCase())}
+                placeholder="Optional"
+                maxLength={32}
+                autoCapitalize="characters"
+              />
+            </label>
+          )}
           <div className="kiosk-cart__total">
             <span>Total</span>
             <strong>{isQuoting ? 'Updating…' : formatMoney(quote?.totalAmountMinor ?? 0, menu?.currencyCode)}</strong>
