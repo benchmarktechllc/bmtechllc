@@ -111,9 +111,15 @@ def metadata_for(chunk: Chunk, path: Path, source_type: str) -> ChunkMetadata:
             speakers=_speakers_in_order(chunk.units),
         )
     elif source_type == "transcript":
+        attendees = first.extra.get("attendees") or []
         common.update(
             meeting=str(first.extra.get("meeting", path.stem)),
             speakers=_speakers_in_order(chunk.units),
+            title=_optional_text(first.extra.get("title")),
+            url=_optional_text(first.extra.get("url")),
+            kind=_optional_text(first.extra.get("kind")),
+            recording_id=_optional_text(first.extra.get("recording_id")),
+            attendees=[str(person) for person in attendees] if isinstance(attendees, list) else [],
         )
         if first.extra.get("section"):
             common["section"] = str(first.extra["section"])
@@ -183,10 +189,16 @@ def embedding_prefix(metadata: ChunkMetadata, source_filename: str) -> str:
             f"list: {metadata.column}{labels}{due}."
         )
     else:
-        header = (
-            f"Meeting transcript: {metadata.meeting}; date: {metadata.date or 'unknown'}; "
-            f"section: {metadata.section or 'general'}."
-        )
+        details = [
+            f"Meeting transcript: {metadata.meeting}",
+            f"date: {metadata.date or 'unknown'}",
+            f"section: {metadata.section or 'general'}",
+        ]
+        if metadata.url:
+            details.append(f"url: {metadata.url}")
+        if metadata.attendees:
+            details.append("attendees: " + ", ".join(metadata.attendees))
+        header = "; ".join(details) + "."
     return header
 
 

@@ -139,13 +139,63 @@ there. `TRELLO_BOARD_ID` is an optional Actions variable; leave it empty to
 keep `tIvVZqio`. After the secrets are saved, run the workflow once by hand
 for the first backfill. The schedule then keeps the board current.
 
+## Fathom meeting sync
+
+`benchmark-sync-fathom` reads meetings visible to a Fathom API key: recordings
+that user made, or that were shared with them or their team. Generate the key
+under Fathom user settings, API Access. The key never sees another user's
+private meetings.
+
+A meeting is indexed once Fathom has a transcript. The summary is included when
+Fathom returns one. Each meeting is one source, `fathom/<recording_id>.md`,
+with `source_type` `transcript` and `kind` `meeting_transcript`. Chunk metadata
+includes the title, meeting date, attendees, recording id, and Fathom URL. The
+calendar join link (Google Meet, Zoom, or Teams) is in the chunk text. Meetings
+that leave the key's accessible set are removed from `document_chunks`. A listed
+meeting with no transcript yet is skipped and retried next run.
+
+Fathom's list payload has no `updated_at`. The sync skips the transcript fetch
+and the embedding call when the recording end time (or `created_at` if the
+recording has no end time), start time, title, URLs, and attendees still match
+the stored row. When those change, a content hash still skips re-embedding if
+the text is the same. A transcript edit that moves none of those fields is
+picked up on the next metadata change.
+
+Preview chunk counts without embeddings or database writes. This still calls
+the Fathom API:
+
+```bash
+FATHOM_API_KEY=... benchmark-sync-fathom --dry-run
+```
+
+Backfill into the corpus:
+
+```bash
+FATHOM_API_KEY=...
+DATABASE_URL=...
+OPENAI_API_KEY=...
+benchmark-sync-fathom
+```
+
+Do not commit those values. `.github/workflows/fathom-ingestion.yml` runs at
+05:17 UTC daily and on manual dispatch. It uses the `discord-ingestion`
+environment, alongside the Discord, portal, and Trello jobs. Add
+`FATHOM_API_KEY` as a secret there. `DATABASE_URL` and `OPENAI_API_KEY` are
+already on that environment. After the secret is saved, run the workflow once
+by hand (Actions → Fathom ingestion → Run workflow) for the first backfill.
+Transcript calls are rate limited, so a large backfill can take a while and
+may need a second manual run; meetings already indexed are skipped. The
+schedule then keeps the corpus current.
+
 ## Discord ask bot
 
 `benchmark-discord-ask` is a separate always-on gateway process. It calls
 `run_agent` and posts the reply. Ingestion stays on the sync commands
-(`benchmark-sync-discord`, `benchmark-sync-portal`, and `benchmark-sync-trello`);
-this bot does not store source text or rebuild the corpus. Once those syncs
-write chunks, the bot can answer from them with no gateway change.
+(`benchmark-sync-discord`, `benchmark-sync-portal`, `benchmark-sync-trello`,
+and `benchmark-sync-fathom`); this bot does not store source text or rebuild
+the corpus. Once those syncs write chunks, the bot can answer from them with
+no gateway change. Retrieval reads `document_chunks` and does not filter on
+source type, so Fathom transcripts are included as soon as they are indexed.
 
 People can ask in two ways:
 
@@ -303,6 +353,7 @@ src/benchmark_cli/
   discord_sync.py  Scheduled Discord channel ingestion
   portal_sync.py   Published portal knowledge-base ingestion
   trello_sync.py   Trello board ingestion
+  fathom_sync.py   Fathom meeting transcript ingestion
   discord_ask.py   Gateway bot for #ask-bmtech and /ask
 tests/unit/        Chunking, embeddings, RRF, metric, and Discord reply tests
 data/evaluation/   30-query golden-dataset template
