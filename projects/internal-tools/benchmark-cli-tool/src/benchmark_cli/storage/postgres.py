@@ -87,6 +87,23 @@ class FathomSyncState:
 
 
 @dataclass(frozen=True, slots=True)
+class FirefliesSyncState:
+    """Last indexed revision of one Fireflies meeting transcript."""
+
+    recording_id: str
+    source_file: str
+    content_sha256: str
+    title: str
+    fireflies_url: str
+    join_url: str
+    attendees: tuple[str, ...]
+    recorded_at: datetime | None
+    duration_minutes: float | None
+    host: str
+    summary_status: str
+
+
+@dataclass(frozen=True, slots=True)
 class TrelloSourceCard:
     """Last indexed revision of one Trello card."""
 
@@ -169,6 +186,7 @@ def initialize_database() -> None:
     apply_sql("004_discord_sync.sql")
     apply_sql("005_portal_trello_sync.sql")
     apply_sql("006_fathom_sync.sql")
+    apply_sql("007_fireflies_sync.sql")
 
 
 def create_indexes() -> None:
@@ -605,6 +623,89 @@ def delete_fathom_sync_state(recording_id: str) -> None:
     """Forget a Fathom meeting after its chunks have been removed."""
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute("DELETE FROM fathom_sync_state WHERE recording_id = %s", (recording_id,))
+        conn.commit()
+
+
+def fireflies_sync_states() -> dict[str, FirefliesSyncState]:
+    """Return every Fireflies transcript revision recorded by ``benchmark-sync-fireflies``."""
+    statement = """
+        SELECT recording_id, source_file, content_sha256, title, fireflies_url, join_url,
+               attendees, recorded_at, duration_minutes, host, summary_status
+        FROM fireflies_sync_state
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement)
+        rows = cursor.fetchall()
+    states: dict[str, FirefliesSyncState] = {}
+    for row in rows:
+        attendees = row[6] if isinstance(row[6], list) else []
+        duration = None if row[8] is None else float(row[8])
+        state = FirefliesSyncState(
+            recording_id=str(row[0]),
+            source_file=str(row[1]),
+            content_sha256=str(row[2]),
+            title=str(row[3]),
+            fireflies_url=str(row[4]),
+            join_url=str(row[5] or ""),
+            attendees=tuple(str(person) for person in attendees),
+            recorded_at=row[7],
+            duration_minutes=duration,
+            host=str(row[9] or ""),
+            summary_status=str(row[10] or ""),
+        )
+        states[state.recording_id] = state
+    return states
+
+
+def upsert_fireflies_sync_state(state: FirefliesSyncState) -> None:
+    """Record a Fireflies meeting after its chunks have been replaced."""
+    _, _, Json = _dependencies()
+    statement = """
+        INSERT INTO fireflies_sync_state
+            (recording_id, source_file, content_sha256, title, fireflies_url, join_url,
+             attendees, recorded_at, duration_minutes, host, summary_status)
+        VALUES (%(recording_id)s, %(source_file)s, %(content_sha256)s, %(title)s,
+                %(fireflies_url)s, %(join_url)s, %(attendees)s, %(recorded_at)s,
+                %(duration_minutes)s, %(host)s, %(summary_status)s)
+        ON CONFLICT (recording_id) DO UPDATE
+        SET source_file = EXCLUDED.source_file,
+            content_sha256 = EXCLUDED.content_sha256,
+            title = EXCLUDED.title,
+            fireflies_url = EXCLUDED.fireflies_url,
+            join_url = EXCLUDED.join_url,
+            attendees = EXCLUDED.attendees,
+            recorded_at = EXCLUDED.recorded_at,
+            duration_minutes = EXCLUDED.duration_minutes,
+            host = EXCLUDED.host,
+            summary_status = EXCLUDED.summary_status,
+            last_synced_at = now()
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            statement,
+            {
+                "recording_id": state.recording_id,
+                "source_file": state.source_file,
+                "content_sha256": state.content_sha256,
+                "title": state.title,
+                "fireflies_url": state.fireflies_url,
+                "join_url": state.join_url,
+                "attendees": Json(list(state.attendees)),
+                "recorded_at": state.recorded_at,
+                "duration_minutes": state.duration_minutes,
+                "host": state.host,
+                "summary_status": state.summary_status,
+            },
+        )
+        conn.commit()
+
+
+def delete_fireflies_sync_state(recording_id: str) -> None:
+    """Forget a Fireflies meeting after its chunks have been removed."""
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM fireflies_sync_state WHERE recording_id = %s", (recording_id,)
+        )
         conn.commit()
 
 
