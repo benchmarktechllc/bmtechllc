@@ -61,6 +61,33 @@ class DiscordSourceMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class PortalSyncState:
+    """Last indexed revision of one portal knowledge-base page."""
+
+    source_file: str
+    content_sha256: str
+    title: str
+    section: str
+    updated_on: Date | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TrelloSourceCard:
+    """Last indexed revision of one Trello card."""
+
+    board_id: str
+    card_id: str
+    source_file: str
+    list_name: str
+    card_name: str
+    card_url: str
+    labels: tuple[str, ...]
+    due_at: datetime | None
+    content_sha256: str
+    last_activity_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class SearchFilters:
     """Optional provenance constraints shared by keyword and vector retrieval."""
 
@@ -125,6 +152,7 @@ def initialize_database() -> None:
     apply_sql("001_init.sql")
     apply_sql("002_fts.sql")
     apply_sql("004_discord_sync.sql")
+    apply_sql("005_portal_trello_sync.sql")
 
 
 def create_indexes() -> None:
@@ -361,6 +389,155 @@ def discord_source_messages(channel_id: str) -> list[DiscordSourceMessage]:
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(statement, (channel_id,))
         return [DiscordSourceMessage(*row) for row in cursor.fetchall()]
+
+
+def portal_sync_states() -> dict[str, PortalSyncState]:
+    """Return every portal page revision recorded by ``benchmark-sync-portal``."""
+    statement = """
+        SELECT source_file, content_sha256, title, section, updated_on
+        FROM portal_sync_state
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement)
+        rows = cursor.fetchall()
+    return {
+        str(source_file): PortalSyncState(
+            str(source_file),
+            str(content_sha256),
+            str(title),
+            str(section),
+            updated_on,
+        )
+        for source_file, content_sha256, title, section, updated_on in rows
+    }
+
+
+def upsert_portal_sync_state(state: PortalSyncState) -> None:
+    """Record a portal page after its chunks have been replaced."""
+    statement = """
+        INSERT INTO portal_sync_state
+            (source_file, content_sha256, title, section, updated_on)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (source_file) DO UPDATE
+        SET content_sha256 = EXCLUDED.content_sha256,
+            title = EXCLUDED.title,
+            section = EXCLUDED.section,
+            updated_on = EXCLUDED.updated_on,
+            last_synced_at = now()
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            statement,
+            (state.source_file, state.content_sha256, state.title, state.section, state.updated_on),
+        )
+        conn.commit()
+
+
+def delete_portal_sync_state(source_file: str) -> None:
+    """Forget a portal page after its chunks have been removed."""
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("DELETE FROM portal_sync_state WHERE source_file = %s", (source_file,))
+        conn.commit()
+
+
+def trello_source_cards(board_id: str) -> dict[str, TrelloSourceCard]:
+    """Return indexed cards for one Trello board, keyed by card id."""
+    statement = """
+        SELECT board_id, card_id, source_file, list_name, card_name, card_url,
+               labels, due_at, content_sha256, last_activity_at
+        FROM trello_source_cards
+        WHERE board_id = %s
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (board_id,))
+        rows = cursor.fetchall()
+    cards: dict[str, TrelloSourceCard] = {}
+    for row in rows:
+        labels = row[6] if isinstance(row[6], list) else []
+        card = TrelloSourceCard(
+            board_id=str(row[0]),
+            card_id=str(row[1]),
+            source_file=str(row[2]),
+            list_name=str(row[3]),
+            card_name=str(row[4]),
+            card_url=str(row[5]),
+            labels=tuple(str(label) for label in labels),
+            due_at=row[7],
+            content_sha256=str(row[8]),
+            last_activity_at=row[9],
+        )
+        cards[card.card_id] = card
+    return cards
+
+
+def upsert_trello_source_card(card: TrelloSourceCard) -> None:
+    """Record a Trello card after its chunks have been replaced."""
+    _, _, Json = _dependencies()
+    statement = """
+        INSERT INTO trello_source_cards
+            (board_id, card_id, source_file, list_name, card_name, card_url, labels,
+             due_at, content_sha256, last_activity_at)
+        VALUES (%(board_id)s, %(card_id)s, %(source_file)s, %(list_name)s, %(card_name)s,
+                %(card_url)s, %(labels)s, %(due_at)s, %(content_sha256)s, %(last_activity_at)s)
+        ON CONFLICT (board_id, card_id) DO UPDATE
+        SET source_file = EXCLUDED.source_file,
+            list_name = EXCLUDED.list_name,
+            card_name = EXCLUDED.card_name,
+            card_url = EXCLUDED.card_url,
+            labels = EXCLUDED.labels,
+            due_at = EXCLUDED.due_at,
+            content_sha256 = EXCLUDED.content_sha256,
+            last_activity_at = EXCLUDED.last_activity_at,
+            updated_at = now()
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            statement,
+            {
+                "board_id": card.board_id,
+                "card_id": card.card_id,
+                "source_file": card.source_file,
+                "list_name": card.list_name,
+                "card_name": card.card_name,
+                "card_url": card.card_url,
+                "labels": Json(list(card.labels)),
+                "due_at": card.due_at,
+                "content_sha256": card.content_sha256,
+                "last_activity_at": card.last_activity_at,
+            },
+        )
+        conn.commit()
+
+
+def delete_trello_source_card(board_id: str, card_id: str) -> None:
+    """Forget a Trello card after its chunks have been removed."""
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM trello_source_cards WHERE board_id = %s AND card_id = %s",
+            (board_id, card_id),
+        )
+        conn.commit()
+
+
+def set_trello_sync_state(
+    board_id: str,
+    board_name: str,
+    short_link: str,
+    last_activity_at: datetime | None,
+) -> None:
+    """Record a successful board snapshot after card indexing finishes."""
+    statement = """
+        INSERT INTO trello_sync_state (board_id, board_name, short_link, last_activity_at)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (board_id) DO UPDATE
+        SET board_name = EXCLUDED.board_name,
+            short_link = EXCLUDED.short_link,
+            last_activity_at = EXCLUDED.last_activity_at,
+            last_synced_at = now()
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (board_id, board_name, short_link, last_activity_at))
+        conn.commit()
 
 
 def _filters_where_clause(filters: SearchFilters) -> tuple[str, list[str]]:

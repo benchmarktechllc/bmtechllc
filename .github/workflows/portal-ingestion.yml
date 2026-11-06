@@ -1,0 +1,42 @@
+name: Portal ingestion
+
+on:
+  schedule:
+    # Schedules use UTC. Offset from discord-ingestion (03:17) and trello-ingestion (04:47).
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "portal/content/**"
+      - "projects/internal-tools/benchmark-cli-tool/src/benchmark_cli/portal_sync.py"
+      - ".github/workflows/portal-ingestion.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portal-ingestion
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: projects/internal-tools/benchmark-cli-tool
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # Same environment as Discord sync. DATABASE_URL and OPENAI_API_KEY are
+    # already stored there; this job does not need Trello secrets.
+    environment: discord-ingestion
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip && python -m pip install .
+      - run: benchmark-sync-portal --content-dir "$GITHUB_WORKSPACE/portal/content"
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
