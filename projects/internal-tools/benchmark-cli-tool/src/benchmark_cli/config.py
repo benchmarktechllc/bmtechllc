@@ -16,6 +16,13 @@ load_dotenv(PROJECT_ROOT / ".env.local", override=False)
 
 OPENAI_API_KEY: Final[str | None] = os.getenv("OPENAI_API_KEY")
 DATABASE_URL: Final[str | None] = os.getenv("DATABASE_URL")
+DISCORD_INGEST_BOT_TOKEN: Final[str | None] = os.getenv("DISCORD_INGEST_BOT_TOKEN")
+DISCORD_INGEST_CHANNEL_IDS: Final[tuple[str, ...]] = tuple(
+    channel_id.strip()
+    for channel_id in os.getenv("DISCORD_INGEST_CHANNEL_IDS", "").split(",")
+    if channel_id.strip()
+)
+DISCORD_API_BASE_URL: Final[str] = os.getenv("DISCORD_API_BASE_URL", "https://discord.com/api/v10")
 DB_STATEMENT_TIMEOUT_MS: Final[int] = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "5000"))
 HNSW_EF_SEARCH: Final[int] = int(os.getenv("HNSW_EF_SEARCH", "40"))
 

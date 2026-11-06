@@ -6,6 +6,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date as Date
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,20 @@ class ParentContext:
     chunks: tuple[SearchChunk, ...]
     token_count: int
     section_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordSourceMessage:
+    """A normalized Discord message retained to rebuild one channel's chunks."""
+
+    channel_id: str
+    message_id: str
+    channel_name: str
+    author_name: str
+    message_text: str
+    sent_at: datetime
+    edited_at: datetime | None = None
+    reply_to_message_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +124,7 @@ def initialize_database() -> None:
     """Create or upgrade the chunk table, vector support, and FTS field."""
     apply_sql("001_init.sql")
     apply_sql("002_fts.sql")
+    apply_sql("004_discord_sync.sql")
 
 
 def create_indexes() -> None:
@@ -125,6 +141,21 @@ def existing_hashes(hashes: Sequence[str]) -> set[str]:
             (list(hashes),),
         )
         return {row[0].strip() for row in cursor.fetchall()}
+
+
+def existing_embeddings(hashes: Sequence[str]) -> dict[str, list[float]]:
+    """Return persisted vectors keyed by content hash for an atomic source refresh."""
+    if not hashes:
+        return {}
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT content_sha256, embedding FROM document_chunks WHERE content_sha256 = ANY(%s)",
+            (list(hashes),),
+        )
+        return {
+            content_sha256.strip(): embedding.to_list()
+            for content_sha256, embedding in cursor.fetchall()
+        }
 
 
 def resolve_chunk_references(
@@ -188,6 +219,148 @@ def upsert_chunks(rows: Sequence[dict[str, Any]]) -> int:
         inserted = cursor.rowcount
         conn.commit()
     return inserted
+
+
+def replace_source_chunks(source_file: str, rows: Sequence[dict[str, Any]]) -> int:
+    """Atomically replace one source after its embeddings have already been prepared.
+
+    Generating embeddings happens before this function is called. Therefore, a
+    provider failure cannot leave the source missing from the active corpus.
+    """
+    _, _, Json = _dependencies()
+    statement = """
+        INSERT INTO document_chunks
+            (source_file, chunk_index, chunk_text, content_sha256, token_count, embedding, metadata)
+        VALUES (%(source_file)s, %(chunk_index)s, %(chunk_text)s, %(content_sha256)s,
+                %(token_count)s, %(embedding)s, %(metadata)s)
+        ON CONFLICT (content_sha256) DO NOTHING
+    """
+    prepared = [{**row, "metadata": Json(row["metadata"])} for row in rows]
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("DELETE FROM document_chunks WHERE source_file = %s", (source_file,))
+        if prepared:
+            cursor.executemany(statement, prepared)
+            inserted = cursor.rowcount
+        else:
+            inserted = 0
+        conn.commit()
+    return inserted
+
+
+def discord_sync_cursor(channel_id: str) -> str | None:
+    """Return the newest Discord message ID committed for one channel."""
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT last_message_id FROM discord_sync_state WHERE channel_id = %s", (channel_id,)
+        )
+        row = cursor.fetchone()
+    return str(row[0]) if row and row[0] is not None else None
+
+
+def set_discord_sync_cursor(channel_id: str, channel_name: str, message_id: str | None) -> None:
+    """Commit a channel cursor only after its current index has been written."""
+    statement = """
+        INSERT INTO discord_sync_state (channel_id, channel_name, last_message_id)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (channel_id) DO UPDATE
+        SET channel_name = EXCLUDED.channel_name,
+            last_message_id = EXCLUDED.last_message_id,
+            reindex_required = FALSE,
+            last_synced_at = now()
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (channel_id, channel_name, message_id))
+        conn.commit()
+
+
+def upsert_discord_source_messages(messages: Sequence[DiscordSourceMessage]) -> int:
+    """Store only newly observed or changed normalized Discord messages."""
+    if not messages:
+        return 0
+    statement = """
+        INSERT INTO discord_source_messages
+            (channel_id, message_id, channel_name, author_name, message_text, sent_at,
+             edited_at, reply_to_message_id)
+        VALUES (%(channel_id)s, %(message_id)s, %(channel_name)s, %(author_name)s,
+                %(message_text)s, %(sent_at)s, %(edited_at)s, %(reply_to_message_id)s)
+        ON CONFLICT (channel_id, message_id) DO UPDATE
+        SET channel_name = EXCLUDED.channel_name,
+            author_name = EXCLUDED.author_name,
+            message_text = EXCLUDED.message_text,
+            sent_at = EXCLUDED.sent_at,
+            edited_at = EXCLUDED.edited_at,
+            reply_to_message_id = EXCLUDED.reply_to_message_id,
+            updated_at = now()
+        WHERE (discord_source_messages.channel_name,
+               discord_source_messages.author_name,
+               discord_source_messages.message_text,
+               discord_source_messages.sent_at,
+               discord_source_messages.edited_at,
+               discord_source_messages.reply_to_message_id)
+              IS DISTINCT FROM
+              (EXCLUDED.channel_name,
+               EXCLUDED.author_name,
+               EXCLUDED.message_text,
+               EXCLUDED.sent_at,
+               EXCLUDED.edited_at,
+               EXCLUDED.reply_to_message_id)
+        RETURNING message_id
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        changed = 0
+        for message in messages:
+            cursor.execute(
+                statement,
+                {
+                    "channel_id": message.channel_id,
+                    "message_id": message.message_id,
+                    "channel_name": message.channel_name,
+                    "author_name": message.author_name,
+                    "message_text": message.message_text,
+                    "sent_at": message.sent_at,
+                    "edited_at": message.edited_at,
+                    "reply_to_message_id": message.reply_to_message_id,
+                },
+            )
+            changed += int(cursor.fetchone() is not None)
+        if changed:
+            first = messages[0]
+            cursor.execute(
+                """
+                INSERT INTO discord_sync_state (channel_id, channel_name, reindex_required)
+                VALUES (%s, %s, TRUE)
+                ON CONFLICT (channel_id) DO UPDATE
+                SET channel_name = EXCLUDED.channel_name,
+                    reindex_required = TRUE
+                """,
+                (first.channel_id, first.channel_name),
+            )
+        conn.commit()
+    return changed
+
+
+def discord_reindex_required(channel_id: str) -> bool:
+    """Return whether stored message changes still need an index refresh."""
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT reindex_required FROM discord_sync_state WHERE channel_id = %s", (channel_id,)
+        )
+        row = cursor.fetchone()
+    return bool(row and row[0])
+
+
+def discord_source_messages(channel_id: str) -> list[DiscordSourceMessage]:
+    """Return a channel's normalized source messages in chronological order."""
+    statement = """
+        SELECT channel_id, message_id, channel_name, author_name, message_text, sent_at,
+               edited_at, reply_to_message_id
+        FROM discord_source_messages
+        WHERE channel_id = %s
+        ORDER BY sent_at ASC, message_id ASC
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (channel_id,))
+        return [DiscordSourceMessage(*row) for row in cursor.fetchall()]
 
 
 def _filters_where_clause(filters: SearchFilters) -> tuple[str, list[str]]:

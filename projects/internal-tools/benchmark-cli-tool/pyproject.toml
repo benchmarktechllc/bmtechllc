@@ -24,6 +24,7 @@ benchmark-ingest = "benchmark_cli.ingestion.pipeline:main"
 benchmark-evaluate = "benchmark_cli.evaluation.cli:main"
 benchmark-search = "benchmark_cli.search_cli:main"
 benchmark-answer = "benchmark_cli.agent:main"
+benchmark-sync-discord = "benchmark_cli.discord_sync:main"
 
 [tool.pytest.ini_options]
 addopts = "-m 'not integration_live'"

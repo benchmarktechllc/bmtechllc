@@ -167,29 +167,77 @@ def _discord_messages(payload: Any) -> tuple[list[dict[str, Any]], dict[str, str
     return messages if isinstance(messages, list) else [], user_lookup, channel_lookup
 
 
+def discord_units_from_messages(
+    messages: list[dict[str, Any]],
+    *,
+    channel: str,
+    users: dict[str, str] | None = None,
+    channels: dict[str, str] | None = None,
+) -> list[RawUnit]:
+    """Normalize Discord API/export messages into ingestion units.
+
+    This is deliberately shared by file exports and the live connector so both
+    paths redact secrets and apply the same bot/content filtering rules.
+    """
+    user_lookup = users or {}
+    channel_lookup = channels or {}
+    units: list[RawUnit] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        author = message.get("author", message.get("Author", {})) or {}
+        if not isinstance(author, dict):
+            continue
+        author_name = str(
+            author.get("global_name")
+            or author.get("name")
+            or author.get("username")
+            or author.get("Name")
+            or "unknown"
+        )
+        if author.get("isBot") or author.get("bot") or _BOT_NAME.search(author_name):
+            continue
+        kind = str(message.get("type", message.get("Type", "Default")))
+        if kind.casefold() not in {"default", "reply", "0", "19"}:
+            continue
+        content = _rewrite_discord(
+            str(message.get("content", message.get("Content", ""))), user_lookup, channel_lookup
+        )
+        content = normalize_text(content)
+        if len(content) < 3 or _URL_ONLY.fullmatch(content):
+            continue
+        reference = message.get("message_reference", message.get("reference", message.get("replyTo")))
+        reply_to: str | None
+        if isinstance(reference, dict):
+            value = reference.get("message_id", reference.get("messageId"))
+            reply_to = str(value) if value is not None else None
+        else:
+            reply_to = str(reference) if reference is not None else None
+        units.append(
+            RawUnit(
+                content,
+                author_name,
+                _parse_datetime(message.get("timestamp", message.get("Timestamp"))),
+                len(units),
+                {
+                    "channel": str(message.get("channel", message.get("channelName", channel))),
+                    "section": str(message.get("channel", message.get("channelName", channel))),
+                    "message_id": str(message.get("id", message.get("Id", ""))),
+                    "reply_to": reply_to,
+                    "edited_timestamp": message.get("edited_timestamp", message.get("editedTimestamp")),
+                },
+            )
+        )
+    return units
+
+
 def parse_discord(path: Path) -> Iterator[RawUnit]:
     """Parse DiscordChatExporter JSON or a lightweight timestamped TXT export."""
     if path.suffix.casefold() == ".json":
         payload = json.loads(path.read_text(encoding="utf-8"))
         messages, users, channels = _discord_messages(payload)
-        for ordinal, message in enumerate(messages):
-            if not isinstance(message, dict):
-                continue
-            author = message.get("author", message.get("Author", {})) or {}
-            author_name = str(author.get("name", author.get("username", author.get("Name", "unknown"))))
-            if author.get("isBot") or author.get("bot") or _BOT_NAME.search(author_name):
-                continue
-            kind = str(message.get("type", message.get("Type", "Default")))
-            if kind.casefold() not in {"default", "reply", "0", "19"}:
-                continue
-            content = _rewrite_discord(str(message.get("content", message.get("Content", ""))), users, channels)
-            content = normalize_text(content)
-            if len(content) < 3 or _URL_ONLY.fullmatch(content):
-                continue
-            timestamp = _parse_datetime(message.get("timestamp", message.get("Timestamp")))
-            channel = str(message.get("channel", message.get("channelName", path.stem)))
-            reply = message.get("reference", message.get("replyTo"))
-            yield RawUnit(content, author_name, timestamp, ordinal, {"channel": channel, "reply_to": reply})
+        channel = str(payload.get("channel", payload.get("channelName", path.stem))) if isinstance(payload, dict) else path.stem
+        yield from discord_units_from_messages(messages, channel=channel, users=users, channels=channels)
         return
 
     source_text = path.read_text(encoding="utf-8")

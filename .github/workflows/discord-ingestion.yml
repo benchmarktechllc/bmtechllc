@@ -1,0 +1,36 @@
+name: Discord ingestion
+
+on:
+  schedule:
+    # Schedules use UTC. Avoid the top of the hour, when GitHub can delay jobs.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: discord-ingestion
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: projects/internal-tools/benchmark-cli-tool
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    environment: discord-ingestion
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip && python -m pip install .
+      - run: benchmark-sync-discord
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DISCORD_INGEST_BOT_TOKEN: ${{ secrets.DISCORD_INGEST_BOT_TOKEN }}
+          DISCORD_INGEST_CHANNEL_IDS: ${{ vars.DISCORD_INGEST_CHANNEL_IDS }}

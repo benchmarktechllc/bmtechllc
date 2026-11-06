@@ -25,6 +25,44 @@ benchmark-ingest --source-dir data/documents --dry-run
 benchmark-ingest --source-dir data/documents --create-indexes
 ```
 
+## Discord sync
+
+`benchmark-sync-discord` reads selected channels from Discord's REST API; it
+does not create transcript files. It normalizes and redacts each retained
+message before storing it in PostgreSQL, then rebuilds a channel's chunks when
+new or recently edited messages are found.
+
+Configure these runtime values only in your secret manager or local `.env`
+files, never in Git:
+
+```bash
+DISCORD_INGEST_BOT_TOKEN=...
+DISCORD_INGEST_CHANNEL_IDS=123456789012345678,234567890123456789
+DATABASE_URL=...
+OPENAI_API_KEY=...
+```
+
+The Discord application needs a bot token with `VIEW_CHANNEL` and
+`READ_MESSAGE_HISTORY` for each configured channel, plus the privileged Message
+Content intent enabled. Run a one-time backfill (or manually trigger the
+workflow) with:
+
+```bash
+benchmark-sync-discord
+```
+
+The repository-level workflow at `.github/workflows/discord-ingestion.yml`
+runs at 03:17 UTC daily and can be run manually. It runs on GitHub-hosted
+Ubuntu and works inside this project directory. Configure an environment named
+`discord-ingestion` with `DATABASE_URL`, `OPENAI_API_KEY`, and
+`DISCORD_INGEST_BOT_TOKEN` secrets, plus a non-secret
+`DISCORD_INGEST_CHANNEL_IDS` variable. If Supabase network restrictions are
+enabled, GitHub-hosted runners will need an allowed network path.
+
+The scheduled sync detects additions and edits in the range since its stored
+cursor. A deleted older Discord message is not yet removed from the corpus;
+that needs a future reconciliation pass or Discord gateway delete events.
+
 `search_docs(query, top_k=5)` embeds the query once, concurrently retrieves 20
 pgvector candidates and 20 PostgreSQL FTS candidates, then merges them with
 RRF (`k = 60`). It returns chunks and fused search scores only. The optional

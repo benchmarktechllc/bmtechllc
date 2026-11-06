@@ -1,10 +1,19 @@
 .venv/
 .env
 .env.local
+.env.*
+!.env.example
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+
+# Python build and coverage output.
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
 
 # Runtime telemetry and regenerated reports.
 artifacts/
@@ -16,3 +25,18 @@ data/archive/
 
 # Reviewed production evaluation labels may contain confidential business context.
 data/evaluation/golden_queries.json
+
+# Local Docker overrides may contain credentials.
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# Manual database exports/backups. Versioned SQL migrations remain tracked.
+backups/
+*.dump
+*.backup
+*.sql.gz
+
+# Supabase CLI internal state. Keep Supabase config and migrations tracked.
+supabase/.temp/
+supabase/.branches/
+supabase/signing_keys.json

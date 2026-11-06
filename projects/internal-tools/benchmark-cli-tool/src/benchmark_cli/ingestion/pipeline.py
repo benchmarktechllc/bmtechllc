@@ -17,9 +17,10 @@ from ..paths import DOCUMENTS_DIR
 from ..providers.openai import embed_texts
 from ..storage.postgres import (
     create_indexes,
-    delete_source,
+    existing_embeddings,
     existing_hashes,
     initialize_database,
+    replace_source_chunks,
     upsert_chunks,
 )
 from .chunk import Chunk, chunk_units
@@ -146,9 +147,18 @@ def discover_sources(source_dir: Path) -> list[Path]:
     )
 
 
-def ingest_source(path: Path, *, dry_run: bool, force: bool, batch_size: int = 128) -> dict[str, Any]:
-    source_type = source_type_for(path)
-    chunks = chunk_units(parse_by_type(path))
+def ingest_units(
+    units: Iterable[RawUnit],
+    *,
+    source_filename: str,
+    source_type: str,
+    dry_run: bool,
+    replace_existing: bool = False,
+    batch_size: int = 128,
+) -> dict[str, Any]:
+    """Ingest normalized units from either a local file or a live source connector."""
+    path = Path(source_filename)
+    chunks = chunk_units(units)
     prepared = [
         (chunk_index, chunk, metadata_for(chunk, path, source_type))
         for chunk_index, chunk in enumerate(chunks)
@@ -164,7 +174,7 @@ def ingest_source(path: Path, *, dry_run: bool, force: bool, batch_size: int = 1
     ]
     hashes = {content_hash(chunk.text) for _, chunk, _ in prepared}
     result: dict[str, Any] = {
-        "source": str(path),
+        "source": source_filename,
         "source_type": source_type,
         "chunks": len(prepared),
         "tokens": sum(chunk.token_count for _, chunk, _ in prepared),
@@ -176,20 +186,26 @@ def ingest_source(path: Path, *, dry_run: bool, force: bool, batch_size: int = 1
         return result
 
     initialize_database()
-    source_filename = path.name
-    if force:
-        delete_source(source_filename)
-        known_hashes: set[str] = set()
+    if replace_existing:
+        vectors_by_hash = existing_embeddings(hashes)
+        pending_by_hash = {
+            content_hash(chunk.text): (chunk_index, chunk, metadata)
+            for chunk_index, chunk, metadata in prepared
+            if content_hash(chunk.text) not in vectors_by_hash
+        }
+        pending = list(pending_by_hash.values())
+        result["skipped"] = len(prepared) - len(pending)
     else:
         known_hashes = existing_hashes(hashes)
-    pending = [
-        (chunk_index, chunk, metadata)
-        for chunk_index, chunk, metadata in prepared
-        if content_hash(chunk.text) not in known_hashes
-    ]
-    result["skipped"] = len(prepared) - len(pending)
-    if not pending:
-        return result
+        pending = [
+            (chunk_index, chunk, metadata)
+            for chunk_index, chunk, metadata in prepared
+            if content_hash(chunk.text) not in known_hashes
+        ]
+        result["skipped"] = len(prepared) - len(pending)
+        vectors_by_hash: dict[str, list[float]] = {}
+        if not pending:
+            return result
 
     inputs = [embedding_input(chunk, metadata, path.name) for _, chunk, metadata in pending]
     vectors: list[list[float]] = []
@@ -205,6 +221,10 @@ def ingest_source(path: Path, *, dry_run: bool, force: bool, batch_size: int = 1
                 if attempt == 2:
                     raise
                 time.sleep(2**attempt)
+    vectors_by_hash.update(
+        {content_hash(chunk.text): vector for (_, chunk, _), vector in zip(pending, vectors, strict=True)}
+    )
+    row_entries = prepared if replace_existing else pending
     rows = [
         {
             "source_file": source_filename,
@@ -213,12 +233,27 @@ def ingest_source(path: Path, *, dry_run: bool, force: bool, batch_size: int = 1
             "content_sha256": content_hash(chunk.text),
             "token_count": chunk.token_count,
             "metadata": metadata.model_dump(mode="json"),
-            "embedding": vector,
+            "embedding": vectors_by_hash[content_hash(chunk.text)],
         }
-        for (chunk_index, chunk, metadata), vector in zip(pending, vectors, strict=True)
+        for chunk_index, chunk, metadata in row_entries
     ]
-    upsert_chunks(rows)
-    result["inserted"] = len(rows)
+    result["inserted"] = (
+        replace_source_chunks(source_filename, rows) if replace_existing else upsert_chunks(rows)
+    )
+    return result
+
+
+def ingest_source(path: Path, *, dry_run: bool, force: bool, batch_size: int = 128) -> dict[str, Any]:
+    """Ingest one local source using the common normalized-unit pipeline."""
+    result = ingest_units(
+        parse_by_type(path),
+        source_filename=path.name,
+        source_type=source_type_for(path),
+        dry_run=dry_run,
+        replace_existing=force,
+        batch_size=batch_size,
+    )
+    result["source"] = str(path)
     return result
 
 
