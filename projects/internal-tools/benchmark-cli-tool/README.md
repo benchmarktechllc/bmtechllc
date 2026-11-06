@@ -187,15 +187,68 @@ Transcript calls are rate limited, so a large backfill can take a while and
 may need a second manual run; meetings already indexed are skipped. The
 schedule then keeps the corpus current.
 
+## Fireflies meeting sync
+
+`benchmark-sync-fireflies` reads transcripts visible to a Fireflies API key.
+Create the key under Fireflies integrations, Fireflies API. The sync lists
+meeting metadata from `transcripts` (50 at a time, without sentences) and
+downloads the transcript and summary only for new or changed meetings.
+
+A meeting is indexed once it has a finalized transcript. Live meetings
+(`is_live`), silent meetings (`silent_meeting`), and transcripts with no
+sentences are skipped and retried next run. The summary is included when
+Fireflies returns an overview, short summary, or action items. Each meeting is
+one source, `fireflies/<transcript_id>.md`, with `source_type` `transcript` and
+`kind` `meeting_transcript`. Chunk metadata reuses `recording_id` for the
+Fireflies transcript id and includes the title, meeting date, attendees, and
+transcript URL. The conferencing link (Google Meet, Zoom, or Teams) is in the
+chunk text. Meetings that leave the key's accessible set are removed from
+`document_chunks`.
+
+The list payload has no separate updated time. The sync skips the detail fetch
+and the embedding call when the title, transcript URL, meeting link, host,
+attendees, date, duration, and summary status still match the stored row. When
+those change, a content hash still skips re-embedding if the text is the same.
+
+Free-plan keys allow about 30 requests a minute and 500 a day. The client
+honors HTTP 429 and `Retry-After`. A large backfill can take more than one run;
+meetings already indexed are skipped, and a failed run leaves stored meetings
+in place. Fathom sync continues on its own schedule.
+
+Preview chunk counts without embeddings or database writes. This still calls
+the Fireflies API:
+
+```bash
+FIREFLIES_API_KEY=... benchmark-sync-fireflies --dry-run
+```
+
+Backfill into the corpus:
+
+```bash
+FIREFLIES_API_KEY=...
+DATABASE_URL=...
+OPENAI_API_KEY=...
+benchmark-sync-fireflies
+```
+
+Do not commit those values. `.github/workflows/fireflies-ingestion.yml` runs at
+05:47 UTC daily and on manual dispatch. It uses the `discord-ingestion`
+environment, alongside the Discord, portal, Trello, and Fathom jobs. Add
+`FIREFLIES_API_KEY` as a secret there. `DATABASE_URL` and `OPENAI_API_KEY` are
+already on that environment. After the secret is saved, run the workflow once
+by hand (Actions → Fireflies ingestion → Run workflow) for the first backfill.
+The schedule then keeps the corpus current.
+
 ## Discord ask bot
 
 `benchmark-discord-ask` is a separate always-on gateway process. It calls
 `run_agent` and posts the reply. Ingestion stays on the sync commands
 (`benchmark-sync-discord`, `benchmark-sync-portal`, `benchmark-sync-trello`,
-and `benchmark-sync-fathom`); this bot does not store source text or rebuild
-the corpus. Once those syncs write chunks, the bot can answer from them with
-no gateway change. Retrieval reads `document_chunks` and does not filter on
-source type, so Fathom transcripts are included as soon as they are indexed.
+`benchmark-sync-fathom`, and `benchmark-sync-fireflies`); this bot does not
+store source text or rebuild the corpus. Once those syncs write chunks, the
+bot can answer from them with no gateway change. Retrieval reads
+`document_chunks` and does not filter on source type, so Fathom and Fireflies
+transcripts are included as soon as they are indexed.
 
 People can ask in two ways:
 
@@ -354,6 +407,7 @@ src/benchmark_cli/
   portal_sync.py   Published portal knowledge-base ingestion
   trello_sync.py   Trello board ingestion
   fathom_sync.py   Fathom meeting transcript ingestion
+  fireflies_sync.py  Fireflies meeting transcript ingestion
   discord_ask.py   Gateway bot for #ask-bmtech and /ask
 tests/unit/        Chunking, embeddings, RRF, metric, and Discord reply tests
 data/evaluation/   30-query golden-dataset template

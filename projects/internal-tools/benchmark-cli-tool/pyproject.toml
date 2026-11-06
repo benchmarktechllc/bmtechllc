@@ -29,6 +29,7 @@ benchmark-sync-discord = "benchmark_cli.discord_sync:main"
 benchmark-sync-portal = "benchmark_cli.portal_sync:main"
 benchmark-sync-trello = "benchmark_cli.trello_sync:main"
 benchmark-sync-fathom = "benchmark_cli.fathom_sync:main"
+benchmark-sync-fireflies = "benchmark_cli.fireflies_sync:main"
 benchmark-discord-ask = "benchmark_cli.discord_ask:main"
 
 [tool.pytest.ini_options]

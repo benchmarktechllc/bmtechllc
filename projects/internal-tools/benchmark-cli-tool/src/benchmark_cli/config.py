@@ -31,6 +31,10 @@ FATHOM_API_KEY: Final[str | None] = os.getenv("FATHOM_API_KEY")
 FATHOM_API_BASE_URL: Final[str] = os.getenv(
     "FATHOM_API_BASE_URL", "https://api.fathom.ai/external/v1"
 )
+FIREFLIES_API_KEY: Final[str | None] = os.getenv("FIREFLIES_API_KEY")
+FIREFLIES_API_BASE_URL: Final[str] = os.getenv(
+    "FIREFLIES_API_BASE_URL", "https://api.fireflies.ai/graphql"
+)
 DB_STATEMENT_TIMEOUT_MS: Final[int] = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "5000"))
 HNSW_EF_SEARCH: Final[int] = int(os.getenv("HNSW_EF_SEARCH", "40"))
 
