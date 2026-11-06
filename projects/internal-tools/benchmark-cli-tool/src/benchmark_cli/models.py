@@ -35,6 +35,9 @@ class ChunkMetadata(BaseModel):
     card_id: str | None = None
     labels: list[str] = Field(default_factory=list)
     due: str | None = None
+    attendees: list[str] = Field(default_factory=list)
+    recording_id: str | None = None
+    kind: str | None = None
 
     @model_validator(mode="after")
     def validate_source_fields(self) -> ChunkMetadata:
@@ -42,6 +45,12 @@ class ChunkMetadata(BaseModel):
             raise ValueError("discord chunk metadata requires channel and date_end.")
         if self.source_type == "transcript" and not self.meeting:
             raise ValueError("transcript chunk metadata requires meeting.")
+        if self.kind == "meeting_transcript" and not (
+            self.meeting and self.title and self.url and self.recording_id
+        ):
+            raise ValueError(
+                "meeting transcript metadata requires meeting, title, url, and recording_id."
+            )
         if self.source_type == "policy_doc" and not self.section:
             raise ValueError("policy_doc chunk metadata requires section.")
         if self.source_type == "kb_page" and (not self.section or not self.title):

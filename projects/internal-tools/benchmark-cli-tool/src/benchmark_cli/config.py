@@ -27,6 +27,10 @@ TRELLO_API_KEY: Final[str | None] = os.getenv("TRELLO_API_KEY")
 TRELLO_TOKEN: Final[str | None] = os.getenv("TRELLO_TOKEN")
 TRELLO_BOARD_ID: Final[str] = os.getenv("TRELLO_BOARD_ID", "tIvVZqio").strip() or "tIvVZqio"
 TRELLO_API_BASE_URL: Final[str] = os.getenv("TRELLO_API_BASE_URL", "https://api.trello.com/1")
+FATHOM_API_KEY: Final[str | None] = os.getenv("FATHOM_API_KEY")
+FATHOM_API_BASE_URL: Final[str] = os.getenv(
+    "FATHOM_API_BASE_URL", "https://api.fathom.ai/external/v1"
+)
 DB_STATEMENT_TIMEOUT_MS: Final[int] = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "5000"))
 HNSW_EF_SEARCH: Final[int] = int(os.getenv("HNSW_EF_SEARCH", "40"))
 

@@ -72,6 +72,21 @@ class PortalSyncState:
 
 
 @dataclass(frozen=True, slots=True)
+class FathomSyncState:
+    """Last indexed revision of one Fathom meeting recording."""
+
+    recording_id: str
+    source_file: str
+    content_sha256: str
+    title: str
+    fathom_url: str
+    join_url: str
+    attendees: tuple[str, ...]
+    recorded_at: datetime | None
+    revised_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class TrelloSourceCard:
     """Last indexed revision of one Trello card."""
 
@@ -153,6 +168,7 @@ def initialize_database() -> None:
     apply_sql("002_fts.sql")
     apply_sql("004_discord_sync.sql")
     apply_sql("005_portal_trello_sync.sql")
+    apply_sql("006_fathom_sync.sql")
 
 
 def create_indexes() -> None:
@@ -516,6 +532,79 @@ def delete_trello_source_card(board_id: str, card_id: str) -> None:
             "DELETE FROM trello_source_cards WHERE board_id = %s AND card_id = %s",
             (board_id, card_id),
         )
+        conn.commit()
+
+
+def fathom_sync_states() -> dict[str, FathomSyncState]:
+    """Return every Fathom recording revision recorded by ``benchmark-sync-fathom``."""
+    statement = """
+        SELECT recording_id, source_file, content_sha256, title, fathom_url, join_url,
+               attendees, recorded_at, revised_at
+        FROM fathom_sync_state
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement)
+        rows = cursor.fetchall()
+    states: dict[str, FathomSyncState] = {}
+    for row in rows:
+        attendees = row[6] if isinstance(row[6], list) else []
+        state = FathomSyncState(
+            recording_id=str(row[0]),
+            source_file=str(row[1]),
+            content_sha256=str(row[2]),
+            title=str(row[3]),
+            fathom_url=str(row[4]),
+            join_url=str(row[5] or ""),
+            attendees=tuple(str(person) for person in attendees),
+            recorded_at=row[7],
+            revised_at=row[8],
+        )
+        states[state.recording_id] = state
+    return states
+
+
+def upsert_fathom_sync_state(state: FathomSyncState) -> None:
+    """Record a Fathom meeting after its chunks have been replaced."""
+    _, _, Json = _dependencies()
+    statement = """
+        INSERT INTO fathom_sync_state
+            (recording_id, source_file, content_sha256, title, fathom_url, join_url,
+             attendees, recorded_at, revised_at)
+        VALUES (%(recording_id)s, %(source_file)s, %(content_sha256)s, %(title)s,
+                %(fathom_url)s, %(join_url)s, %(attendees)s, %(recorded_at)s, %(revised_at)s)
+        ON CONFLICT (recording_id) DO UPDATE
+        SET source_file = EXCLUDED.source_file,
+            content_sha256 = EXCLUDED.content_sha256,
+            title = EXCLUDED.title,
+            fathom_url = EXCLUDED.fathom_url,
+            join_url = EXCLUDED.join_url,
+            attendees = EXCLUDED.attendees,
+            recorded_at = EXCLUDED.recorded_at,
+            revised_at = EXCLUDED.revised_at,
+            last_synced_at = now()
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            statement,
+            {
+                "recording_id": state.recording_id,
+                "source_file": state.source_file,
+                "content_sha256": state.content_sha256,
+                "title": state.title,
+                "fathom_url": state.fathom_url,
+                "join_url": state.join_url,
+                "attendees": Json(list(state.attendees)),
+                "recorded_at": state.recorded_at,
+                "revised_at": state.revised_at,
+            },
+        )
+        conn.commit()
+
+
+def delete_fathom_sync_state(recording_id: str) -> None:
+    """Forget a Fathom meeting after its chunks have been removed."""
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("DELETE FROM fathom_sync_state WHERE recording_id = %s", (recording_id,))
         conn.commit()
 
 
