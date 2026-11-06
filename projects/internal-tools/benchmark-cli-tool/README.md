@@ -63,6 +63,104 @@ The scheduled sync detects additions and edits in the range since its stored
 cursor. A deleted older Discord message is not yet removed from the corpus;
 that needs a future reconciliation pass or Discord gateway delete events.
 
+## Discord ask bot
+
+`benchmark-discord-ask` is a separate always-on gateway process. It calls
+`run_agent` and posts the reply. Ingestion stays on `benchmark-sync-discord`;
+this bot does not store Discord messages or rebuild the corpus.
+
+People can ask in two ways:
+
+- In `DISCORD_ASK_CHANNEL_ID` (the `#ask-bmtech` channel), every non-bot
+  message that contains text is answered. Threads under that channel are
+  included. The bot opens a thread on the message when Discord allows it, and
+  replies on the message when it does not. Messages that are already in a
+  thread get a thread reply. The bot ignores its own messages and other bots.
+- `/ask question:<text>` works in every channel of the guild. The answer is
+  posted in the channel where the command was used. Discord's first response
+  window is shorter than retrieval, so the bot defers with a public thinking
+  state and then sends the answer. A blank question gets an ephemeral reply.
+
+Set `DISCORD_ASK_GUILD_ID` to register `/ask` on that guild immediately. Leave
+it unset to sync a global command, which can take up to an hour to appear.
+Use one of those modes. After switching from a global command to a guild
+command, remove the leftover global `/ask` in the Discord developer portal so
+the command is listed once. Leave `/ask` enabled for every channel in the
+server's integration settings.
+
+The answer bot needs the privileged Message Content Intent. Channel messages
+arrive without text when that intent is off, and those messages are skipped.
+`/ask` still works, because the question is a slash-command option. Invite the
+application with the `bot` and `applications.commands` scopes. In the ask
+channel, grant View Channel, Send Messages, Read Message History, Create
+Public Threads, and Send Messages in Threads. In other channels where people
+use `/ask`, grant View Channel and Send Messages.
+
+Keep these values in a secret manager, the gitignored `.env` / `.env.local`
+files, or a `chmod 600` env file on the VM:
+
+```bash
+DISCORD_ANSWER_BOT_TOKEN=...     # required gateway bot token
+DISCORD_ASK_CHANNEL_ID=...       # required snowflake of #ask-bmtech
+DATABASE_URL=...                 # required by run_agent
+OPENAI_API_KEY=...               # required by run_agent
+DISCORD_ASK_GUILD_ID=...         # optional; guild command sync
+```
+
+`DISCORD_ANSWER_BOT_TOKEN` is independent of `DISCORD_INGEST_BOT_TOKEN`.
+
+Run it locally from this directory after Setup:
+
+```bash
+pip install -e '.[dev]'
+benchmark-discord-ask
+```
+
+The process stays connected until you stop it. `.env` in this directory is
+loaded on startup.
+
+On the Hetzner VM, run it as a systemd service or a container. The scheduled
+GitHub Actions ingest workflow stays as it is. Install the project into a
+virtualenv, put the variables in `/etc/bmtech/discord-ask.env`, and use a unit
+like:
+
+```ini
+[Unit]
+Description=BMTech Discord ask bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bmtech
+WorkingDirectory=/opt/benchmark-cli-tool
+EnvironmentFile=/etc/bmtech/discord-ask.env
+ExecStart=/opt/benchmark-cli-tool/.venv/bin/benchmark-discord-ask
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now benchmark-discord-ask
+sudo systemctl status benchmark-discord-ask
+```
+
+A local image can run the same process. Build from this directory and pass
+the env file at runtime:
+
+```bash
+docker build -t benchmark-discord-ask .
+docker run -d --name benchmark-discord-ask --restart unless-stopped \
+  --env-file /etc/bmtech/discord-ask.env benchmark-discord-ask
+```
+
+Replies are capped at Discord's 2000-character limit. Citations from the
+agent are included when they fit.
+
 `search_docs(query, top_k=5)` embeds the query once, concurrently retrieves 20
 pgvector candidates and 20 PostgreSQL FTS candidates, then merges them with
 RRF (`k = 60`). It returns chunks and fused search scores only. The optional
@@ -124,6 +222,8 @@ src/benchmark_cli/
   storage/         PostgreSQL/pgvector + FTS schema and queries
   retrieval.py     Concurrent hybrid retrieval and pure RRF fusion
   evaluation/      Golden dataset loading, metrics, CLI
-tests/unit/        Chunking, embeddings, RRF, and metric tests
+  discord_sync.py  Scheduled channel ingestion
+  discord_ask.py   Gateway bot for #ask-bmtech and /ask
+tests/unit/        Chunking, embeddings, RRF, metric, and Discord reply tests
 data/evaluation/   30-query golden-dataset template
 ```

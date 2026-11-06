@@ -14,6 +14,7 @@ dependencies = [
   "psycopg[binary]>=3.1",
   "pgvector>=0.2.5",
   "tiktoken>=0.7.0",
+  "discord.py>=2.4,<3",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +26,7 @@ benchmark-evaluate = "benchmark_cli.evaluation.cli:main"
 benchmark-search = "benchmark_cli.search_cli:main"
 benchmark-answer = "benchmark_cli.agent:main"
 benchmark-sync-discord = "benchmark_cli.discord_sync:main"
+benchmark-discord-ask = "benchmark_cli.discord_ask:main"
 
 [tool.pytest.ini_options]
 addopts = "-m 'not integration_live'"
