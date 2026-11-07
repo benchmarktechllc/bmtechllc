@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -10,11 +11,13 @@ import pytest
 from benchmark_cli import agent
 from benchmark_cli.acceptance import _check, _outcome
 from benchmark_cli.discord_sync import plan_discord_reconcile
+from benchmark_cli.entailment import assess_claim, meaningful_text, supported_steps
 from benchmark_cli.grounding import (
     asks_for_core_team,
     asks_for_employee_count,
     asks_for_portal_link,
     asks_for_synced_channels,
+    scrub_response,
     stated_employee_count_answer,
 )
 from benchmark_cli.ingestion.clean import discord_message_is_authoritative, redact_secrets
@@ -816,3 +819,227 @@ def test_abstention_uses_plain_language_and_keeps_a_cited_plan(
     assert unknown.citations == []
     assert "no_relevant_information" not in unknown.answer
     assert "does not address" in unknown.answer.casefold()
+    assert "incident" not in unknown.answer.casefold()
+
+
+@pytest.mark.unit
+def test_claim_entailment_accepts_paraphrase_and_marks_status() -> None:
+    assert (
+        assess_claim(
+            "The page describes invoices and credits.",
+            "The billing page covers invoices and credits.",
+        )
+        == "supported"
+    )
+    assert (
+        assess_claim(
+            "It describes invoices and credits.",
+            "The billing page covers invoices and credits.",
+        )
+        == "supported"
+    )
+    assert (
+        assess_claim(
+            "The playbook says to page the primary and then post in incident channel.",
+            "Page the primary, then post in incident channel.",
+        )
+        == "supported"
+    )
+    billed = "Customers are billed through invoices and credits."
+    assert assess_claim(billed, billed) == "supported"
+    weaker = assess_claim(billed, "The page covers invoices and credits.")
+    assert weaker == "unknown"
+    assert (
+        assess_claim(
+            "The page describes invoices and credits.",
+            "The guide does not cover invoices or credits.",
+        )
+        == "contradicted"
+    )
+    assert (
+        assess_claim(
+            "The core team hired Ada.",
+            "The core team will discuss hiring next month.",
+        )
+        == "unknown"
+    )
+
+
+@pytest.mark.unit
+def test_ordinary_answers_stay_meaningful_and_responsive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def run(question: str, chunk: SearchChunk, claim: str, quote: str | None = None) -> AnswerResponse:
+        monkeypatch.setattr(agent, "log_agent_diagnostic", lambda **_kwargs: None)
+        monkeypatch.setattr(agent, "classify_query", lambda _question: "cheap")
+        monkeypatch.setattr(
+            agent,
+            "retrieve_evidence",
+            lambda *_a, **_k: RetrievalDecision(
+                "accepted",
+                (HybridSearchResult(chunk, 0.2, vector_score=0.8, fts_score=1.0),),
+                0.8,
+                1,
+            ),
+        )
+        monkeypatch.setattr(
+            agent,
+            "call_llm",
+            lambda **_k: SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=None, content=""))]),
+        )
+        monkeypatch.setattr(
+            agent,
+            "call_llm_structured",
+            lambda **_k: AnswerResponse(
+                status="answered",
+                answer=claim,
+                confidence=0.9,
+                citations=[
+                    Citation(
+                        source_file=chunk.source_file,
+                        chunk_id=chunk.id,
+                        content_sha256=chunk.content_sha256 or _DIGEST,
+                        quote=quote or chunk.chunk_text,
+                    )
+                ],
+            ),
+        )
+        return agent.run_agent(question)
+
+    comparison = "A playbook explains the approach. A runbook lists the steps."
+    guide = SearchChunk(
+        7,
+        "portal/guide/operations.md",
+        0,
+        comparison,
+        {"source_type": "kb_page", "title": "Guide", "url": "https://example.test/guide/"},
+        1.0,
+        content_sha256=_DIGEST,
+    )
+    paraphrase = "Playbooks explain the approach, while runbooks list the steps."
+    compared = run("How do playbooks compare with runbooks?", guide, paraphrase)
+    assert compared.status == "answered"
+    assert compared.answer == paraphrase
+    assert "incident" not in compared.answer.casefold()
+    assert "playbook" in compared.answer.casefold()
+    assert "runbook" in compared.answer.casefold()
+
+    suppressed = run(
+        "How do playbooks compare with runbooks?",
+        guide,
+        "The retrieved evidence does not address this question. Missing facts, including any current incident state, are unknown.",
+    )
+    assert suppressed.status == "answered"
+    assert "playbook" in suppressed.answer.casefold()
+    assert "runbook" in suppressed.answer.casefold()
+    assert "current incident" not in suppressed.answer.casefold()
+
+    numbered = SearchChunk(
+        8,
+        "notes/planning.md",
+        0,
+        "Kiosk next work is MVP definition and setting the timeline.",
+        {"source_type": "kb_page", "title": "Planning note"},
+        1.0,
+        content_sha256="c" * 64,
+    )
+    kiosk = run("What kiosk decisions are complete?", numbered, "2. 3. 4.")
+    assert meaningful_text(kiosk.answer)
+    assert re.fullmatch(r"[\d.\s]+", kiosk.answer.strip()) is None
+    assert "2. 3. 4." != kiosk.answer.strip()
+    assert "timeline" in kiosk.answer.casefold()
+    assert "does not explicitly state" in kiosk.answer.casefold()
+
+    link = SearchChunk(
+        9,
+        "notes/chat.md",
+        0,
+        "Can someone share the Google link?",
+        {"source_type": "discord", "title": "Chat"},
+        1.0,
+        content_sha256="d" * 64,
+    )
+    oncall = run("How many staff are on the on-call rotation?", link, "Can someone share the Google link?")
+    assert oncall.status == "no_relevant_information"
+    assert oncall.citations == []
+    assert "google" not in oncall.answer.casefold()
+    assert "does not address" in oncall.answer.casefold()
+
+    brainstorm = SearchChunk(
+        10,
+        "notes/ideas.md",
+        0,
+        "Brainstorm note: we might hire someone for ingestion someday.",
+        {"source_type": "kb_page", "title": "Old ideas"},
+        1.0,
+        content_sha256="e" * 64,
+    )
+    hiring = run(
+        "Who should we hire next for the core team?",
+        brainstorm,
+        "Hire Nick to own ingestion.",
+    )
+    assert "nick" not in hiring.answer.casefold()
+    assert "not a current recommendation" in hiring.answer.casefold()
+    assert "brainstorm" in hiring.answer.casefold()
+
+    billed = "Customers are billed through invoices and credits."
+    billing = SearchChunk(
+        11,
+        "portal/billing.md",
+        0,
+        billed,
+        {"source_type": "kb_page", "title": "Billing"},
+        1.0,
+        content_sha256="f" * 64,
+    )
+    invoices = run("What does billing cover?", billing, billed)
+    assert invoices.status == "answered"
+    assert invoices.answer == billed
+    assert "not a final decision" not in invoices.answer.casefold()
+    covers = SearchChunk(
+        13,
+        "portal/billing.md",
+        0,
+        "The page covers invoices and credits.",
+        {"source_type": "kb_page", "title": "Billing"},
+        1.0,
+        content_sha256="b" * 64,
+    )
+    described = run("What does the page describe?", covers, "The page describes invoices and credits.")
+    assert described.status == "answered"
+    assert "invoices and credits" in described.answer.casefold()
+    assert "not a final decision" not in described.answer.casefold()
+    hedged = run("What does the page describe?", covers, billed)
+    assert "not a final decision" not in hedged.answer.casefold()
+    steps = supported_steps(
+        "Page the primary, then post in incident channel, then call the vendor.",
+        "Page the primary, then post in incident channel.",
+    )
+    assert steps is not None
+    assert "vendor" not in steps.casefold()
+    assert "primary" in steps.casefold()
+
+    duties = SearchChunk(
+        12,
+        "portal/guide/lifecycle.md",
+        0,
+        "Forward-deployed engineers own release responsibilities.",
+        {"source_type": "kb_page", "title": "Forward-deployed responsibilities"},
+        1.0,
+        content_sha256="a" * 64,
+    )
+    located = run(
+        "Where is the deployment guide?",
+        duties,
+        "Forward-deployed engineers own release responsibilities.",
+    )
+    assert "closest cited page" in located.answer.casefold()
+    assert located.answer.strip() != duties.chunk_text
+
+    dumped = scrub_response(
+        AnswerResponse(status="no_relevant_information", answer="status : nothing matched", confidence=0.0)
+    )
+    assert "nothing matched" not in dumped.answer.casefold()
+    assert "status" not in dumped.answer.casefold()
+    assert "does not address" in dumped.answer.casefold()

@@ -13,6 +13,15 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from .corpus import is_synthetic_canary
+from .entailment import (
+    answers_question,
+    asks_recommendation,
+    assess_claim,
+    claim_status,
+    is_not_current_recommendation,
+    meaningful_text,
+    supported_steps,
+)
 from .ingestion.clean import redact_secrets
 from .models import AnswerResponse, Citation
 from .portal_urls import portal_home_from_metadata, portal_home_url
@@ -445,27 +454,13 @@ def synced_channels_answer(channels: Sequence[SyncedDiscordChannel]) -> AnswerRe
     )
 
 
-# Grammar and answer framing, not a catalog of company nouns.
-_FUNCTION = frozenset(
-    """
-    a an the of to for in on at by with from into about and or but if unless
-    when while our your my me i we you do does did is are was were be been
-    being how what where who which whom whose please can could should would
-    will may might shall tell give show send there here this that these those
-    it its their them than then so not no nor as per via onto upon am have has
-    had also just only next new current bmtech benchmark benchmarktech company
-    discord team core channel channels
-    """.split()
-)
-_FRAMING = frozenset(
-    "relevant retrieved retrieve excerpt excerpts citation citations source sources following".split()
-)
-_IRREGULAR_DONE = frozenset(
-    "made done built sent paid met left kept held found set gone begun".split()
-)
 _NOT_RESPONSIVE = (
     "The retrieved evidence does not address this question. "
-    "Missing facts, including any current incident state, are unknown."
+    "What it does not say is unknown."
+)
+_NOT_CURRENT_RECOMMENDATION = (
+    "The cited text is not a current recommendation. "
+    "It reads as an older note or brainstorm, not a decision about who to hire now."
 )
 _REQUESTED_DOCS = (
     ("deployment guide", ("deployment guide", "deploy guide")),
@@ -477,7 +472,10 @@ _PLAN_QUALIFICATION = (
     "The retrieved evidence does not explicitly state that this was approved, decided, or completed. "
     "What follows is cited text, and it is not a final decision."
 )
-_STATUS_TOKEN = re.compile(r"\bno_relevant_information\b", re.IGNORECASE)
+_STATUS_TOKEN = re.compile(
+    r"\bstatus\s*[:=]\s*[^\n.]*|\b(?:no_relevant_information|nothing matched)\b",
+    re.IGNORECASE,
+)
 
 
 def _cited_chunks(response: AnswerResponse, chunks: Sequence[SearchChunk]) -> list[SearchChunk]:
@@ -517,61 +515,6 @@ def _chunk_identity_text(chunk: SearchChunk) -> str:
     )
 
 
-def _stem(token: str) -> str:
-    word = token.casefold().replace("'", "")
-    for suffix in ("ing", "ed", "es"):
-        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
-            word = word[: -len(suffix)]
-            break
-    else:
-        if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
-            word = word[:-1]
-    if len(word) > 3 and word.endswith("e"):
-        word = word[:-1]
-    return word
-
-
-def _content_stems(text: str) -> set[str]:
-    stems: set[str] = set()
-    for token in re.findall(r"[A-Za-z][A-Za-z'-]{1,}", text):
-        raw = token.casefold().replace("'", "")
-        if raw in _FUNCTION or raw in _FRAMING:
-            continue
-        stem = _stem(token)
-        if len(stem) >= 3 and stem not in _FUNCTION and stem not in _FRAMING:
-            stems.add(stem)
-    return stems
-
-
-def _proper_names(sentence: str) -> list[str]:
-    return [
-        word
-        for word in re.findall(r"\b[A-Z][a-z]{2,}\b", sentence)
-        if word.casefold() not in _FUNCTION and word.casefold() not in _FRAMING
-    ]
-
-
-def _completed(text: str) -> bool:
-    """A finished claim, not a future, modal, or proposal.
-
-    ``decisions made`` counts without a preceding ``were``. ``will discuss``
-    and ``might write`` do not.
-    """
-    if re.search(r"\b(?:will|would|might|could|may|should|shall|can)\b", text, flags=re.IGNORECASE):
-        return False
-    if re.search(
-        r"\b(?:next|tomorrow|later|upcoming|proposal|plan|planning|todo|to-do|draft)\b",
-        text,
-        flags=re.IGNORECASE,
-    ):
-        return False
-    for token in re.findall(r"[A-Za-z']+", text):
-        word = token.casefold()
-        if word in _IRREGULAR_DONE or (len(word) > 4 and word.endswith("ed") and not word.endswith("eed")):
-            return True
-    return False
-
-
 def _is_howto(question: str) -> bool:
     """A procedure question. A comparison that happens to start with ``how`` is not one."""
     if re.search(
@@ -606,28 +549,6 @@ def _is_document_lookup(question: str) -> bool:
     ) is not None
 
 
-def _on_topic(question: str, evidence: str) -> bool:
-    return bool(_content_stems(question) & _content_stems(evidence))
-
-
-def _covers(question: str, evidence: str) -> bool:
-    stems = _content_stems(question)
-    return bool(stems) and stems <= _content_stems(evidence)
-
-
-def _sentence_supported(sentence: str, quotes: str) -> bool:
-    """The sentence adds nothing the quotes do not already say, in the same tense."""
-    stems = _content_stems(sentence)
-    if stems and not stems <= _content_stems(quotes):
-        return False
-    folded = quotes.casefold()
-    if any(name.casefold() not in folded for name in _proper_names(sentence)):
-        return False
-    if _completed(sentence) and not _completed(quotes):
-        return False
-    return True
-
-
 def _without_orphan_citation_sentences(answer: str, citation_count: int) -> str:
     """Drop a sentence whose inline marker does not name a returned citation."""
     kept: list[str] = []
@@ -653,21 +574,6 @@ def _chunk_label(chunk: SearchChunk) -> str:
     return title or url or chunk.source_file
 
 
-def _asserts_document(answer: str, aliases: tuple[str, ...]) -> bool:
-    """True when the answer equates a page with the document, not when it discusses the idea."""
-    for alias in aliases:
-        if re.search(rf"\b{re.escape(alias)}\s+(?:is|are)\b", answer, flags=re.IGNORECASE) is None:
-            continue
-        if re.search(
-            rf"\b{re.escape(alias)}\s+(?:is|are)\s+(?:not|no|different|broader|narrower|unlike)\b",
-            answer,
-            flags=re.IGNORECASE,
-        ):
-            continue
-        return True
-    return False
-
-
 def _excerpts(response: AnswerResponse) -> str:
     return "\n".join(f"- {citation.quote}" for citation in response.citations)
 
@@ -681,18 +587,18 @@ def _with_note(response: AnswerResponse, note: str) -> AnswerResponse:
     )
 
 
-def _identity_gap(question: str, answer: str, cited: Sequence[SearchChunk]) -> str | None:
-    """A lookup that names a page the metadata does not identify. Comparisons are not lookups."""
+def _identity_gap(question: str, cited: Sequence[SearchChunk]) -> str | None:
+    """A page lookup whose metadata is a different document. Comparisons are not lookups."""
     if not _is_document_lookup(question):
         return None
     for label, aliases in _requested_documents(question):
-        if not _asserts_document(answer, aliases):
-            continue
         if any(
             any(_identity_has(_chunk_identity_text(chunk), alias) for alias in aliases) for chunk in cited
         ):
-            continue
-        closest = _chunk_label(cited[0]) if cited else "the cited page"
+            return None
+        if not cited:
+            return None
+        closest = _chunk_label(cited[0])
         return (
             f"No retrieved page is identified as the {label}. "
             f"The closest cited page is {closest}. "
@@ -701,8 +607,37 @@ def _identity_gap(question: str, answer: str, cited: Sequence[SearchChunk]) -> s
     return None
 
 
+def _page_is_identified(question: str, cited: Sequence[SearchChunk]) -> bool:
+    if not _is_document_lookup(question):
+        return False
+    for _label, aliases in _requested_documents(question):
+        if any(
+            any(_identity_has(_chunk_identity_text(chunk), alias) for alias in aliases) for chunk in cited
+        ):
+            return True
+    return False
+
+
 def _split_sentences(answer: str) -> list[str]:
     return [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", answer.strip()) if sentence.strip()]
+
+
+def _is_comparison(question: str) -> bool:
+    return re.search(
+        r"\b(?:differ(?:s|ence|ent)?|compar(?:e|ison|ing|ed)|versus|vs\.?|between)\b",
+        question,
+        flags=re.IGNORECASE,
+    ) is not None
+
+
+def _rendered(response: AnswerResponse, text: str) -> AnswerResponse | None:
+    """Ship only an answer that still says something."""
+    cleaned = text.strip()
+    if not meaningful_text(cleaned):
+        return None
+    if cleaned == response.answer.strip():
+        return response
+    return response.model_copy(update={"answer": cleaned, "confidence": min(response.confidence, 0.4)})
 
 
 def qualify_grounded_answer(
@@ -710,57 +645,94 @@ def qualify_grounded_answer(
     response: AnswerResponse,
     chunks: Sequence[SearchChunk],
 ) -> AnswerResponse:
-    """Keep a sentence only when a returned citation says it, in the same tense.
+    """Keep supported, responsive synthesis. Do not ship numbering or an off-topic quote.
 
-    A how-to is answered from quotes that cover the request, not from one shared
-    verb. A finished claim needs finished evidence. A comparison is not rewritten
-    into a missing-page notice. An inline marker with no returned citation drops
-    that sentence.
+    Entailment allows a paraphrase. It does not treat quote containment, a
+    shared verb, or an -ed spelling as proof. A page lookup that is not the
+    requested document keeps the closest-page qualification. A comparison the
+    evidence supports is kept as that comparison.
     """
     if response.status != "answered" or not response.citations:
         return response
     visible = _without_orphan_citation_sentences(response.answer, len(response.citations))
-    if not visible:
-        return _abstain(_NOT_RESPONSIVE)
     response = response.model_copy(update={"answer": visible})
     cited = _cited_chunks(response, chunks)
     quoted = "\n".join(citation.quote for citation in response.citations)
-    if _is_howto(question) and not _covers(question, quoted):
+    identity = " ".join(_chunk_identity_text(chunk) for chunk in cited)
+    if _is_howto(question) and not answers_question(question, quoted, require_all=True):
         return _abstain(_NOT_RESPONSIVE)
-    sentences = _split_sentences(visible)
-    kept = [sentence for sentence in sentences if _sentence_supported(sentence, quoted)]
-    if len(kept) == len(sentences):
-        kept_answer = visible
-    else:
-        kept_answer = " ".join(kept).strip()
-    identity = _identity_gap(question, visible, cited)
-    if identity is not None:
-        return _with_note(response, identity)
-    if kept_answer:
-        if kept_answer == visible:
-            return response
-        return response.model_copy(update={"answer": kept_answer, "confidence": min(response.confidence, 0.4)})
-    identified = _is_document_lookup(question) and any(
-        any(_identity_has(_chunk_identity_text(chunk), alias) for alias in aliases)
-        for _label, aliases in _requested_documents(question)
-        for chunk in cited
-    )
-    if identified:
-        return response.model_copy(
-            update={"answer": _excerpts(response), "confidence": min(response.confidence, 0.4)}
-        )
-    if _is_howto(question) and _covers(question, quoted):
-        return response.model_copy(
-            update={"answer": _excerpts(response), "confidence": min(response.confidence, 0.4)}
-        )
-    if _on_topic(question, quoted) and _completed(quoted):
-        return response.model_copy(
-            update={"answer": _excerpts(response), "confidence": min(response.confidence, 0.4)}
-        )
-    if _on_topic(question, quoted) and (
-        _asks_outcome(question) or (_completed(visible) and not _completed(quoted))
+    kept: list[str] = []
+    unsupported_decision = False
+    for sentence in _split_sentences(visible):
+        if not meaningful_text(sentence):
+            continue
+        verdict = assess_claim(sentence, quoted, identity)
+        if verdict == "supported" and (
+            answers_question(question, sentence) or answers_question(question, quoted)
+        ):
+            kept.append(sentence)
+            continue
+        if claim_status(sentence) == "decided":
+            unsupported_decision = True
+            continue
+        partial = supported_steps(sentence, quoted)
+        if partial and meaningful_text(partial) and answers_question(question, partial):
+            kept.append(partial)
+    disclaimer = _identity_gap(question, cited)
+    excerpts = _excerpts(response)
+    if disclaimer:
+        body = excerpts if meaningful_text(excerpts) else ""
+        text = disclaimer if not body else f"{disclaimer}\n\n{body}"
+        rendered = _rendered(response, text)
+        return rendered if rendered is not None else _abstain(_NOT_RESPONSIVE)
+    if kept and kept == _split_sentences(visible) and meaningful_text(visible):
+        return response
+    if kept:
+        rendered = _rendered(response, " ".join(kept))
+        if rendered is not None:
+            return rendered
+    if (
+        asks_recommendation(question)
+        and answers_question(question, quoted)
+        and is_not_current_recommendation(quoted)
+        and meaningful_text(excerpts)
     ):
-        return _with_note(response, _PLAN_QUALIFICATION)
+        rendered = _rendered(response, f"{_NOT_CURRENT_RECOMMENDATION}\n\n{excerpts}")
+        if rendered is not None:
+            return rendered
+    if (
+        unsupported_decision
+        and answers_question(question, quoted)
+        and claim_status(quoted) != "decided"
+        and meaningful_text(excerpts)
+    ):
+        rendered = _rendered(response, f"{_PLAN_QUALIFICATION}\n\n{excerpts}")
+        if rendered is not None:
+            return rendered
+    if (
+        not kept
+        and _asks_outcome(question)
+        and answers_question(question, quoted)
+        and meaningful_text(excerpts)
+    ):
+        if claim_status(quoted) == "decided":
+            rendered = _rendered(response, excerpts)
+        else:
+            rendered = _rendered(response, f"{_PLAN_QUALIFICATION}\n\n{excerpts}")
+        if rendered is not None:
+            return rendered
+    if _is_comparison(question) and answers_question(question, quoted) and meaningful_text(excerpts):
+        rendered = _rendered(response, excerpts)
+        if rendered is not None:
+            return rendered
+    if _page_is_identified(question, cited) and meaningful_text(excerpts):
+        rendered = _rendered(response, excerpts)
+        if rendered is not None:
+            return rendered
+    if _is_howto(question) and answers_question(question, quoted, require_all=True) and meaningful_text(excerpts):
+        rendered = _rendered(response, excerpts)
+        if rendered is not None:
+            return rendered
     return _abstain(_NOT_RESPONSIVE)
 
 
@@ -777,7 +749,7 @@ def supported_outcome_answer(
         return None
     citations: list[Citation] = []
     for result in results:
-        if not _on_topic(question, result.chunk.chunk_text):
+        if not answers_question(question, result.chunk.chunk_text):
             continue
         quote = verbatim_excerpt(result.chunk.chunk_text)
         citation = _citation(result, quote)
@@ -785,23 +757,23 @@ def supported_outcome_answer(
             citations.append(citation)
     if not citations:
         return None
-    completed = [
-        citation.quote
-        for citation in citations
-        if _completed(citation.quote) and _on_topic(question, citation.quote)
-    ]
-    if completed:
-        answer = "\n".join(f"- {quote}" for quote in completed)
+    decided = [citation.quote for citation in citations if claim_status(citation.quote) == "decided"]
+    if decided:
+        answer = "\n".join(f"- {quote}" for quote in decided)
+    elif asks_recommendation(question) and is_not_current_recommendation("\n".join(c.quote for c in citations)):
+        answer = _NOT_CURRENT_RECOMMENDATION + "\n\n" + "\n".join(f"- {c.quote}" for c in citations)
     else:
         answer = _PLAN_QUALIFICATION + "\n\n" + "\n".join(f"- {citation.quote}" for citation in citations)
+    if not meaningful_text(answer):
+        return None
     return AnswerResponse(status="answered", answer=answer, confidence=0.4, citations=citations)
 
 
 def _plain_answer(answer: str) -> str:
-    """The status code is not something to show a person."""
+    """Drop an internal status dump, including ``status : nothing matched``."""
     if _STATUS_TOKEN.search(answer) is None:
         return answer
-    cleaned = _STATUS_TOKEN.sub("", answer)
+    cleaned = _STATUS_TOKEN.sub(" ", answer)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" \n\t-:;,.")
     return cleaned or _NOT_RESPONSIVE
 
