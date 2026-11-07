@@ -1,24 +1,22 @@
-"""Claim-level entailment for grounded answers.
+"""Claim checks for grounded answers.
 
-A citation quote being an exact substring of a chunk is not a reason to show
-it. Each answer sentence is a claim with polarity, time, and status. The
-claim is supported, unknown, or contradicted by the evidence:
+This is not an open-world paraphrase model. It does not know that "go out
+every month" means "are sent monthly." It does three narrower jobs:
 
-- supported: the evidence establishes the proposition, including a reporting
-  paraphrase ("describes" / "covers"), a "says to" restatement of an
-  instruction, a pronoun, or a source name that belongs to the citation
-- unknown: the evidence does not establish the claim, including when a
-  proposal or future note is asked to count as a finished decision
-- contradicted: the evidence asserts the opposite of the claim
+- a claim is supported only when one citation states that proposition
+  (reporting verbs and instruction voice aside) and the times agree
+- a quote answers a question only when it covers the question, not when the
+  two strings share one word
+- a past year keeps a recommendation in the past, and a decision does not
+  prove a future "will"
 
-Status comes from decision and proposal language. A participle such as
-"billed" is not a decision. Rendering then refuses an answer that is only
-numbering or an off-topic quote.
+Unsupported paraphrases stay unknown.
 """
 
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Literal
 
 Verdict = Literal["supported", "unknown", "contradicted"]
@@ -35,8 +33,9 @@ _FUNCTION = frozenset(
     """.split()
 )
 _FRAMING = frozenset(
-    "relevant retrieved retrieve excerpt excerpts citation citations source sources following page document evidence text section article chunk".split()
+    "relevant retrieved retrieve excerpt excerpts citation citations source sources following document evidence text section article chunk".split()
 )
+_YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
 _VAGUE = frozenset({"result", "thing", "information", "detail", "anything", "something"})
 _REPORT_BASES = (
     "say",
@@ -117,11 +116,30 @@ def asks_recommendation(question: str) -> bool:
     return _RECOMMENDATION.search(question) is not None
 
 
+def past_scoped(text: str, today: date | None = None) -> bool:
+    """A calendar year before this year anchors the text in the past."""
+    year = (today or date.today()).year
+    return any(int(value) < year for value in _YEAR.findall(text))
+
+
 def is_not_current_recommendation(text: str) -> bool:
-    """A brainstorm or hedged note is not a current hiring recommendation."""
+    """A past note stays past even when it says ``we should hire``."""
+    if past_scoped(text):
+        return True
     if _CURRENT_RECOMMENDATION.search(text):
         return False
     return _NOT_CURRENT.search(text) is not None
+
+
+def temporally_incompatible(claim: str, evidence: str) -> bool:
+    """Future does not follow from a past decision, and a past note is not current."""
+    claim_future = _FUTURE.search(claim) is not None and claim_status(claim) != "decided"
+    if claim_future and claim_status(evidence) == "decided":
+        return True
+    if past_scoped(evidence) and not past_scoped(claim):
+        if claim_future or re.search(r"\bhire\b", claim, re.IGNORECASE):
+            return True
+    return False
 
 
 def _lemma(token: str) -> str:
@@ -164,12 +182,10 @@ def _covered(term: str, terms: set[str]) -> bool:
     return any(_related(term, other) for other in terms)
 
 
-def proposition_terms(text: str) -> set[str]:
-    """Content of the proposition after attribution and reporting verbs are set aside."""
-    stripped = _SAYS_TO.sub("", text.strip(), count=1)
-    stripped = _DEICTIC_REPORT.sub("", stripped, count=1)
+def content_terms(text: str) -> set[str]:
+    """Content words, including a document word such as page when it is not only a frame."""
     terms: set[str] = set()
-    for token in re.findall(r"[A-Za-z][A-Za-z'-]{1,}", stripped):
+    for token in re.findall(r"[A-Za-z][A-Za-z'-]{1,}", text):
         raw = token.casefold().replace("'", "")
         if raw in _FUNCTION or raw in _FRAMING or _is_reporting(token):
             continue
@@ -177,6 +193,13 @@ def proposition_terms(text: str) -> set[str]:
         if len(lemma) >= 3 and lemma not in _FUNCTION and lemma not in _FRAMING:
             terms.add(lemma)
     return terms
+
+
+def proposition_terms(text: str) -> set[str]:
+    """Proposition after a leading 'the page describes' or 'says to' frame is removed."""
+    stripped = _SAYS_TO.sub("", text.strip(), count=1)
+    stripped = _DEICTIC_REPORT.sub("", stripped, count=1)
+    return content_terms(stripped)
 
 
 def _terms_covered(claim: set[str], evidence: set[str]) -> bool:
@@ -235,6 +258,8 @@ def assess_claim(sentence: str, evidence: str, identity: str = "") -> Verdict:
         return "unknown"
     if _contradicts(sentence, evidence):
         return "contradicted"
+    if temporally_incompatible(sentence, evidence):
+        return "unknown"
     if claim_status(sentence) == "decided" and claim_status(evidence) != "decided":
         return "unknown"
     if any(not _name_in_evidence(name, evidence) for name in proper_names(sentence)):
@@ -248,15 +273,28 @@ def assess_claim(sentence: str, evidence: str, identity: str = "") -> Verdict:
     return "unknown"
 
 
+def _matched(question: str, text: str) -> tuple[int, int]:
+    asked = content_terms(question) - _VAGUE
+    have = content_terms(text)
+    return sum(1 for term in asked if _covered(term, have)), len(asked)
+
+
+def touches_question(question: str, text: str) -> bool:
+    """Any shared content term. Used only to attach a qualifier, not to accept a claim."""
+    matched, total = _matched(question, text)
+    return total == 0 or matched >= 1
+
+
 def answers_question(question: str, text: str, *, require_all: bool = False) -> bool:
-    """The text has to address the question. A contained quote can still be off topic."""
-    asked = proposition_terms(question) - _VAGUE
-    if not asked:
+    """One shared word does not answer a question that asked for several things."""
+    matched, total = _matched(question, text)
+    if total == 0:
         return True
-    have = proposition_terms(text)
     if require_all:
-        return _terms_covered(asked, have)
-    return any(_covered(term, have) for term in asked)
+        return matched == total
+    if total == 1:
+        return matched == 1
+    return matched >= 2 and matched / total > 0.5
 
 
 def supported_steps(sentence: str, evidence: str) -> str | None:

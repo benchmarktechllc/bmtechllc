@@ -475,7 +475,7 @@ def test_orphan_citation_marker_is_removed_and_unrelated_hire_abstains(
     assert "does not explicitly state" in kiosk.answer.casefold()
     assert "[3]" not in kiosk.answer
     assert "demonstrated prototype shipped" not in kiosk.answer.casefold()
-    assert [citation.chunk_id for citation in kiosk.citations] == [110, 200]
+    assert [citation.chunk_id for citation in kiosk.citations] == [110]
 
     decided = SearchChunk(
         300,
@@ -863,6 +863,10 @@ def test_claim_entailment_accepts_paraphrase_and_marks_status() -> None:
         )
         == "unknown"
     )
+    assert assess_claim("The primary is paged.", "Page the primary.") == "supported"
+    assert assess_claim("Invoices go out every month.", "Invoices are sent monthly.") == "unknown"
+    assert assess_claim("Customers receive a bill each month.", "Invoices are sent monthly.") == "unknown"
+    assert assess_claim("They will ship the portal.", "They decided to ship the portal.") == "unknown"
 
 
 @pytest.mark.unit
@@ -1043,3 +1047,112 @@ def test_ordinary_answers_stay_meaningful_and_responsive(
     assert "nothing matched" not in dumped.answer.casefold()
     assert "status" not in dumped.answer.casefold()
     assert "does not address" in dumped.answer.casefold()
+
+    contact = SearchChunk(
+        14,
+        "notes/expenses.md",
+        0,
+        "The expense report is at the Google link.",
+        {"source_type": "kb_page", "title": "Expenses"},
+        1.0,
+        content_sha256="c" * 64,
+    )
+    shared = run(
+        "What is the on-call contact link?",
+        contact,
+        "The expense report is at the Google link.",
+    )
+    assert shared.status == "no_relevant_information"
+    assert "google" not in shared.answer.casefold()
+    assert shared.confidence == 0.0
+
+    handbook = SearchChunk(
+        15,
+        "notes/window.md",
+        0,
+        "During the incident we closed the beta window.",
+        {"source_type": "kb_page", "title": "Window"},
+        1.0,
+        content_sha256="d" * 64,
+    )
+    differ = run(
+        "How do alpha handbook and beta handbook differ?",
+        handbook,
+        "During the incident we closed the beta window.",
+    )
+    assert differ.status == "no_relevant_information"
+    assert "beta window" not in differ.answer.casefold()
+
+    future = SearchChunk(
+        16,
+        "notes/ship.md",
+        0,
+        "They decided to ship the portal.",
+        {"source_type": "kb_page", "title": "Ship"},
+        1.0,
+        content_sha256="e" * 64,
+    )
+    will_ship = run("Will they ship the portal?", future, "They will ship the portal.")
+    assert will_ship.answer != "They will ship the portal."
+    assert will_ship.confidence < 0.8
+
+    dated = SearchChunk(
+        17,
+        "notes/hiring.md",
+        0,
+        "The 2022 notes say we should hire Ada.",
+        {"source_type": "kb_page", "title": "Hiring notes"},
+        1.0,
+        content_sha256="f" * 64,
+    )
+    ada = run("Who should we hire?", dated, "Hire Ada.")
+    assert ada.answer.strip() != "Hire Ada."
+    assert "not a current recommendation" in ada.answer.casefold()
+    assert ada.confidence < 0.8
+
+
+@pytest.mark.unit
+def test_excerpt_fallback_keeps_only_the_chunk_that_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    comparison = "A playbook explains the approach. A runbook lists the steps."
+    chunks = (
+        SearchChunk(31, "home.md", 0, "Welcome to the knowledge base homepage.", {"title": "Home"}, 1.0, content_sha256="1" * 64),
+        SearchChunk(32, "ops.md", 0, comparison, {"title": "Operations"}, 1.0, content_sha256="2" * 64),
+        SearchChunk(33, "tokens.md", 0, "Tokenization stores overlapping windows.", {"title": "Tokens"}, 1.0, content_sha256="3" * 64),
+    )
+    invalid = AnswerResponse(
+        status="answered",
+        answer="Not grounded.",
+        confidence=0.9,
+        citations=[
+            Citation(source_file="ops.md", chunk_id=32, content_sha256="2" * 64, quote="not in the page")
+        ],
+    )
+    monkeypatch.setattr(agent, "log_agent_diagnostic", lambda **_kwargs: None)
+    monkeypatch.setattr(agent, "classify_query", lambda _question: "cheap")
+    monkeypatch.setattr(
+        agent,
+        "retrieve_evidence",
+        lambda *_a, **_k: RetrievalDecision(
+            "accepted",
+            tuple(HybridSearchResult(chunk, 0.2, vector_score=0.8, fts_score=1.0) for chunk in chunks),
+            0.8,
+            1,
+        ),
+    )
+    monkeypatch.setattr(
+        agent,
+        "call_llm",
+        lambda **_k: SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=None, content=""))]),
+    )
+    monkeypatch.setattr(agent, "call_llm_structured", lambda **_k: invalid)
+
+    response = agent.run_agent("How do playbooks compare with runbooks?")
+
+    assert response.status == "answered"
+    assert "playbook" in response.answer.casefold()
+    assert "runbook" in response.answer.casefold()
+    assert "homepage" not in response.answer.casefold()
+    assert "tokenization" not in response.answer.casefold()
+    assert [citation.chunk_id for citation in response.citations] == [32]

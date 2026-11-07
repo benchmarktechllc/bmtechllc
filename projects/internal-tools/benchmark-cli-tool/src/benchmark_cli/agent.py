@@ -10,6 +10,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from .entailment import answers_question
 from .grounding import (
     ANSWER_PATH_REVISION,
     SyncedDiscordChannel,
@@ -202,12 +203,23 @@ def _repair_citation_presentation(
     return response.model_copy(update={"citations": citations}) if citations else None
 
 
+def _term_index(text: str, term: str) -> int:
+    found = text.find(term)
+    if found >= 0:
+        return found
+    if len(term) > 3 and term.endswith("s"):
+        return text.find(term[:-1])
+    return -1
+
+
 def _evidence_excerpt(chunk: SearchChunk, question: str, *, maximum_characters: int = 500) -> str:
     """Select a short, verbatim excerpt around a query term from one evidence chunk."""
     terms = [term.casefold() for term in re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]*", question) if len(term) > 1]
     lowered = chunk.chunk_text.casefold()
-    positions = [lowered.find(term) for term in terms if lowered.find(term) >= 0]
-    position = min(positions, default=0)
+    positions = [index for term in terms if (index := _term_index(lowered, term)) >= 0]
+    if not positions:
+        return ""
+    position = min(positions)
     line_start = chunk.chunk_text.rfind("\n", 0, position) + 1
     line_end = chunk.chunk_text.find("\n", position)
     if line_end < 0:
@@ -223,17 +235,21 @@ def _evidence_excerpt_response(
     question: str, results: Iterable[HybridSearchResult]
 ) -> AnswerResponse:
     """Return a deterministic, cited evidence view if synthesis cannot be grounded."""
-    selected = list(results)[:3]
-    citations = [
-        Citation(
-            source_file=result.chunk.source_file,
-            chunk_id=result.chunk.id,
-            content_sha256=result.chunk.content_sha256 or "",
-            quote=_evidence_excerpt(result.chunk, question),
+    citations: list[Citation] = []
+    for result in list(results)[:3]:
+        if not result.chunk.content_sha256:
+            continue
+        quote = _evidence_excerpt(result.chunk, question)
+        if not quote or not answers_question(question, quote):
+            continue
+        citations.append(
+            Citation(
+                source_file=result.chunk.source_file,
+                chunk_id=result.chunk.id,
+                content_sha256=result.chunk.content_sha256,
+                quote=quote,
+            )
         )
-        for result in selected
-        if result.chunk.content_sha256 and _evidence_excerpt(result.chunk, question)
-    ]
     if not citations:
         return _no_information()
     excerpts = "\n\n".join(f"- {citation.quote}" for citation in citations)

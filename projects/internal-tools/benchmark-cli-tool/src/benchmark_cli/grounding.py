@@ -21,6 +21,7 @@ from .entailment import (
     is_not_current_recommendation,
     meaningful_text,
     supported_steps,
+    touches_question,
 )
 from .ingestion.clean import redact_secrets
 from .models import AnswerResponse, Citation
@@ -661,15 +662,22 @@ def qualify_grounded_answer(
     identity = " ".join(_chunk_identity_text(chunk) for chunk in cited)
     if _is_howto(question) and not answers_question(question, quoted, require_all=True):
         return _abstain(_NOT_RESPONSIVE)
+    topical = [citation for citation in response.citations if touches_question(question, citation.quote)]
+    relevant = [citation for citation in topical if answers_question(question, citation.quote)]
     kept: list[str] = []
     unsupported_decision = False
     for sentence in _split_sentences(visible):
         if not meaningful_text(sentence):
             continue
-        verdict = assess_claim(sentence, quoted, identity)
-        if verdict == "supported" and (
-            answers_question(question, sentence) or answers_question(question, quoted)
-        ):
+        verdict = next(
+            (
+                assess_claim(sentence, citation.quote, identity)
+                for citation in relevant
+                if assess_claim(sentence, citation.quote, identity) == "supported"
+            ),
+            "unknown",
+        )
+        if verdict == "supported":
             kept.append(sentence)
             continue
         if claim_status(sentence) == "decided":
@@ -679,58 +687,74 @@ def qualify_grounded_answer(
         if partial and meaningful_text(partial) and answers_question(question, partial):
             kept.append(partial)
     disclaimer = _identity_gap(question, cited)
-    excerpts = _excerpts(response)
+    topical_text = "\n".join(f"- {citation.quote}" for citation in topical)
+    relevant_text = "\n".join(f"- {citation.quote}" for citation in relevant)
+    cited_text = _excerpts(response)
     if disclaimer:
-        body = excerpts if meaningful_text(excerpts) else ""
+        body = cited_text if meaningful_text(cited_text) else ""
         text = disclaimer if not body else f"{disclaimer}\n\n{body}"
         rendered = _rendered(response, text)
         return rendered if rendered is not None else _abstain(_NOT_RESPONSIVE)
     if kept and kept == _split_sentences(visible) and meaningful_text(visible):
+        if relevant and len(relevant) != len(response.citations):
+            return response.model_copy(update={"citations": relevant})
         return response
     if kept:
-        rendered = _rendered(response, " ".join(kept))
+        rendered = _rendered(
+            response.model_copy(update={"citations": relevant or response.citations}),
+            " ".join(kept),
+        )
         if rendered is not None:
             return rendered
     if (
         asks_recommendation(question)
-        and answers_question(question, quoted)
+        and touches_question(question, quoted)
         and is_not_current_recommendation(quoted)
-        and meaningful_text(excerpts)
+        and meaningful_text(topical_text)
     ):
-        rendered = _rendered(response, f"{_NOT_CURRENT_RECOMMENDATION}\n\n{excerpts}")
+        rendered = _rendered(
+            response.model_copy(update={"citations": topical}),
+            f"{_NOT_CURRENT_RECOMMENDATION}\n\n{topical_text}",
+        )
         if rendered is not None:
             return rendered
     if (
         unsupported_decision
-        and answers_question(question, quoted)
+        and touches_question(question, quoted)
         and claim_status(quoted) != "decided"
-        and meaningful_text(excerpts)
+        and meaningful_text(topical_text)
     ):
-        rendered = _rendered(response, f"{_PLAN_QUALIFICATION}\n\n{excerpts}")
+        rendered = _rendered(
+            response.model_copy(update={"citations": topical}),
+            f"{_PLAN_QUALIFICATION}\n\n{topical_text}",
+        )
         if rendered is not None:
             return rendered
     if (
         not kept
         and _asks_outcome(question)
-        and answers_question(question, quoted)
-        and meaningful_text(excerpts)
+        and touches_question(question, quoted)
+        and meaningful_text(topical_text)
     ):
         if claim_status(quoted) == "decided":
-            rendered = _rendered(response, excerpts)
+            rendered = _rendered(response.model_copy(update={"citations": topical}), topical_text)
         else:
-            rendered = _rendered(response, f"{_PLAN_QUALIFICATION}\n\n{excerpts}")
+            rendered = _rendered(
+                response.model_copy(update={"citations": topical}),
+                f"{_PLAN_QUALIFICATION}\n\n{topical_text}",
+            )
         if rendered is not None:
             return rendered
-    if _is_comparison(question) and answers_question(question, quoted) and meaningful_text(excerpts):
-        rendered = _rendered(response, excerpts)
+    if _is_comparison(question) and relevant_text and answers_question(question, relevant_text):
+        rendered = _rendered(response.model_copy(update={"citations": relevant}), relevant_text)
         if rendered is not None:
             return rendered
-    if _page_is_identified(question, cited) and meaningful_text(excerpts):
-        rendered = _rendered(response, excerpts)
+    if _page_is_identified(question, cited) and meaningful_text(relevant_text):
+        rendered = _rendered(response.model_copy(update={"citations": relevant}), relevant_text)
         if rendered is not None:
             return rendered
-    if _is_howto(question) and answers_question(question, quoted, require_all=True) and meaningful_text(excerpts):
-        rendered = _rendered(response, excerpts)
+    if _is_howto(question) and relevant_text and answers_question(question, relevant_text, require_all=True):
+        rendered = _rendered(response.model_copy(update={"citations": relevant}), relevant_text)
         if rendered is not None:
             return rendered
     return _abstain(_NOT_RESPONSIVE)
@@ -749,7 +773,7 @@ def supported_outcome_answer(
         return None
     citations: list[Citation] = []
     for result in results:
-        if not answers_question(question, result.chunk.chunk_text):
+        if not touches_question(question, result.chunk.chunk_text):
             continue
         quote = verbatim_excerpt(result.chunk.chunk_text)
         citation = _citation(result, quote)
