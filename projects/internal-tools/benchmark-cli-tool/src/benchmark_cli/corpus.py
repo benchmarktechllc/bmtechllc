@@ -14,6 +14,14 @@ _CANARY_FILE = re.compile(
     r"|(?:^|/)[^/]*(?:canary|synthetic)[^/]*$",
     re.IGNORECASE,
 )
+_BOILERPLATE_TEXT = re.compile(
+    r"no relevant information was found in the company document library"
+    r"|there is no information available regarding"
+    r"|retrieved evidence does not contain any specific link"
+    r"|i couldn't answer that just now"
+    r"|new documentation published",
+    re.IGNORECASE,
+)
 _TRUE = frozenset({"true", "t", "1", "yes"})
 
 SYNTHETIC_CORPUS_SQL = """
@@ -53,3 +61,8 @@ def is_synthetic_canary(source_file: str, metadata: Mapping[str, object] | None 
         str(meta.get("source_type") or "") == "transcript"
         and str(meta.get("kind") or "") != "meeting_transcript"
     )
+
+
+def is_boilerplate_text(text: str) -> bool:
+    """Return whether text is an indexed bot abstention or notification template."""
+    return _BOILERPLATE_TEXT.search(text) is not None

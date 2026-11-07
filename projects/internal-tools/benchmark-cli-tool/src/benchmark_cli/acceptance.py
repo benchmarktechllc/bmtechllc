@@ -1,59 +1,145 @@
-"""Non-posting acceptance run for the four Ask BMTech questions.
+"""Non-posting acceptance run for Ask BMTech.
 
 This calls ``run_agent``, the same function the Discord bot uses. It does not
-connect to Discord and does not send messages. It needs ``DATABASE_URL`` and
-``OPENAI_API_KEY`` because retrieval embeds the question. Set
-``PORTAL_BASE_URL`` to the current GitHub Pages portal before expecting a
-clickable link.
+connect to Discord and does not send messages. Retrieval embeds each question,
+so ``DATABASE_URL`` and ``OPENAI_API_KEY`` must already be in the environment.
+``PORTAL_BASE_URL`` must be the current GitHub Pages portal. The report lists
+configured/missing dependencies without printing secret values.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 
 from .agent import run_agent
-from .grounding import ACCEPTANCE_QUESTIONS
+from .corpus import is_boilerplate_text, is_synthetic_canary
+from .grounding import (
+    ACCEPTANCE_QUESTIONS,
+    CHANNEL_ACCEPTANCE_QUESTIONS,
+    CORE_TEAM_ACCEPTANCE_QUESTIONS,
+    EMPLOYEE_ACCEPTANCE_QUESTIONS,
+    PORTAL_ACCEPTANCE_QUESTIONS,
+    asks_for_core_team,
+    asks_for_employee_count,
+    asks_for_portal_link,
+    asks_for_synced_channels,
+)
 from .portal_urls import portal_home_url
 
-_EMPLOYEE_COUNT = re.compile(r"\b\d+\s+employees?\b", re.IGNORECASE)
+_DIGIT_EMPLOYEE_COUNT = re.compile(r"\b\d+\s+employees?\b", re.IGNORECASE)
 _STALE_HOST = "hussein881.github.io"
-_ARTICLE_BOT = "new documentation published"
+_GENERIC_NO_INFO = "no relevant information was found in the company document library"
+_COUNT_UNCERTAINTY = "does not state a current employee count"
+
+
+def _dependencies() -> dict[str, bool]:
+    return {
+        "database_url_configured": bool(os.getenv("DATABASE_URL", "").strip()),
+        "openai_api_key_configured": bool(os.getenv("OPENAI_API_KEY", "").strip())
+        and os.getenv("OPENAI_API_KEY", "").strip() != "your_openai_api_key_here",
+        "portal_base_configured": portal_home_url() is not None,
+    }
+
+
+def _citation_views(response_payload: dict[str, object]) -> list[dict[str, object]]:
+    citations = response_payload.get("citations")
+    if not isinstance(citations, list):
+        return []
+    views: list[dict[str, object]] = []
+    for citation in citations:
+        if not isinstance(citation, dict):
+            continue
+        source = str(citation.get("source_file") or "")
+        quote = str(citation.get("quote") or "")
+        views.append(
+            {
+                "source_file": source,
+                "chunk_id": citation.get("chunk_id"),
+                "synthetic_source": is_synthetic_canary(source, {}),
+                "boilerplate_quote": is_boilerplate_text(quote),
+            }
+        )
+    return views
+
+
+def _check(question: str, payload: dict[str, object], *, home: str | None) -> list[str]:
+    answer = str(payload.get("answer") or "")
+    status = str(payload.get("status") or "")
+    blob = json.dumps(payload)
+    failures: list[str] = []
+    if _STALE_HOST in blob:
+        failures.append("contains the previous Pages host")
+    views = _citation_views(payload)
+    if any(view["synthetic_source"] for view in views):
+        failures.append("citation source is a synthetic canary")
+    if any(view["boilerplate_quote"] for view in views) or is_boilerplate_text(answer):
+        failures.append("answer or citation is indexed bot boilerplate")
+    if _GENERIC_NO_INFO in answer.casefold():
+        failures.append("generic no-information sentence")
+    if asks_for_portal_link(question):
+        if home is None:
+            failures.append("PORTAL_BASE_URL is not set")
+        elif home not in answer:
+            failures.append(f"portal answer does not contain {home}")
+        elif status != "answered":
+            failures.append("portal question was not answered")
+        elif not views:
+            failures.append("portal answer has no citation")
+    elif asks_for_employee_count(question):
+        if _DIGIT_EMPLOYEE_COUNT.search(answer):
+            failures.append("employee answer states a numeric headcount")
+        if _COUNT_UNCERTAINTY not in answer.casefold():
+            failures.append("employee answer does not state count uncertainty")
+    elif asks_for_core_team(question):
+        if _DIGIT_EMPLOYEE_COUNT.search(answer):
+            failures.append("core-team answer states a numeric headcount")
+    elif asks_for_synced_channels(question):
+        if status != "answered" or "#" not in answer:
+            failures.append("synced-channel answer did not list indexed channel names")
+    return failures
 
 
 def run_acceptance() -> dict[str, object]:
-    """Answer the four production questions and report grounded checks."""
+    """Answer the production questions and paraphrases, then report grounded checks."""
+    dependencies = _dependencies()
     home = portal_home_url()
-    results = []
     failures: list[str] = []
-    for question in ACCEPTANCE_QUESTIONS:
-        response = run_agent(question)
-        payload = response.model_dump()
-        blob = json.dumps(payload)
-        if _STALE_HOST in blob:
-            failures.append(f"{question}: answer still contains the previous Pages host")
-        if question.startswith("What is the link"):
-            if home is None:
-                failures.append("PORTAL_BASE_URL is not set, so no canonical portal URL is available")
-            elif home not in response.answer:
-                failures.append(f"portal answer does not contain {home}")
-            elif response.status != "answered":
-                failures.append("portal question was not answered")
-        elif question.startswith("How many employees"):
-            if _EMPLOYEE_COUNT.search(response.answer):
-                failures.append("employee answer states a numeric headcount")
-            if "employee count" not in response.answer.casefold():
-                failures.append("employee answer does not say whether a count is in evidence")
-        elif question.startswith("Who are the core team"):
-            if _EMPLOYEE_COUNT.search(response.answer):
-                failures.append("core-team answer states a numeric headcount")
-        elif question.startswith("Which Discord"):
-            if response.status != "answered" or "#" not in response.answer:
-                failures.append("synced-channel answer did not list indexed channel names")
-            if _ARTICLE_BOT in blob.casefold():
-                failures.append("synced-channel answer used the article-update notification")
-        results.append({"question": question, "response": payload})
-    return {"portal_home": home, "failures": failures, "results": results}
+    if not dependencies["database_url_configured"]:
+        failures.append("DATABASE_URL is not configured")
+    if not dependencies["openai_api_key_configured"]:
+        failures.append("OPENAI_API_KEY is not configured")
+    results = []
+    if dependencies["database_url_configured"] and dependencies["openai_api_key_configured"]:
+        for question in ACCEPTANCE_QUESTIONS:
+            response = run_agent(question)
+            payload = response.model_dump()
+            question_failures = _check(question, payload, home=home)
+            for item in question_failures:
+                failures.append(f"{question}: {item}")
+            results.append(
+                {
+                    "question": question,
+                    "status": payload.get("status"),
+                    "answer": payload.get("answer"),
+                    "citations": _citation_views(payload),
+                    "failures": question_failures,
+                }
+            )
+    return {
+        "revision": "2026-11-07-ask-retrieval",
+        "portal_home": home,
+        "dependencies": dependencies,
+        "question_groups": {
+            "portal": list(PORTAL_ACCEPTANCE_QUESTIONS),
+            "employee": list(EMPLOYEE_ACCEPTANCE_QUESTIONS),
+            "core_team": list(CORE_TEAM_ACCEPTANCE_QUESTIONS),
+            "channels": list(CHANNEL_ACCEPTANCE_QUESTIONS),
+        },
+        "failures": failures,
+        "results": results,
+    }
 
 
 def main() -> None:

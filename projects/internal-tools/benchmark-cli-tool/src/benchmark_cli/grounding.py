@@ -12,6 +12,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from .corpus import is_boilerplate_text, is_synthetic_canary
 from .ingestion.clean import redact_secrets
 from .models import AnswerResponse, Citation
 from .portal_urls import portal_home_from_metadata, portal_home_url
@@ -20,11 +21,34 @@ from .retrieval import HybridSearchResult
 logger = logging.getLogger(__name__)
 
 ANSWER_PATH_REVISION = "2026-11-07-ask-retrieval"
-ACCEPTANCE_QUESTIONS = (
+PORTAL_ACCEPTANCE_QUESTIONS = (
     "What is the link to the knowledge base portal?",
+    "Where do I open the knowledge base?",
+    "What's the URL for our KB?",
+)
+EMPLOYEE_ACCEPTANCE_QUESTIONS = (
     "How many employees does BMTech currently have?",
+    "What is our current headcount?",
+    "How many staff do we have?",
+)
+CORE_TEAM_ACCEPTANCE_QUESTIONS = (
     "Who are the core team members at BMTech?",
+    "Who is on the core team?",
+)
+CHANNEL_ACCEPTANCE_QUESTIONS = (
     "Which Discord channels are synced?",
+    "What Discord channels do we ingest?",
+)
+UNRELATED_ACCEPTANCE_QUESTIONS = (
+    "What was the HNSW p99 latency?",
+    "How do I add a page to the knowledge base?",
+    "Which Discord bot posts article updates?",
+)
+ACCEPTANCE_QUESTIONS = (
+    *PORTAL_ACCEPTANCE_QUESTIONS,
+    *EMPLOYEE_ACCEPTANCE_QUESTIONS,
+    *CORE_TEAM_ACCEPTANCE_QUESTIONS,
+    *CHANNEL_ACCEPTANCE_QUESTIONS,
 )
 
 _CORE_TEAM = re.compile(r"\bcore[\s-]+team(?:mates?| members?)?\b", re.IGNORECASE)
@@ -69,26 +93,35 @@ def asks_for_credentials(question: str) -> bool:
 
 
 def asks_for_portal_link(question: str) -> bool:
+    """Match requests for the knowledge-base home, including paraphrases."""
     text = question.casefold()
-    mentions_portal = "portal" in text or "knowledge base" in text or "knowledge-base" in text
-    asks_where = any(word in text for word in ("link", "url", "uri", "address", "where"))
+    mentions_portal = re.search(r"\b(portal|knowledge[ -]?base|kb)\b", text) is not None
+    asks_where = re.search(r"\b(link|url|uri|address|homepage|home page|where)\b", text) is not None
     return mentions_portal and asks_where
 
 
 def asks_for_employee_count(question: str) -> bool:
+    """Match headcount questions without treating a core-team roster as payroll."""
     text = question.casefold()
-    return "employee" in text and any(
-        phrase in text for phrase in ("how many", "number of", "headcount", "count of")
-    )
+    if re.search(r"\bcore[\s-]+team", text) and re.search(r"\b(employees?|headcount|staff)\b", text) is None:
+        return False
+    has_workforce = re.search(r"\b(employees?|headcount|staff)\b", text) is not None
+    asks_count = re.search(r"\b(how many|number of|count of|headcount|current)\b", text) is not None
+    return has_workforce and asks_count
 
 
 def asks_for_core_team(question: str) -> bool:
-    return "core team" in question.casefold()
+    return re.search(r"\bcore[\s-]+team", question, re.IGNORECASE) is not None
 
 
 def asks_for_synced_channels(question: str) -> bool:
+    """Match questions about which Discord channels are in the index."""
     text = question.casefold()
-    return "discord" in text and "channel" in text and "sync" in text
+    return (
+        re.search(r"\bdiscord\b", text) is not None
+        and re.search(r"\bchannels?\b", text) is not None
+        and re.search(r"\b(sync\w*|ingest\w*|index\w*|corpus|which|what|list)\b", text) is not None
+    )
 
 
 def credential_refusal() -> AnswerResponse:
@@ -122,6 +155,18 @@ def _citation(result: HybridSearchResult, quote: str) -> Citation | None:
     )
 
 
+def _company_results(results: Sequence[HybridSearchResult]) -> list[HybridSearchResult]:
+    """Drop synthetic canaries and bot-boilerplate chunks before quoting them."""
+    kept: list[HybridSearchResult] = []
+    for result in results:
+        if is_synthetic_canary(result.chunk.source_file, result.chunk.metadata):
+            continue
+        if is_boilerplate_text(result.chunk.chunk_text):
+            continue
+        kept.append(result)
+    return kept
+
+
 def _core_team_quote(text: str) -> str | None:
     redacted = redact_secrets(text)
     for sentence in re.split(r"(?<=[.!?])\s+|\n+", redacted):
@@ -136,7 +181,7 @@ def portal_link_answer(results: Sequence[HybridSearchResult]) -> AnswerResponse:
     configured = portal_home_url()
     selected: HybridSearchResult | None = None
     home: str | None = None
-    for result in results:
+    for result in _company_results(results):
         if result.chunk.metadata.get("source_type") != "kb_page":
             continue
         candidate = portal_home_from_metadata(result.chunk.metadata, configured)
@@ -171,7 +216,7 @@ def portal_link_answer(results: Sequence[HybridSearchResult]) -> AnswerResponse:
 
 def stated_employee_count_answer(results: Sequence[HybridSearchResult]) -> AnswerResponse | None:
     """Quote an explicit employee-count sentence when the index contains one."""
-    for result in results:
+    for result in _company_results(results):
         redacted = redact_secrets(result.chunk.chunk_text)
         for sentence in re.split(r"(?<=[.!?])\s+|\n+", redacted):
             cleaned = sentence.strip()
@@ -191,7 +236,7 @@ def stated_employee_count_answer(results: Sequence[HybridSearchResult]) -> Answe
 
 def employee_count_answer(results: Sequence[HybridSearchResult]) -> AnswerResponse:
     """Refuse to turn a core-team sentence into a headcount."""
-    for result in results:
+    for result in _company_results(results):
         quote = _core_team_quote(result.chunk.chunk_text)
         citation = _citation(result, quote or "")
         if quote and citation is not None:
@@ -215,7 +260,7 @@ def employee_count_answer(results: Sequence[HybridSearchResult]) -> AnswerRespon
 
 def core_team_answer(results: Sequence[HybridSearchResult]) -> AnswerResponse:
     """Name a core team only when those words appear in retrieved evidence."""
-    for result in results:
+    for result in _company_results(results):
         quote = _core_team_quote(result.chunk.chunk_text)
         citation = _citation(result, quote or "")
         if quote and citation is not None:

@@ -16,7 +16,18 @@ import pytest
 from benchmark_cli import agent
 from benchmark_cli.corpus import is_synthetic_canary
 from benchmark_cli.discord_sync import plan_discord_reconcile
-from benchmark_cli.grounding import ACCEPTANCE_QUESTIONS
+from benchmark_cli.grounding import (
+    ACCEPTANCE_QUESTIONS,
+    CHANNEL_ACCEPTANCE_QUESTIONS,
+    CORE_TEAM_ACCEPTANCE_QUESTIONS,
+    EMPLOYEE_ACCEPTANCE_QUESTIONS,
+    PORTAL_ACCEPTANCE_QUESTIONS,
+    UNRELATED_ACCEPTANCE_QUESTIONS,
+    asks_for_core_team,
+    asks_for_employee_count,
+    asks_for_portal_link,
+    asks_for_synced_channels,
+)
 from benchmark_cli.ingestion.clean import discord_units_from_messages, redact_secrets
 from benchmark_cli.portal_urls import join_portal_url, portal_home_url
 from benchmark_cli.retrieval import HybridSearchResult, RetrievalDecision
@@ -51,13 +62,22 @@ def quiet_agent(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.unit
-def test_acceptance_questions_are_the_production_wording() -> None:
-    assert ACCEPTANCE_QUESTIONS == (
+def test_acceptance_questions_include_exact_prompts_and_paraphrases() -> None:
+    assert ACCEPTANCE_QUESTIONS[:4] == (
         "What is the link to the knowledge base portal?",
+        "Where do I open the knowledge base?",
+        "What's the URL for our KB?",
         "How many employees does BMTech currently have?",
-        "Who are the core team members at BMTech?",
-        "Which Discord channels are synced?",
     )
+    assert all(asks_for_portal_link(question) for question in PORTAL_ACCEPTANCE_QUESTIONS)
+    assert all(asks_for_employee_count(question) for question in EMPLOYEE_ACCEPTANCE_QUESTIONS)
+    assert all(asks_for_core_team(question) for question in CORE_TEAM_ACCEPTANCE_QUESTIONS)
+    assert all(asks_for_synced_channels(question) for question in CHANNEL_ACCEPTANCE_QUESTIONS)
+    for question in UNRELATED_ACCEPTANCE_QUESTIONS:
+        assert not asks_for_portal_link(question)
+        assert not asks_for_employee_count(question)
+        assert not asks_for_core_team(question)
+        assert not asks_for_synced_channels(question)
 
 
 @pytest.mark.unit
@@ -134,6 +154,79 @@ def test_portal_home_stored_on_a_page_is_used_without_the_environment(
 
 
 @pytest.mark.unit
+def test_paraphrases_use_retrieved_facts_and_skip_canary_boilerplate(
+    monkeypatch: pytest.MonkeyPatch, quiet_agent: None
+) -> None:
+    monkeypatch.setenv("PORTAL_BASE_URL", _HOME.rstrip("/"))
+    kb_text = "The guide explains how this knowledge base is organized."
+    team_text = "Ada, Grace, and Lin are the core team for the sample effort."
+    canary_text = (
+        "There is no information available regarding employees. "
+        "The canary core team is Samplebot. The canary has 12 employees."
+    )
+    kb = _result(
+        286,
+        "portal/guide/index.md",
+        kb_text,
+        {"source_type": "kb_page", "url": "/guide/index/"},
+    )
+    team = _result(101, "discord-channel-example.json", team_text, {"source_type": "discord"})
+    canary = _result(
+        448,
+        "sample_meeting_transcript.json",
+        canary_text,
+        {"source_type": "transcript", "synthetic": True},
+    )
+    stale = _result(
+        243,
+        "discord-channel-old.json",
+        f"The documentation page is {_STALE}",
+        {"source_type": "discord", "channel": "sample-collab"},
+    )
+
+    def retrieve(question: str, *_args: object, **_kwargs: object) -> RetrievalDecision:
+        if asks_for_portal_link(question):
+            return _decision(canary, stale, kb)
+        return _decision(canary, team)
+
+    monkeypatch.setattr(agent, "retrieve_evidence", retrieve)
+    monkeypatch.setattr(
+        agent,
+        "synced_discord_channel_rows",
+        lambda: [("sample-collab", 7, "discord-channel-1.json", _DIGEST, "Sample planning note.")],
+    )
+
+    portal = agent.run_agent("What's the URL for our KB?")
+    assert portal.answer == f"The knowledge base portal is {_HOME}."
+    assert portal.citations[0].source_file == "portal/guide/index.md"
+    assert portal.citations[0].quote in kb_text
+    assert "Samplebot" not in portal.answer
+    assert "no information available regarding" not in portal.answer.casefold()
+    assert _STALE not in portal.model_dump_json()
+
+    headcount = agent.run_agent("What is our current headcount?")
+    assert "does not state a current employee count" in headcount.answer.casefold()
+    assert team_text in headcount.answer
+    assert headcount.citations[0].quote in team_text
+    assert headcount.citations[0].source_file == "discord-channel-example.json"
+    assert "12 employees" not in headcount.answer
+    assert "Samplebot" not in headcount.answer
+    assert "no information available regarding" not in headcount.answer.casefold()
+    assert "no relevant information was found" not in headcount.answer.casefold()
+
+    roster = agent.run_agent("Who is on the core team?")
+    assert team_text in roster.answer
+    assert roster.citations[0].quote in team_text
+    assert "Samplebot" not in roster.answer
+    assert "12 employees" not in roster.answer
+
+    channels = agent.run_agent("What Discord channels do we ingest?")
+    assert channels.answer == "Synced Discord channels in the retrieval index: #sample-collab."
+    assert "New documentation published" not in channels.model_dump_json()
+    assert "no relevant information was found" not in channels.answer.casefold()
+
+
+@pytest.mark.unit
 def test_employee_question_does_not_turn_a_core_team_into_a_headcount(
     monkeypatch: pytest.MonkeyPatch, quiet_agent: None
 ) -> None:
@@ -141,7 +234,7 @@ def test_employee_question_does_not_turn_a_core_team_into_a_headcount(
     chunk = _result(101, "discord-channel-example.json", evidence, {"source_type": "discord"})
     monkeypatch.setattr(agent, "retrieve_evidence", lambda *_args, **_kwargs: _decision(chunk))
 
-    response = agent.run_agent(ACCEPTANCE_QUESTIONS[1])
+    response = agent.run_agent(EMPLOYEE_ACCEPTANCE_QUESTIONS[0])
 
     assert "employee count" in response.answer.casefold()
     assert "not a headcount" in response.answer.casefold()
@@ -158,7 +251,7 @@ def test_core_team_question_quotes_only_a_labeled_sentence(
     chunk = _result(101, "discord-channel-example.json", labeled, {"source_type": "discord"})
     monkeypatch.setattr(agent, "retrieve_evidence", lambda *_args, **_kwargs: _decision(chunk))
 
-    named = agent.run_agent(ACCEPTANCE_QUESTIONS[2])
+    named = agent.run_agent(CORE_TEAM_ACCEPTANCE_QUESTIONS[0])
     assert named.status == "answered"
     assert labeled in named.answer
     assert "not an employee" in named.answer.casefold()
@@ -170,7 +263,7 @@ def test_core_team_question_quotes_only_a_labeled_sentence(
         {"source_type": "discord"},
     )
     monkeypatch.setattr(agent, "retrieve_evidence", lambda *_args, **_kwargs: _decision(unlabeled))
-    missing = agent.run_agent(ACCEPTANCE_QUESTIONS[2])
+    missing = agent.run_agent(CORE_TEAM_ACCEPTANCE_QUESTIONS[1])
     assert missing.status == "no_relevant_information"
     assert "Ada" not in missing.answer
     assert "does not name a core team" in missing.answer
@@ -194,7 +287,7 @@ def test_synced_channel_question_lists_indexed_channels_not_the_notification(
         lambda *_args, **_kwargs: RetrievalDecision("no_relevant_information", (), None, 0),
     )
 
-    response = agent.run_agent(ACCEPTANCE_QUESTIONS[3])
+    response = agent.run_agent(CHANNEL_ACCEPTANCE_QUESTIONS[0])
     rendered = response.model_dump_json()
 
     assert response.status == "answered"

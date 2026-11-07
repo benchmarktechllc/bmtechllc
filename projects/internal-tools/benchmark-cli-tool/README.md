@@ -297,23 +297,60 @@ PORTAL_BASE_URL=https://<owner>.github.io/bmtechllc/portal
 has rewritten knowledge-base chunk metadata. Use the current repository
 owner. Do not set a previous GitHub Pages host.
 
-Non-posting check of the production answer path (this does not connect to
-Discord):
+The production ask process is the Docker container `benchmark-discord-ask`.
+It keeps using `/etc/bmtech/discord-ask.env`. Do not print that file. Acceptance
+runs in a second container so the live bot stays up. Install the wheel; the
+host does not need a git checkout.
 
 ```bash
-set -a
-source /etc/bmtech/discord-ask.env
-set +a
-python -m benchmark_cli.acceptance
+docker ps --filter name=^benchmark-discord-ask$ --format '{{.Names}} {{.Status}} {{.Image}}'
+image=$(docker inspect -f '{{.Config.Image}}' benchmark-discord-ask)
+docker run --rm --name benchmark-ask-acceptance --user root \
+  --env-file /etc/bmtech/discord-ask.env \
+  -e PORTAL_BASE_URL=https://benchmarktechllc.github.io/bmtechllc/portal \
+  -v "$PWD/benchmark_cli_tool-0.1.1-py3-none-any.whl":/tmp/benchmark_cli_tool.whl:ro \
+  --entrypoint bash \
+  "$image" \
+  -lc 'pip install --no-cache-dir /tmp/benchmark_cli_tool.whl && benchmark-acceptance'
 ```
 
-The same path, one question at a time:
+`-e PORTAL_BASE_URL` overrides a stale host still stored in the env file.
+`--env-file` does not print secrets. If the new container cannot reach the
+database, rerun the same command with
+`--network container:benchmark-discord-ask` added. That shares the running
+container's network and does not stop it.
+
+`benchmark-acceptance` asks the original four questions plus paraphrases
+("Where do I open the knowledge base?", "What is our current headcount?",
+"Who is on the core team?", "What Discord channels do we ingest?"). It fails
+if the portal answer is not the configured URL, if an employee answer states
+a digit headcount or omits count uncertainty, if a citation comes from a
+synthetic canary, or if the answer repeats bot no-information or
+article-update boilerplate. A core-team question may abstain when no indexed
+chunk uses that label. The JSON includes answer text, so do not paste it into
+a public ticket when a citation quote is private Discord text.
+
+After that report passes, replace the bot without deleting the old container:
 
 ```bash
-benchmark-answer --question 'What is the link to the knowledge base portal?'
-benchmark-answer --question 'How many employees does BMTech currently have?'
-benchmark-answer --question 'Who are the core team members at BMTech?'
-benchmark-answer --question 'Which Discord channels are synced?'
+docker rename benchmark-discord-ask benchmark-discord-ask-previous
+docker run -d --name benchmark-discord-ask --restart unless-stopped \
+  --env-file /etc/bmtech/discord-ask.env \
+  -e PORTAL_BASE_URL=https://benchmarktechllc.github.io/bmtechllc/portal \
+  -v /var/bmtech/benchmark_cli_tool-0.1.1-py3-none-any.whl:/opt/benchmark_cli_tool.whl:ro \
+  --user root \
+  --entrypoint bash \
+  "$image" \
+  -lc 'pip install --no-cache-dir /opt/benchmark_cli_tool.whl && exec su -s /bin/bash bmtech -c "exec benchmark-discord-ask"'
+```
+
+Rollback while the previous container still exists:
+
+```bash
+docker stop benchmark-discord-ask
+docker rm benchmark-discord-ask
+docker rename benchmark-discord-ask-previous benchmark-discord-ask
+docker start benchmark-discord-ask
 ```
 
 Runtime logs record retrieval status, chunk ids, source file names, cosine,
@@ -343,10 +380,9 @@ benchmark-discord-ask
 The process stays connected until you stop it. `.env` in this directory is
 loaded on startup.
 
-On the Hetzner VM, run it as a systemd service or a container. The scheduled
-GitHub Actions ingest workflow stays as it is. Install the project into a
-virtualenv, put the variables in `/etc/bmtech/discord-ask.env`, and use a unit
-like:
+The scheduled GitHub Actions ingest workflow stays as it is. A host that is
+not already running the Docker container can use a virtualenv and systemd.
+The current production host is the Docker container above, not this unit:
 
 ```ini
 [Unit]
@@ -373,30 +409,14 @@ sudo systemctl enable --now benchmark-discord-ask
 sudo systemctl status benchmark-discord-ask
 ```
 
-Rollback is a checkout of the previous revision, reinstall, and restart. Keep
-the previous container if you deployed with Docker:
-
-```bash
-git checkout <previous-revision>
-python -m pip install -e .
-sudo systemctl restart benchmark-discord-ask
-```
-
-```bash
-docker stop benchmark-discord-ask
-docker rm benchmark-discord-ask
-docker rename benchmark-discord-ask-previous benchmark-discord-ask
-docker start benchmark-discord-ask
-```
-
-A local image can run the same process. Build from this directory and pass
-the env file at runtime:
+On a systemd host, roll back with the previous revision and
+`sudo systemctl restart benchmark-discord-ask`. On the Docker host, use the
+rename rollback in the acceptance section. A local image can still be built
+from this directory when a checkout exists:
 
 ```bash
 docker build -t benchmark-discord-ask:ask-retrieval .
-docker rename benchmark-discord-ask benchmark-discord-ask-previous
-docker run -d --name benchmark-discord-ask --restart unless-stopped \
-  --env-file /etc/bmtech/discord-ask.env benchmark-discord-ask:ask-retrieval
+docker run --rm --env-file /etc/bmtech/discord-ask.env benchmark-discord-ask:ask-retrieval
 ```
 
 Replies are capped at Discord's 2000-character limit. Citations from the
