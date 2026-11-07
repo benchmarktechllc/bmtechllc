@@ -47,6 +47,12 @@ def _result(text: str) -> HybridSearchResult:
         "How many staff are on the on-call rotation?",
         "Who did the core team hire?",
         "How do I index a Discord channel?",
+        "Send me the link to the portal status page",
+        "Please open the portal and tell me who is on call",
+        "How many employees does Acme have?",
+        "How many employees joined last quarter?",
+        "Who should we hire next for the core team?",
+        "How do I index a new Discord channel?",
     ),
 )
 def test_ordinary_prompts_are_not_intercepted(question: str) -> None:
@@ -77,6 +83,13 @@ def test_negated_conditional_and_other_party_counts_are_not_headcount() -> None:
         "When the company has 10 employees, file the form.",
         "Acme has 10 employees while BMTech integrates the product.",
         "The client has 50 employees.",
+        "BMTech has one employee handbook.",
+        "BMTech has 12 employee benefits.",
+        "BMTech would have 12 employees.",
+        "BMTech might have 12 employees.",
+        "BMTech has 12 employees if the plan is approved.",
+        "BMTech had 12 employees in 2019.",
+        "The company has 10 employees.",
     )
     assert stated_employee_count_answer(tuple(_result(text) for text in samples)) is None
     stated = stated_employee_count_answer((_result("BMTech currently has 12 employees."),))
@@ -98,6 +111,7 @@ def test_heading_and_denial_are_not_a_core_team_roster(
             _result("The core team is meeting tomorrow."),
             _result("Our core team is ready."),
             _result("The core team is Responsible for deployments."),
+            _result("The core team members are in Boston."),
         ),
         0.8,
         2,
@@ -109,6 +123,7 @@ def test_heading_and_denial_are_not_a_core_team_roster(
     assert response.citations == []
     assert "does not name a core team" in response.answer.casefold()
     assert "Ada" not in response.answer
+    assert "Boston" not in response.answer
 
 
 @pytest.mark.unit
@@ -214,7 +229,9 @@ def test_ordinary_prompt_reaches_the_model_with_redacted_tool_text(
     assert seen
     assert secret not in seen[0]
     assert "[REDACTED]" in seen[0]
-    assert response.answer == evidence
+    assert "not established as the requested document" in response.answer.casefold()
+    assert evidence in response.answer
+    assert secret not in response.answer
     assert _HOME not in response.answer
 
 
@@ -239,7 +256,7 @@ def test_plans_and_proposals_are_not_reported_as_completed_decisions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     planning = (
-        "Next work is MVP definition and setting the timeline. "
+        "Kiosk next work is MVP definition and setting the timeline. "
         "Prototype todos remain open. "
         "The revised project proposal covers the architecture."
     )
@@ -314,7 +331,7 @@ def test_closest_page_is_not_renamed_as_the_requested_document(
         "These runbooks and playbooks are the operating set.",
         {
             "source_type": "kb_page",
-            "title": "Runbooks",
+            "title": "Playbooks and runbooks",
             "url": "https://example.test/runbooks/",
         },
         1.0,
@@ -373,6 +390,153 @@ def test_discord_shaped_tokens_are_redacted_before_the_model() -> None:
     assert mfa not in redacted
     assert "v1.2.3" in redacted
     assert redacted.count("[REDACTED]") == 2
+
+
+@pytest.mark.unit
+def test_orphan_citation_marker_is_removed_and_unrelated_hire_abstains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planning = "Kiosk next work is MVP definition and setting the timeline. The revised project proposal covers architecture."
+    prototype = "A demonstrated prototype exists only as a note in this planning paragraph."
+    plan_chunk = SearchChunk(
+        110,
+        "notes/planning.md",
+        0,
+        planning,
+        {"source_type": "kb_page", "title": "Planning note", "url": "https://example.test/planning/"},
+        1.0,
+        content_sha256=_DIGEST,
+    )
+    other = SearchChunk(
+        200,
+        "notes/other.md",
+        0,
+        prototype,
+        {"source_type": "kb_page", "title": "Prototype note", "url": "https://example.test/prototype/"},
+        1.0,
+        content_sha256="e" * 64,
+    )
+
+    def run(question: str, chunks: tuple[SearchChunk, ...], claim: str, quotes: list[str]) -> AnswerResponse:
+        monkeypatch.setattr(agent, "log_agent_diagnostic", lambda **_kwargs: None)
+        monkeypatch.setattr(agent, "classify_query", lambda _question: "cheap")
+        monkeypatch.setattr(
+            agent,
+            "retrieve_evidence",
+            lambda *_a, **_k: RetrievalDecision(
+                "accepted",
+                tuple(HybridSearchResult(chunk, 0.2, vector_score=0.8, fts_score=1.0) for chunk in chunks),
+                0.8,
+                1,
+            ),
+        )
+        monkeypatch.setattr(
+            agent,
+            "call_llm",
+            lambda **_k: SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=None, content=""))]
+            ),
+        )
+
+        def structured(**_kwargs: object) -> AnswerResponse:
+            return AnswerResponse(
+                status="answered",
+                answer=claim,
+                confidence=0.9,
+                citations=[
+                    Citation(
+                        source_file=chunk.source_file,
+                        chunk_id=chunk.id,
+                        content_sha256=chunk.content_sha256 or _DIGEST,
+                        quote=quote,
+                    )
+                    for chunk, quote in zip(chunks, quotes, strict=True)
+                ],
+            )
+
+        monkeypatch.setattr(agent, "call_llm_structured", structured)
+        return agent.run_agent(question)
+
+    kiosk = run(
+        "What kiosk decisions are complete?",
+        (plan_chunk, other),
+        "Architecture decisions were made for the kiosk [1]. The demonstrated prototype shipped [3].",
+        [planning, prototype],
+    )
+    assert "does not explicitly state" in kiosk.answer.casefold()
+    assert "[3]" not in kiosk.answer
+    assert "demonstrated prototype shipped" not in kiosk.answer.casefold()
+    assert [citation.chunk_id for citation in kiosk.citations] == [110, 200]
+
+    decided = SearchChunk(
+        300,
+        "notes/decision.md",
+        0,
+        "The group decided to keep the prototype.",
+        {"source_type": "kb_page", "title": "Decision note"},
+        1.0,
+        content_sha256="f" * 64,
+    )
+    kept = run(
+        "What did the group decide about the prototype?",
+        (decided,),
+        "The group decided to keep the prototype.",
+        ["The group decided to keep the prototype."],
+    )
+    assert kept.answer == "The group decided to keep the prototype."
+
+    hire = run(
+        "Who should we hire next for the core team?",
+        (plan_chunk,),
+        "Hire Nick to work on ingestion.",
+        [planning],
+    )
+    assert hire.status == "no_relevant_information"
+    assert hire.citations == []
+    assert "Nick" not in hire.answer
+    assert "does not address" in hire.answer.casefold()
+
+    schedule = SearchChunk(
+        521,
+        "notes/schedule.md",
+        0,
+        "A scheduler can be triggered manually. Suggest a bot if you want automation.",
+        {"source_type": "kb_page", "title": "Scheduler"},
+        1.0,
+        content_sha256="a" * 64,
+    )
+    howto = run(
+        "How do I index a new Discord channel?",
+        (schedule,),
+        "Trigger the ingestion workflow and add a bot.",
+        ["A scheduler can be triggered manually. Suggest a bot if you want automation."],
+    )
+    assert howto.status == "no_relevant_information"
+    assert "ingestion workflow" not in howto.answer.casefold()
+    assert "unknown" in howto.answer.casefold()
+    assert howto.citations == []
+
+    lifecycle = SearchChunk(
+        110,
+        "portal/guide/lifecycle.md",
+        0,
+        "Later we might write a deployment guide. This article explains a lifecycle.",
+        {
+            "source_type": "kb_page",
+            "title": "Forward-deployed lifecycle",
+            "url": "https://example.test/guide/lifecycle/",
+        },
+        1.0,
+        content_sha256=_DIGEST,
+    )
+    guide = run(
+        "Where is the deployment guide?",
+        (lifecycle,),
+        "The deployment guide is the forward-deployed lifecycle article.",
+        ["Later we might write a deployment guide. This article explains a lifecycle."],
+    )
+    assert "not established as the requested document" in guide.answer.casefold()
+    assert "the deployment guide is the forward-deployed" not in guide.answer.casefold()
 
 
 @pytest.mark.unit

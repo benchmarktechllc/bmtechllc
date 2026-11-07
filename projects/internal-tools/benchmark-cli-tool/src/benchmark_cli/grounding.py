@@ -90,47 +90,54 @@ def asks_for_credentials(question: str) -> bool:
 
 
 def asks_for_portal_link(question: str) -> bool:
-    """Match a request for the knowledge-base home, not a page inside it."""
+    """Match only an unambiguous request for the knowledge-base home.
+
+    A subpage, a second question joined by ``and``, or any other document
+    name falls through to the ordinary model path.
+    """
     text = question.casefold()
-    if re.search(
-        r"\b(?:in|inside|within|from)\s+(?:the|our|your)\s+(?:knowledge[ -]?base|portal|kb)\b",
-        text,
-    ):
+    if re.search(r"\b(?:and|then)\b", text):
         return False
-    if re.search(r"\b(?:url|link|address)\s+for\s+the\s+(?!portal\b|knowledge|kb\b)\w+", text):
+    if re.search(r"\b(?:page|status|billing|guide|handbook|article|runbook|playbook)\b", text):
         return False
-    return re.search(
-        r"\b(?:link|url|uri|address|homepage|home page)\b.{0,40}\b(?:portal|knowledge[ -]?base|kb)\b"
-        r"|\b(?:portal|knowledge[ -]?base)\s+(?:link|url|address|homepage)\b"
-        r"|\bwhere\s+(?:do|can|should)\s+i\b.{0,40}\b(?:open|find|reach)\b.{0,40}\b(?:portal|knowledge[ -]?base)\b"
-        r"|\b(?:open|visit)\s+the\s+(?:portal|knowledge[ -]?base)\b",
+    if re.search(r"\bportal\s+(?!home\b|link\b|url\b)\w+", text):
+        return False
+    asks_for_location = re.search(
+        r"\b(?:link|url|uri|address|homepage|home page)\b"
+        r"|\bwhere\b.+\b(?:open|find)\b"
+        r"|\b(?:open|visit)\b",
         text,
-    ) is not None
+    )
+    names_the_site = re.search(r"\b(?:knowledge[ -]?base|portal|kb)\b", text)
+    return asks_for_location is not None and names_the_site is not None
 
 
 def asks_for_employee_count(question: str) -> bool:
-    """Match a company headcount question, not a count of a rotation or team."""
+    """Match only an unambiguous current BMTech headcount question."""
     text = question.casefold()
-    if re.search(r"\bhow many\b.+\b(?:on|in|for)\s+the\b", text):
+    if re.search(r"\b(?:joined|hired|left|rotation|on-call|on call)\b", text):
         return False
-    if re.search(r"\bheadcount\b", text):
-        return True
+    if re.search(r"\bhow many\b.+\b(?:on|in)\s+(?:the|our)\b", text):
+        return False
+    other_subject = re.search(r"\bhow many\s+employees\s+does\s+([a-z]+)\b", text)
+    if other_subject and other_subject.group(1) not in {"bmtech", "benchmark", "benchmarktech"}:
+        return False
     return re.search(
-        r"\bhow many\s+(?:employees?|staff)\b"
-        r"|\bnumber of\s+(?:employees?|staff)\b"
-        r"|\bemployee\s+count\b",
+        r"\bhow many\s+employees\s+does\s+bmtech\b"
+        r"|\bhow many\s+staff\s+do\s+we\b"
+        r"|\b(?:our|bmtech(?:'s)?)\s+(?:current\s+)?headcount\b",
         text,
     ) is not None
 
 
 def asks_for_core_team(question: str) -> bool:
-    """Match who the members are, not an action the core team took."""
+    """Match only who the members are. Hiring and decisions fall through."""
     text = question.casefold()
     if re.search(r"\bcore[\s-]+team", text) is None:
         return False
     return re.search(
         r"\bwho\s+(?:is|are)\b.{0,40}\bcore[\s-]+team\b"
-        r"|\bwho\b.{0,30}\b(?:on|in)\s+the\s+core[\s-]+team\b"
+        r"|\bwho\s+is\s+on\s+the\s+core[\s-]+team\b"
         r"|\bcore[\s-]+team\s+members\b"
         r"|\bmembers\s+of\s+(?:the\s+)?core[\s-]+team\b",
         text,
@@ -138,7 +145,7 @@ def asks_for_core_team(question: str) -> bool:
 
 
 def asks_for_synced_channels(question: str) -> bool:
-    """Match a catalog question, not instructions for indexing one channel."""
+    """Match only a catalog question. How-to requests fall through."""
     text = question.casefold()
     if re.search(r"\bhow\s+(?:do|can|should|to)\b", text):
         return False
@@ -205,14 +212,21 @@ def _company_results(results: Sequence[HybridSearchResult]) -> list[HybridSearch
 
 
 _AFFIRMED_COUNT = re.compile(
-    r"(?P<subject>.{0,80}?)\s+"
-    r"(?<![\w'])(?:has|have|had|employs|employ)\s+(?:got\s+)?"
+    r"(?P<subject>.{0,60}?)\s+"
+    r"(?<![\w'])(?:has|have|employs|employ)\s+(?:got\s+)?"
     r"(?P<number>\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
-    r"employees?\b",
+    r"(?P<noun>employees?)\b(?P<after>\s+[A-Za-z]+)?",
     re.IGNORECASE,
 )
-_CONDITIONAL_CLAUSE = re.compile(r"^(?:when|if|unless|whenever|should|were|would)\b", re.IGNORECASE)
+_CONDITIONAL_CLAUSE = re.compile(r"^(?:when|if|unless|whenever)\b", re.IGNORECASE)
 _CLAUSE_BREAK = re.compile(r",|(?=\b(?:while|whereas|although|though|but)\b)", re.IGNORECASE)
+_SENTENCE_HEDGE = re.compile(
+    r"\b(?:if|unless|when|whenever|would|might|could|may|should)\b|\b(?:19|20)\d{2}\b",
+    re.IGNORECASE,
+)
+_COUNT_FUNCTION_WORD = frozenset(
+    {"if", "unless", "when", "in", "at", "on", "for", "and", "or", "the", "a", "an", "to", "of", "with"}
+)
 _NON_PERSON = frozenset(
     {
         "the",
@@ -237,36 +251,44 @@ _NON_PERSON = frozenset(
 
 
 def _subject_is_this_company(subject: str) -> bool:
+    """Require the proper name. ``The company`` alone is not attributed."""
     folded = " ".join(subject.split()).casefold()
-    folded = re.sub(r"^(?:currently|now|still|already|today)\s+", "", folded)
-    if re.search(r"\bnot\b|\w+n't\b", folded):
+    if re.search(r"\b(?:would|might|could|may|should|not)\b|\w+n't\b", folded):
         return False
     if re.search(r"\b(?:acme|client|customer|vendor|prospect|competitor)\b", folded):
         return False
-    return re.search(r"\b(?:bmtech|benchmarktech|benchmark tech|the company|our company)\b", folded) is not None
+    return re.search(r"\bbmtech\b|\bbenchmarktech\b|\bbenchmark tech\b", folded) is not None
 
 
 def _company_employee_count(sentence: str) -> bool:
-    """Accept a count only when this company is the subject of an affirmative clause.
+    """Accept only a present, unconditional count whose head noun is employees.
 
-    Conditional clauses and counts attributed to another party are not a
-    current headcount. Contractions such as ``hasn't`` do not match the
-    affirmative verb, so they are not a separate word list.
+    ``employee handbook`` is a modifier, ``would``/``might``/``if`` are not
+    current facts, ``had`` plus a year is history, and another party's subject
+    is not this company. ``hasn't`` never matches the bare verb ``has``.
     """
+    if _SENTENCE_HEDGE.search(sentence):
+        return False
     for clause in _CLAUSE_BREAK.split(sentence):
         clause = clause.strip()
         if not clause or _CONDITIONAL_CLAUSE.match(clause):
             continue
         match = _AFFIRMED_COUNT.search(clause)
-        if match and _subject_is_this_company(match.group("subject")):
-            return True
+        if not match or not _subject_is_this_company(match.group("subject")):
+            continue
+        following = (match.group("after") or "").strip().casefold()
+        if match.group("noun").casefold() == "employee" and following and following not in _COUNT_FUNCTION_WORD:
+            continue
+        return True
     return False
 
 
 def _people_names(sentence: str) -> list[str]:
+    """Ignore capitalized words that are objects of a place preposition."""
+    without_places = re.sub(r"\b(?:in|at|near|from|into)\s+[A-Z][a-z]+\b", "", sentence)
     return [
         word
-        for word in re.findall(r"\b[A-Z][a-z]{2,}\b", sentence)
+        for word in re.findall(r"\b[A-Z][a-z]{2,}\b", without_places)
         if word.casefold() not in _NON_PERSON
     ]
 
@@ -423,20 +445,29 @@ def synced_channels_answer(channels: Sequence[SyncedDiscordChannel]) -> AnswerRe
 
 
 _ANSWER_COMPLETION = re.compile(
-    r"\b(?:was|were|has been|have been|is|got)\s+(?:decided|approved|completed|finalized|defined|signed off)\b"
-    r"|\b(?:decided|approved|finalized|signed off)\b"
-    r"|\b(?:mvp|timeline|architecture)\b.{0,40}\b(?:defined|decided|approved|completed)\b"
-    r"|\b(?:defined|decided|approved|completed)\b.{0,40}\b(?:mvp|timeline|architecture)\b",
+    r"\b(?:was|were|has been|have been)\s+(?:made|decided|approved|completed|finalized|defined|signed off)\b"
+    r"|\b(?:decided|approved|finalized|signed off)\b",
     re.IGNORECASE,
 )
-_EVIDENCE_DONE = re.compile(
-    r"\b(?:approved|signed off|final decision|was decided|were decided|we decided|"
-    r"has been completed|was completed|were completed)\b"
-    r"|\b(?:mvp|timeline|architecture)\b.{0,40}\b(?:is|was|were|has been|have been)\s+"
-    r"(?:defined|decided|approved|set|completed)\b"
-    r"|\b(?:defined|decided|approved|completed)\s+the\s+(?:mvp|timeline|architecture)\b",
-    re.IGNORECASE,
+# Finite decision verbs only. The noun "decision" inside a proposal is not one.
+_EVIDENCE_DONE = re.compile(r"\b(?:decided|approved|agreed|signed off)\b", re.IGNORECASE)
+_FOCUS_STOP = frozenset(
+    {
+        "the", "and", "for", "our", "your", "who", "what", "where", "when", "how",
+        "should", "would", "could", "please", "tell", "does", "did", "are", "was",
+        "next", "new", "current", "bmtech", "company", "discord", "team", "core",
+        "channel", "channels", "with", "from", "that", "this", "you", "have",
+    }
 )
+_NOT_RESPONSIVE = (
+    "The retrieved evidence does not address this question. "
+    "Missing facts, including any current incident state, are unknown."
+)
+_NO_PROCEDURE = (
+    "The retrieved evidence does not include a supported procedure for this request. "
+    "Missing steps are unknown. I will not invent operational steps."
+)
+_RECOMMENDATION = re.compile(r"\b(?:who|what)\s+should\b|\brecommend\b", re.IGNORECASE)
 _REQUESTED_DOCS = (
     ("deployment guide", ("deployment guide", "deploy guide")),
     ("runbook", ("runbook", "runbooks")),
@@ -468,6 +499,7 @@ def _requested_documents(question: str) -> list[tuple[str, tuple[str, ...]]]:
 
 
 def _chunk_identity_text(chunk: SearchChunk) -> str:
+    """Identity comes from source metadata, not a passing mention in the body."""
     metadata = chunk.metadata or {}
     return " ".join(
         (
@@ -475,9 +507,33 @@ def _chunk_identity_text(chunk: SearchChunk) -> str:
             str(metadata.get("title") or ""),
             str(metadata.get("url") or ""),
             str(metadata.get("section") or ""),
-            chunk.chunk_text,
+            str(metadata.get("kb_section") or ""),
         )
     ).casefold()
+
+
+def _focus_terms(question: str) -> set[str]:
+    return {
+        token.casefold()
+        for token in re.findall(r"[A-Za-z][A-Za-z'-]{2,}", question)
+        if token.casefold() not in _FOCUS_STOP
+    }
+
+
+def _without_orphan_citation_sentences(answer: str, citation_count: int) -> str:
+    """Drop a sentence whose inline marker does not name a returned citation."""
+    kept: list[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+", answer.strip()):
+        numbers = [int(value) for value in re.findall(r"\[(\d+)\]", sentence)]
+        numbers.extend(int(value) for value in re.findall(r"【(\d+)】", sentence))
+        if any(number < 1 or number > citation_count for number in numbers):
+            continue
+        kept.append(sentence)
+    return " ".join(kept).strip()
+
+
+def _abstain(answer: str) -> AnswerResponse:
+    return AnswerResponse(status="no_relevant_information", answer=answer, confidence=0.0, citations=[])
 
 
 def _chunk_label(chunk: SearchChunk) -> str:
@@ -517,8 +573,37 @@ def qualify_grounded_answer(
     """Stop completion claims and document identities the citations do not support."""
     if response.status != "answered" or not response.citations:
         return response
+    visible = _without_orphan_citation_sentences(response.answer, len(response.citations))
+    if not visible:
+        return _abstain(_NOT_RESPONSIVE)
+    response = response.model_copy(update={"answer": visible})
     cited = _cited_chunks(response, chunks)
     quoted = "\n".join(citation.quote for citation in response.citations)
+    quoted_folded = quoted.casefold()
+    focus = _focus_terms(question)
+    howto = re.search(r"\bhow\s+(?:do|can|should|to)\b", question, flags=re.IGNORECASE) is not None
+    if howto:
+        procedure = bool(focus) and any(term in quoted_folded for term in focus) and re.search(
+            r"\b(?:step|first|then|run|add|set|open|use)\b",
+            quoted,
+            flags=re.IGNORECASE,
+        )
+        if not procedure:
+            return _abstain(_NO_PROCEDURE)
+        return response.model_copy(
+            update={
+                "answer": (
+                    "Supported steps found in the cited evidence:\n\n"
+                    + "\n".join(f"- {citation.quote}" for citation in response.citations)
+                    + "\n\nAnything not quoted above is unknown."
+                ),
+                "confidence": min(response.confidence, 0.4),
+            }
+        )
+    if _RECOMMENDATION.search(question) and (
+        not focus or not any(term in quoted_folded for term in focus)
+    ):
+        return _abstain(_NOT_RESPONSIVE)
     notes: list[str] = []
     if _claims_completion(response.answer) and not _evidence_records_completion(quoted):
         notes.append(_PLAN_QUALIFICATION)
