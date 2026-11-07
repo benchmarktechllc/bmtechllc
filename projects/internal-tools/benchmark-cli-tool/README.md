@@ -88,12 +88,16 @@ From this directory the command finds `portal/content` by walking up from the
 working directory. Override it with `--content-dir` or `PORTAL_CONTENT_DIR`.
 `--index-json` (or `PORTAL_INDEX_JSON`) can further restrict the sync to a
 built `/index.json`: an entry must be `published` and not `isStale`.
-`PORTAL_BASE_URL` is optional; when set, chunk URLs use that prefix.
+`PORTAL_BASE_URL` is the current GitHub Pages origin plus `/bmtechllc/portal`.
+The portal ingestion workflow sets it from `github.repository_owner`, so an
+organization transfer changes the host without pinning a previous owner.
+Chunk metadata stores that absolute page URL and the portal home. Relative
+`/guide/...` paths are only what older rows contain before the next sync.
 
 ```bash
 DATABASE_URL=...
 OPENAI_API_KEY=...
-PORTAL_BASE_URL=https://example.internal/bmtechllc/portal   # optional
+PORTAL_BASE_URL=https://<owner>.github.io/bmtechllc/portal
 ```
 
 Keep those values in the secret manager or the gitignored `.env` / `.env.local`
@@ -286,7 +290,83 @@ DISCORD_ASK_CHANNEL_ID=...       # required snowflake of #ask-bmtech
 DATABASE_URL=...                 # required by run_agent
 OPENAI_API_KEY=...               # required by run_agent
 DISCORD_ASK_GUILD_ID=...         # optional; guild command sync
+PORTAL_BASE_URL=https://<owner>.github.io/bmtechllc/portal
 ```
+
+`PORTAL_BASE_URL` is required for a clickable portal answer until portal sync
+has rewritten knowledge-base chunk metadata. Use the current repository
+owner. Do not set a previous GitHub Pages host.
+
+The production ask process is the Docker container `benchmark-discord-ask`.
+It keeps using `/etc/bmtech/discord-ask.env`. Do not print that file. Acceptance
+runs in a second container so the live bot stays up. Install the wheel; the
+host does not need a git checkout.
+
+```bash
+docker ps --filter name=^benchmark-discord-ask$ --format '{{.Names}} {{.Status}} {{.Image}}'
+image=$(docker inspect -f '{{.Config.Image}}' benchmark-discord-ask)
+docker run --rm --name benchmark-ask-acceptance --user root \
+  --env-file /etc/bmtech/discord-ask.env \
+  -e PORTAL_BASE_URL=https://benchmarktechllc.github.io/bmtechllc/portal \
+  -v "$PWD/benchmark_cli_tool-0.1.2-py3-none-any.whl":/tmp/benchmark_cli_tool.whl:ro \
+  --entrypoint bash \
+  "$image" \
+  -lc 'pip install --no-cache-dir /tmp/benchmark_cli_tool.whl && benchmark-acceptance'
+```
+
+`-e PORTAL_BASE_URL` overrides a stale host still stored in the env file.
+`--env-file` does not print secrets. If the new container cannot reach the
+database, rerun the same command with
+`--network container:benchmark-discord-ask` added. That shares the running
+container's network and does not stop it.
+
+`benchmark-acceptance` asks the original four questions plus paraphrases
+("Where do I open the knowledge base?", "What is our current headcount?",
+"Who is on the core team?", "What Discord channels do we ingest?"). It fails
+if the portal answer is not the configured URL, if an employee answer states
+a digit headcount or omits count uncertainty, if a citation comes from a
+synthetic canary, or if the answer repeats bot no-information or
+article-update boilerplate. A core-team question may abstain when no indexed
+chunk uses that label. The JSON includes answer text, so do not paste it into
+a public ticket when a citation quote is private Discord text.
+
+After that report passes, replace the bot without deleting the old container:
+
+```bash
+docker rename benchmark-discord-ask benchmark-discord-ask-previous
+docker run -d --name benchmark-discord-ask --restart unless-stopped \
+  --env-file /etc/bmtech/discord-ask.env \
+  -e PORTAL_BASE_URL=https://benchmarktechllc.github.io/bmtechllc/portal \
+  -v /var/bmtech/benchmark_cli_tool-0.1.2-py3-none-any.whl:/opt/benchmark_cli_tool.whl:ro \
+  --user root \
+  --entrypoint bash \
+  "$image" \
+  -lc 'pip install --no-cache-dir /opt/benchmark_cli_tool.whl && exec su -s /bin/bash bmtech -c "exec benchmark-discord-ask"'
+```
+
+Rollback while the previous container still exists:
+
+```bash
+docker stop benchmark-discord-ask
+docker rm benchmark-discord-ask
+docker rename benchmark-discord-ask-previous benchmark-discord-ask
+docker start benchmark-discord-ask
+```
+
+Runtime logs record retrieval status, chunk ids, source file names, cosine,
+and keyword overlap. They do not record chunk text. `benchmark-search` prints
+redacted chunk text; do not paste that output into a ticket if a backfill has
+not yet rewritten stored Discord rows.
+
+After deploying this revision, re-run the portal ingestion workflow and the
+Discord ingestion workflow once. Portal sync stores the current absolute URL.
+Discord sync redacts recognized tokens in stored messages, drops indexed bot
+abstentions and notification templates, and rebuilds those channel chunks.
+The next portal or Discord sync applies the full-text migration that indexes
+URL path words such as `portal`. The ask process does not alter the schema on
+startup. Revoke any exposed credential and delete the original Discord
+message separately; sync rewrites the indexed copy and does not delete Discord
+history.
 
 `DISCORD_ANSWER_BOT_TOKEN` is independent of `DISCORD_INGEST_BOT_TOKEN`.
 
@@ -300,10 +380,9 @@ benchmark-discord-ask
 The process stays connected until you stop it. `.env` in this directory is
 loaded on startup.
 
-On the Hetzner VM, run it as a systemd service or a container. The scheduled
-GitHub Actions ingest workflow stays as it is. Install the project into a
-virtualenv, put the variables in `/etc/bmtech/discord-ask.env`, and use a unit
-like:
+The scheduled GitHub Actions ingest workflow stays as it is. A host that is
+not already running the Docker container can use a virtualenv and systemd.
+The current production host is the Docker container above, not this unit:
 
 ```ini
 [Unit]
@@ -330,21 +409,23 @@ sudo systemctl enable --now benchmark-discord-ask
 sudo systemctl status benchmark-discord-ask
 ```
 
-A local image can run the same process. Build from this directory and pass
-the env file at runtime:
+On a systemd host, roll back with the previous revision and
+`sudo systemctl restart benchmark-discord-ask`. On the Docker host, use the
+rename rollback in the acceptance section. A local image can still be built
+from this directory when a checkout exists:
 
 ```bash
-docker build -t benchmark-discord-ask .
-docker run -d --name benchmark-discord-ask --restart unless-stopped \
-  --env-file /etc/bmtech/discord-ask.env benchmark-discord-ask
+docker build -t benchmark-discord-ask:ask-retrieval .
+docker run --rm --env-file /etc/bmtech/discord-ask.env benchmark-discord-ask:ask-retrieval
 ```
 
 Replies are capped at Discord's 2000-character limit. Citations from the
 agent are included when they fit.
 
-`search_docs(query, top_k=5)` embeds the query once, concurrently retrieves 20
-pgvector candidates and 20 PostgreSQL FTS candidates, then merges them with
-RRF (`k = 60`). It returns chunks and fused search scores only. The optional
+`search_docs(query, top_k=5)` embeds the query once, concurrently retrieves 40
+pgvector candidates and 40 PostgreSQL FTS candidates, then merges them with
+RRF (`k = 60`). Ordinary answers omit synthetic canary transcripts and indexed
+bot abstentions. It returns chunks and fused search scores only. The optional
 `speaker`, `source` (source filename), and ISO-8601 `date` filters apply to
 both retrieval arms.
 

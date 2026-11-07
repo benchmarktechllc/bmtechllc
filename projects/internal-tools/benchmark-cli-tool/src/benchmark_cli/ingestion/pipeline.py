@@ -134,6 +134,7 @@ def metadata_for(chunk: Chunk, path: Path, source_type: str) -> ChunkMetadata:
             visibility=_optional_text(first.extra.get("visibility")),
             kb_section=_optional_text(first.extra.get("kb_section")),
             kb_status=_optional_text(first.extra.get("kb_status")),
+            portal_base=_optional_text(first.extra.get("portal_base")),
         )
     elif source_type == "trello":
         labels = first.extra.get("labels") or []
@@ -177,9 +178,10 @@ def embedding_prefix(metadata: ChunkMetadata, source_filename: str) -> str:
         )
     elif metadata.source_type == "kb_page":
         section = metadata.kb_section or metadata.section
+        url = f" url: {metadata.url}" if metadata.url else ""
         header = (
             f"Knowledge base page: {metadata.title}; section: {section}; "
-            f"heading: {metadata.section}."
+            f"heading: {metadata.section}{url}."
         )
     elif metadata.source_type == "trello":
         labels = f"; labels: {', '.join(metadata.labels)}" if metadata.labels else ""

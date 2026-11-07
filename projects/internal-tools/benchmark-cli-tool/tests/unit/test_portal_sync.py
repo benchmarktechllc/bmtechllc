@@ -61,7 +61,12 @@ def _portal_content() -> Path:
 
 
 @pytest.mark.unit
-def test_frontmatter_parser_keeps_published_pages_and_redacts_secrets(tmp_path: Path) -> None:
+def test_frontmatter_parser_keeps_published_pages_and_redacts_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PORTAL_BASE_URL", raising=False)
+    monkeypatch.delenv("GITHUB_REPOSITORY_OWNER", raising=False)
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
     _write_page(tmp_path, "guide/security.md", _PAGE)
     _write_page(
         tmp_path,
@@ -82,7 +87,7 @@ def test_frontmatter_parser_keeps_published_pages_and_redacts_secrets(tmp_path: 
     assert security.title == "Security Guide: Prompt Injection"
     assert security.tags == ("rag", "security")
     assert security.updated == date(2026, 9, 7)
-    assert security.url == "/guide/security/"
+    assert security.url == "/bmtechllc/portal/guide/security/"
     selected = select_pages(pages.values(), today=date(2026, 11, 6), allowlist=None)
     assert [page.source_file for page in selected] == ["portal/guide/security.md"]
 

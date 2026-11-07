@@ -11,7 +11,7 @@ from .config import MIN_COSINE_SIMILARITY, MIN_KEYWORD_OVERLAP
 from .providers.openai import embed_texts
 from .storage.postgres import SearchChunk, SearchFilters, fts_search, vector_search
 
-CANDIDATE_LIMIT = 20
+CANDIDATE_LIMIT = 40
 RRF_K = 60
 
 
@@ -79,13 +79,16 @@ def search_docs(
     speaker: str | None = None,
     source: str | None = None,
     date: str | None = None,
+    include_synthetic: bool = False,
 ) -> list[HybridSearchResult]:
     """Run filtered 20-per-arm keyword/vector retrieval and return RRF top results."""
     if not query.strip():
         return []
     if top_k < 1:
         return []
-    filters = SearchFilters(speaker=speaker, source=source, date=date)
+    filters = SearchFilters(
+        speaker=speaker, source=source, date=date, include_synthetic=include_synthetic
+    )
     query_embedding = embed_texts([query])[0]
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="hybrid-search") as executor:
         vector_future = executor.submit(
@@ -95,6 +98,7 @@ def search_docs(
             speaker=filters.speaker,
             source=filters.source,
             date=filters.date,
+            include_synthetic=filters.include_synthetic,
         )
         fts_future = executor.submit(
             fts_search,
@@ -103,6 +107,7 @@ def search_docs(
             speaker=filters.speaker,
             source=filters.source,
             date=filters.date,
+            include_synthetic=filters.include_synthetic,
         )
         vector_candidates = vector_future.result()
         fts_candidates = fts_future.result()
@@ -125,6 +130,7 @@ def retrieve_evidence(
     speaker: str | None = None,
     source: str | None = None,
     date: str | None = None,
+    include_synthetic: bool = False,
     min_cosine_similarity: float = MIN_COSINE_SIMILARITY,
     min_keyword_overlap: int = MIN_KEYWORD_OVERLAP,
 ) -> RetrievalDecision:
@@ -133,7 +139,16 @@ def retrieve_evidence(
         raise ValueError("min_cosine_similarity must be between 0 and 1.")
     if min_keyword_overlap < 0:
         raise ValueError("min_keyword_overlap must not be negative.")
-    results = tuple(search_docs(query, top_k, speaker=speaker, source=source, date=date))
+    results = tuple(
+        search_docs(
+            query,
+            top_k,
+            speaker=speaker,
+            source=source,
+            date=date,
+            include_synthetic=include_synthetic,
+        )
+    )
     top_cosine = max(
         (result.vector_score for result in results if result.vector_score is not None), default=None
     )
@@ -159,9 +174,17 @@ def hybrid_search(
     speaker: str | None = None,
     source: str | None = None,
     date: str | None = None,
+    include_synthetic: bool = False,
 ) -> list[HybridSearchResult]:
     """Backward-compatible name for :func:`search_docs`."""
-    return search_docs(query, top_k, speaker=speaker, source=source, date=date)
+    return search_docs(
+        query,
+        top_k,
+        speaker=speaker,
+        source=source,
+        date=date,
+        include_synthetic=include_synthetic,
+    )
 
 
 def vector_only_search(
@@ -171,17 +194,21 @@ def vector_only_search(
     speaker: str | None = None,
     source: str | None = None,
     date: str | None = None,
+    include_synthetic: bool = False,
 ) -> list[HybridSearchResult]:
     """Return vector-only results in the common evaluation result shape."""
     if not query.strip() or top_k < 1:
         return []
-    filters = SearchFilters(speaker=speaker, source=source, date=date)
+    filters = SearchFilters(
+        speaker=speaker, source=source, date=date, include_synthetic=include_synthetic
+    )
     candidates = vector_search(
         embed_texts([query])[0],
         top_k,
         speaker=filters.speaker,
         source=filters.source,
         date=filters.date,
+        include_synthetic=filters.include_synthetic,
     )
     return [
         HybridSearchResult(chunk, rrf_score=0.0, vector_score=chunk.score)

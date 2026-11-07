@@ -20,10 +20,16 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .config import DISCORD_API_BASE_URL, DISCORD_INGEST_BOT_TOKEN, DISCORD_INGEST_CHANNEL_IDS
-from .ingestion.clean import RawUnit, discord_units_from_messages
+from .ingestion.clean import (
+    RawUnit,
+    discord_message_is_authoritative,
+    discord_units_from_messages,
+    normalize_text,
+)
 from .ingestion.pipeline import ingest_units
 from .storage.postgres import (
     DiscordSourceMessage,
+    apply_discord_reconcile,
     create_indexes,
     discord_reindex_required,
     discord_source_messages,
@@ -150,22 +156,66 @@ def _source_messages(units: Sequence[RawUnit], channel_id: str, channel_name: st
 
 
 def _stored_units(messages: Sequence[DiscordSourceMessage]) -> list[RawUnit]:
-    return [
-        RawUnit(
-            message.message_text,
-            message.author_name,
-            message.sent_at,
-            ordinal,
-            {
-                "channel": message.channel_name,
-                "section": message.channel_name,
-                "message_id": message.message_id,
-                "reply_to": message.reply_to_message_id,
-                "edited_timestamp": message.edited_at.isoformat() if message.edited_at else None,
-            },
+    units: list[RawUnit] = []
+    for message in messages:
+        text = normalize_text(message.message_text)
+        if not text or not discord_message_is_authoritative(text, message.author_name):
+            continue
+        units.append(
+            RawUnit(
+                text,
+                message.author_name,
+                message.sent_at,
+                len(units),
+                {
+                    "channel": message.channel_name,
+                    "section": message.channel_name,
+                    "message_id": message.message_id,
+                    "reply_to": message.reply_to_message_id,
+                    "edited_timestamp": message.edited_at.isoformat() if message.edited_at else None,
+                },
+            )
         )
-        for ordinal, message in enumerate(messages)
-    ]
+    return units
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordReconcilePlan:
+    """Stored Discord rows to redact or drop before the next channel reindex."""
+
+    rewritten: tuple[DiscordSourceMessage, ...]
+    deleted_ids: tuple[str, ...]
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.rewritten or self.deleted_ids)
+
+
+def plan_discord_reconcile(messages: Sequence[DiscordSourceMessage]) -> DiscordReconcilePlan:
+    """Redact secrets and drop bot abstentions already stored from earlier syncs."""
+    rewritten: list[DiscordSourceMessage] = []
+    deleted: list[str] = []
+    for message in messages:
+        cleaned = normalize_text(message.message_text)
+        if not cleaned or not discord_message_is_authoritative(cleaned, message.author_name):
+            deleted.append(message.message_id)
+            continue
+        if cleaned != message.message_text:
+            rewritten.append(replace_message(message, cleaned))
+    return DiscordReconcilePlan(tuple(rewritten), tuple(deleted))
+
+
+def replace_message(message: DiscordSourceMessage, text: str) -> DiscordSourceMessage:
+    return DiscordSourceMessage(
+        channel_id=message.channel_id,
+        message_id=message.message_id,
+        channel_name=message.channel_name,
+        author_name=message.author_name,
+        message_text=text,
+        sent_at=message.sent_at,
+        edited_at=message.edited_at,
+        reply_to_message_id=message.reply_to_message_id,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,8 +245,13 @@ def sync_channels(
         units = discord_units_from_messages(payload, channel=channel_name)
         incoming = _source_messages(units, channel_id, channel_name)
         changed = upsert_discord_source_messages(incoming)
-        reindex = discord_reindex_required(channel_id) or (
-            bool(incoming) and _has_new_message(payload, cursor)
+        plan = plan_discord_reconcile(discord_source_messages(channel_id))
+        if plan.changed:
+            apply_discord_reconcile(channel_id, plan.rewritten, plan.deleted_ids)
+        reindex = (
+            discord_reindex_required(channel_id)
+            or (bool(incoming) and _has_new_message(payload, cursor))
+            or plan.changed
         )
         chunks = 0
         if reindex:

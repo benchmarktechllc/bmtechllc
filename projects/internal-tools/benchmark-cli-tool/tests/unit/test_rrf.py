@@ -36,7 +36,7 @@ def test_rrf_rejects_negative_constant() -> None:
 
 
 @pytest.mark.unit
-def test_hybrid_search_requests_twenty_candidates_from_each_mode(
+def test_hybrid_search_requests_forty_candidates_from_each_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, object, int]] = []
@@ -59,4 +59,4 @@ def test_hybrid_search_requests_twenty_candidates_from_each_mode(
     assert results[0].vector_score == 1.0
     assert results[0].fts_score is None
     assert {name for name, _, _ in calls} == {"vector", "fts"}
-    assert {limit for _, _, limit in calls} == {20}
+    assert {limit for _, _, limit in calls} == {40}

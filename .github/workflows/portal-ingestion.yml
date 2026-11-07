@@ -40,3 +40,5 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Tracks the repository owner. Do not pin a previous GitHub Pages host.
+          PORTAL_BASE_URL: https://${{ github.repository_owner }}.github.io/bmtechllc/portal

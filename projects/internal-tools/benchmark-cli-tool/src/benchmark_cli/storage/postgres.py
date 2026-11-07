@@ -16,6 +16,7 @@ from ..config import (
     HNSW_EF_SEARCH,
     PARENT_CONTEXT_MAX_TOKENS,
 )
+from ..corpus import BOILERPLATE_SQL, SYNTHETIC_CORPUS_SQL
 from ..models import GoldenChunkReference
 
 SQL_DIR = Path(__file__).with_name("sql")
@@ -126,6 +127,7 @@ class SearchFilters:
     speaker: str | None = None
     source: str | None = None
     date: str | None = None
+    include_synthetic: bool = False
 
     def __post_init__(self) -> None:
         for field_name, value in (("speaker", self.speaker), ("source", self.source)):
@@ -187,6 +189,7 @@ def initialize_database() -> None:
     apply_sql("005_portal_trello_sync.sql")
     apply_sql("006_fathom_sync.sql")
     apply_sql("007_fireflies_sync.sql")
+    apply_sql("008_fts_url_tokens.sql")
 
 
 def create_indexes() -> None:
@@ -409,6 +412,64 @@ def discord_reindex_required(channel_id: str) -> bool:
         )
         row = cursor.fetchone()
     return bool(row and row[0])
+
+
+def apply_discord_reconcile(channel_id: str, rewritten: Sequence[DiscordSourceMessage], deleted_ids: Sequence[str]) -> None:
+    """Persist redacted Discord text, drop non-evidence rows, and mark the channel for reindex."""
+    if not rewritten and not deleted_ids:
+        return
+    with connection() as conn, conn.cursor() as cursor:
+        for message in rewritten:
+            cursor.execute(
+                """
+                UPDATE discord_source_messages
+                SET message_text = %s, updated_at = now()
+                WHERE channel_id = %s AND message_id = %s
+                """,
+                (message.message_text, channel_id, message.message_id),
+            )
+        if deleted_ids:
+            cursor.execute(
+                """
+                DELETE FROM discord_source_messages
+                WHERE channel_id = %s AND message_id = ANY(%s)
+                """,
+                (channel_id, list(deleted_ids)),
+            )
+        cursor.execute(
+            "UPDATE discord_sync_state SET reindex_required = TRUE WHERE channel_id = %s",
+            (channel_id,),
+        )
+        conn.commit()
+
+
+def synced_discord_channel_rows() -> list[tuple[str, int, str, str, str]]:
+    """Return one redaction-ready excerpt source for every indexed Discord channel."""
+    statement = f"""
+        SELECT channel_name, id, source_file, content_sha256, chunk_text
+        FROM (
+            SELECT metadata ->> 'channel' AS channel_name, id, source_file,
+                   content_sha256, chunk_text, metadata
+            FROM document_chunks
+            WHERE metadata ->> 'source_type' = 'discord'
+        ) AS discord_chunks
+        WHERE coalesce(channel_name, '') <> ''
+          AND NOT {SYNTHETIC_CORPUS_SQL}
+          AND NOT {BOILERPLATE_SQL}
+        ORDER BY channel_name, id
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement)
+        rows = cursor.fetchall()
+    selected: list[tuple[str, int, str, str, str]] = []
+    seen: set[str] = set()
+    for channel_name, chunk_id, source_file, content_sha256, chunk_text in rows:
+        name = str(channel_name).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        selected.append((name, int(chunk_id), str(source_file), str(content_sha256).strip(), str(chunk_text)))
+    return selected
 
 
 def discord_source_messages(channel_id: str) -> list[DiscordSourceMessage]:
@@ -752,6 +813,9 @@ def _filters_where_clause(filters: SearchFilters) -> tuple[str, list[str]]:
             )"""
         )
         parameters.extend((filters.date, filters.date, filters.date, filters.date))
+    if not filters.include_synthetic:
+        clauses.append(f"NOT {SYNTHETIC_CORPUS_SQL}")
+    clauses.append(f"NOT {BOILERPLATE_SQL}")
     return (f"\n          AND {' AND '.join(clauses)}" if clauses else "", parameters)
 
 
@@ -762,11 +826,14 @@ def vector_search(
     speaker: str | None = None,
     source: str | None = None,
     date: str | None = None,
+    include_synthetic: bool = False,
 ) -> list[SearchChunk]:
     """Return vector-ranked candidates independently of keyword retrieval."""
     if limit < 1:
         return []
-    filter_clause, filter_parameters = _filters_where_clause(SearchFilters(speaker, source, date))
+    filter_clause, filter_parameters = _filters_where_clause(
+        SearchFilters(speaker, source, date, include_synthetic=include_synthetic)
+    )
     statement = """
         SELECT id, source_file, chunk_index, chunk_text, metadata,
                1 - (embedding <=> %s::vector) AS score,
@@ -792,11 +859,14 @@ def fts_search(
     speaker: str | None = None,
     source: str | None = None,
     date: str | None = None,
+    include_synthetic: bool = False,
 ) -> list[SearchChunk]:
     """Return PostgreSQL full-text-ranked candidates independently of vectors."""
     if not query.strip() or limit < 1:
         return []
-    filter_clause, filter_parameters = _filters_where_clause(SearchFilters(speaker, source, date))
+    filter_clause, filter_parameters = _filters_where_clause(
+        SearchFilters(speaker, source, date, include_synthetic=include_synthetic)
+    )
     statement = """
         WITH query AS (
             SELECT replace(
