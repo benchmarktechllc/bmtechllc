@@ -205,10 +205,10 @@ def test_paraphrases_use_retrieved_facts_and_skip_canary_boilerplate(
     assert _STALE not in portal.model_dump_json()
 
     headcount = agent.run_agent("What is our current headcount?")
+    assert headcount.status == "no_relevant_information"
+    assert headcount.citations == []
     assert "does not state a current employee count" in headcount.answer.casefold()
-    assert team_text in headcount.answer
-    assert headcount.citations[0].quote in team_text
-    assert headcount.citations[0].source_file == "discord-channel-example.json"
+    assert "Ada" not in headcount.answer
     assert "12 employees" not in headcount.answer
     assert "Samplebot" not in headcount.answer
     assert "no information available regarding" not in headcount.answer.casefold()
@@ -237,10 +237,11 @@ def test_employee_question_does_not_turn_a_core_team_into_a_headcount(
 
     response = agent.run_agent(EMPLOYEE_ACCEPTANCE_QUESTIONS[0])
 
-    assert "employee count" in response.answer.casefold()
-    assert "not a headcount" in response.answer.casefold()
-    assert evidence in response.answer
-    assert "3 employees" not in response.answer.casefold()
+    assert response.status == "no_relevant_information"
+    assert response.citations == []
+    assert "does not state a current employee count" in response.answer.casefold()
+    assert "Ada" not in response.answer
+    assert evidence not in response.answer
     assert not __import__("re").search(r"\b\d+\s+employees?\b", response.answer)
 
 
@@ -456,9 +457,10 @@ def test_discord_reconcile_redacts_tokens_and_drops_bot_abstentions() -> None:
         ]
     )
 
-    assert plan.deleted_ids == ("11",)
+    assert plan.deleted_ids == ()
     assert fake not in plan.rewritten[0].message_text
     assert "[REDACTED]" in plan.rewritten[0].message_text
+    assert plan.rewritten[0].message_id == "10"
     units = discord_units_from_messages(
         [
             {

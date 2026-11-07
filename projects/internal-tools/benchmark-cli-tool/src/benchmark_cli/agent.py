@@ -95,14 +95,22 @@ def _no_information() -> AnswerResponse:
     )
 
 
+def _redacted_chunk(chunk: SearchChunk) -> SearchChunk:
+    redacted = redact_secrets(chunk.chunk_text)
+    if redacted == chunk.chunk_text:
+        return chunk
+    return replace(chunk, chunk_text=redacted)
+
+
 def _chunk_payload(chunk: SearchChunk) -> dict[str, Any]:
     if not chunk.content_sha256:
         raise ValueError("Evidence chunks must include a content hash.")
+    safe = _redacted_chunk(chunk)
     return {
-        "source_file": chunk.source_file,
-        "chunk_id": chunk.id,
-        "content_sha256": chunk.content_sha256,
-        "text": delimit_evidence(chunk.chunk_text),
+        "source_file": safe.source_file,
+        "chunk_id": safe.id,
+        "content_sha256": safe.content_sha256,
+        "text": delimit_evidence(safe.chunk_text),
     }
 
 
@@ -233,15 +241,16 @@ def _execute_tool(name: str, arguments: dict[str, Any], evidence: dict[int, Sear
         if decision.status != "accepted":
             return json.dumps({"status": "no_relevant_information", "results": []})
         for result in decision.results:
-            evidence[result.chunk.id] = result.chunk
+            evidence[result.chunk.id] = _redacted_chunk(result.chunk)
         return json.dumps({"status": "accepted", "results": _results_payload(decision.results)})
     if name == "read_doc":
         context = read_doc(int(arguments.get("chunk_id", 0)))
         if context is None:
             return json.dumps({"error": "Evidence chunk not found."})
-        for chunk in context.chunks:
+        redacted_chunks = [_redacted_chunk(chunk) for chunk in context.chunks]
+        for chunk in redacted_chunks:
             evidence[chunk.id] = chunk
-        return json.dumps({"chunks": [_chunk_payload(chunk) for chunk in context.chunks]})
+        return json.dumps({"chunks": [_chunk_payload(chunk) for chunk in redacted_chunks]})
     return json.dumps({"error": "Unknown tool."})
 
 

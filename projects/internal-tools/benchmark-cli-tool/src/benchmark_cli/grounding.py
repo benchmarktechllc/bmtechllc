@@ -56,6 +56,15 @@ _EXPLICIT_EMPLOYEE_COUNT = re.compile(
     r"\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+employees?\b",
     re.IGNORECASE,
 )
+_NEGATION = re.compile(
+    r"\b(?:not|no|never|without|don'?t|doesn'?t|didn'?t|cannot|can'?t|neither|nor)\b",
+    re.IGNORECASE,
+)
+_COMPANY_SUBJECT = re.compile(r"\b(?:bmtech|benchmarktech|benchmark\s+tech|the company)\b", re.IGNORECASE)
+_OTHER_SUBJECT = re.compile(
+    r"\b(?:client|customer|vendor|prospect|example|handbook|competitor)\b",
+    re.IGNORECASE,
+)
 _CREDENTIAL_REQUEST = re.compile(
     r"\b(api[_ -]?key|access[_ -]?token|password|passwd|secret|private key|"
     r"personal access token|github pat|credential)\b|\bgh[pousr]_|\bgithub_pat_",
@@ -93,34 +102,52 @@ def asks_for_credentials(question: str) -> bool:
 
 
 def asks_for_portal_link(question: str) -> bool:
-    """Match requests for the knowledge-base home, including paraphrases."""
+    """Match a request for the knowledge-base home link, not a page inside it."""
     text = question.casefold()
-    mentions_portal = re.search(r"\b(portal|knowledge[ -]?base|kb)\b", text) is not None
-    asks_where = re.search(r"\b(link|url|uri|address|homepage|home page|where)\b", text) is not None
-    return mentions_portal and asks_where
+    if re.search(r"\b(in|inside|within|from)\s+the\s+(knowledge[ -]?base|portal|kb)\b", text):
+        return False
+    return re.search(
+        r"\b(?:link|url|uri|address|homepage|home page)\b.{0,40}\b(?:portal|knowledge[ -]?base|kb)\b"
+        r"|\b(?:portal|knowledge[ -]?base|kb)\b.{0,40}\b(?:link|url|uri|address|homepage|home page)\b"
+        r"|\bwhere\s+(?:do|can|should)\s+i\b.{0,40}\b(?:open|find|reach)\b.{0,40}\b(?:portal|knowledge[ -]?base|kb)\b"
+        r"|\b(?:open|visit)\s+the\s+(?:portal|knowledge[ -]?base|kb)\b",
+        text,
+    ) is not None
 
 
 def asks_for_employee_count(question: str) -> bool:
-    """Match headcount questions without treating a core-team roster as payroll."""
+    """Match a headcount question, not a handbook or policy that mentions employees."""
     text = question.casefold()
-    if re.search(r"\bcore[\s-]+team", text) and re.search(r"\b(employees?|headcount|staff)\b", text) is None:
+    if re.search(r"\b(?:handbook|policy|guide|manual|benefits)\b", text):
         return False
-    has_workforce = re.search(r"\b(employees?|headcount|staff)\b", text) is not None
-    asks_count = re.search(r"\b(how many|number of|count of|headcount|current)\b", text) is not None
-    return has_workforce and asks_count
+    return re.search(
+        r"\b(?:how many|number of|count of)\b.{0,40}\b(?:employees?|staff|headcount)\b"
+        r"|\b(?:employee|staff)\s+(?:count|headcount)\b"
+        r"|\bheadcount\b"
+        r"|\bcurrent\b.{0,30}\b(?:headcount|number of employees|employee count)\b",
+        text,
+    ) is not None
 
 
 def asks_for_core_team(question: str) -> bool:
-    return re.search(r"\bcore[\s-]+team", question, re.IGNORECASE) is not None
+    """Match a request for who is on the core team, not a decision they made."""
+    text = question.casefold()
+    if re.search(r"\bcore[\s-]+team", text) is None:
+        return False
+    if re.search(r"\b(?:decide|decided|decision|pricing|said|discuss(?:ed)?)\b", text):
+        return False
+    return re.search(r"\b(?:who|members?|roster|names?|list)\b", text) is not None
 
 
 def asks_for_synced_channels(question: str) -> bool:
-    """Match questions about which Discord channels are in the index."""
+    """Match a request for the synced-channel catalog, not one channel's decision."""
     text = question.casefold()
+    if re.search(r"\b(?:decide|decided|decision|said|discuss(?:ed)?)\b", text):
+        return False
     return (
         re.search(r"\bdiscord\b", text) is not None
         and re.search(r"\bchannels?\b", text) is not None
-        and re.search(r"\b(sync\w*|ingest\w*|index\w*|corpus|which|what|list)\b", text) is not None
+        and re.search(r"\b(?:sync\w*|ingest\w*|index\w*)\b", text) is not None
     )
 
 
@@ -178,11 +205,34 @@ def _company_results(results: Sequence[HybridSearchResult]) -> list[HybridSearch
     return kept
 
 
+def _company_employee_count(sentence: str) -> bool:
+    """Accept only an affirmative count about this company."""
+    if not _EXPLICIT_EMPLOYEE_COUNT.search(sentence):
+        return False
+    if _NEGATION.search(sentence) or _OTHER_SUBJECT.search(sentence):
+        return False
+    return _COMPANY_SUBJECT.search(sentence) is not None
+
+
 def _core_team_quote(text: str) -> str | None:
+    """Return a sentence that names members. A heading or a denial is not a roster."""
     redacted = redact_secrets(text)
     for sentence in re.split(r"(?<=[.!?])\s+|\n+", redacted):
-        cleaned = sentence.strip()
-        if cleaned and _CORE_TEAM.search(cleaned) and cleaned in redacted:
+        cleaned = sentence.strip(" \t#")
+        if not cleaned or not _CORE_TEAM.search(cleaned) or cleaned not in redacted:
+            continue
+        if _NEGATION.search(cleaned):
+            continue
+        if re.fullmatch(r"core[\s-]+team\s*:?", cleaned, flags=re.IGNORECASE):
+            continue
+        if re.search(r"\b(?:is|are|includes?|including|consists)\b", cleaned, flags=re.IGNORECASE) is None:
+            continue
+        names = [
+            word
+            for word in re.findall(r"\b[A-Z][a-z]{2,}\b", cleaned)
+            if word.casefold() not in {"core", "team"}
+        ]
+        if names:
             return cleaned
     return None
 
@@ -231,7 +281,7 @@ def stated_employee_count_answer(results: Sequence[HybridSearchResult]) -> Answe
         redacted = redact_secrets(result.chunk.chunk_text)
         for sentence in re.split(r"(?<=[.!?])\s+|\n+", redacted):
             cleaned = sentence.strip()
-            if not cleaned or not _EXPLICIT_EMPLOYEE_COUNT.search(cleaned) or cleaned not in redacted:
+            if not cleaned or cleaned not in redacted or not _company_employee_count(cleaned):
                 continue
             citation = _citation(result, cleaned)
             if citation is None:
@@ -246,21 +296,8 @@ def stated_employee_count_answer(results: Sequence[HybridSearchResult]) -> Answe
 
 
 def employee_count_answer(results: Sequence[HybridSearchResult]) -> AnswerResponse:
-    """Refuse to turn a core-team sentence into a headcount."""
-    for result in _company_results(results):
-        quote = _core_team_quote(result.chunk.chunk_text)
-        citation = _citation(result, quote or "")
-        if quote and citation is not None:
-            return AnswerResponse(
-                status="answered",
-                answer=(
-                    f"{_COUNT_UNCERTAINTY}\n\n"
-                    "The evidence does identify this, which is not a headcount:\n\n"
-                    f"{quote}"
-                ),
-                confidence=0.6,
-                citations=[citation],
-            )
+    """State that no headcount was found. Collaborator names are not a count."""
+    del results
     return AnswerResponse(
         status="no_relevant_information",
         answer=_COUNT_UNCERTAINTY,
