@@ -308,7 +308,7 @@ image=$(docker inspect -f '{{.Config.Image}}' benchmark-discord-ask)
 docker run --rm --name benchmark-ask-acceptance --user root \
   --env-file /etc/bmtech/discord-ask.env \
   -e PORTAL_BASE_URL=https://benchmarktechllc.github.io/bmtechllc/portal \
-  -v "$PWD/benchmark_cli_tool-0.1.1-py3-none-any.whl":/tmp/benchmark_cli_tool.whl:ro \
+  -v "$PWD/benchmark_cli_tool-0.1.2-py3-none-any.whl":/tmp/benchmark_cli_tool.whl:ro \
   --entrypoint bash \
   "$image" \
   -lc 'pip install --no-cache-dir /tmp/benchmark_cli_tool.whl && benchmark-acceptance'
@@ -337,7 +337,7 @@ docker rename benchmark-discord-ask benchmark-discord-ask-previous
 docker run -d --name benchmark-discord-ask --restart unless-stopped \
   --env-file /etc/bmtech/discord-ask.env \
   -e PORTAL_BASE_URL=https://benchmarktechllc.github.io/bmtechllc/portal \
-  -v /var/bmtech/benchmark_cli_tool-0.1.1-py3-none-any.whl:/opt/benchmark_cli_tool.whl:ro \
+  -v /var/bmtech/benchmark_cli_tool-0.1.2-py3-none-any.whl:/opt/benchmark_cli_tool.whl:ro \
   --user root \
   --entrypoint bash \
   "$image" \

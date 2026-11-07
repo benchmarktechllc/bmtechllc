@@ -133,6 +133,17 @@ def credential_refusal() -> AnswerResponse:
     )
 
 
+def channel_provenance_quote(channel_name: str) -> str:
+    """Cite the indexed channel name without copying the message body.
+
+    The stored chunk may contain an older announcement URL or a secret. The
+    channel list is metadata, so the displayed citation stays a provenance
+    label. The chunk row itself is left unchanged.
+    """
+    name = channel_name.strip().lstrip("#")
+    return f"Indexed Discord channel #{name}."
+
+
 def verbatim_excerpt(text: str, *, limit: int = 240) -> str:
     """Return a prefix of redacted text so the quote remains an exact substring."""
     cleaned = redact_secrets(text).strip()

@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from benchmark_cli import agent
+from benchmark_cli import acceptance, agent
 from benchmark_cli.corpus import is_synthetic_canary
 from benchmark_cli.discord_sync import plan_discord_reconcile
 from benchmark_cli.grounding import (
@@ -222,6 +222,7 @@ def test_paraphrases_use_retrieved_facts_and_skip_canary_boilerplate(
 
     channels = agent.run_agent("What Discord channels do we ingest?")
     assert channels.answer == "Synced Discord channels in the retrieval index: #sample-collab."
+    assert channels.citations[0].quote == "Indexed Discord channel #sample-collab."
     assert "New documentation published" not in channels.model_dump_json()
     assert "no relevant information was found" not in channels.answer.casefold()
 
@@ -293,8 +294,101 @@ def test_synced_channel_question_lists_indexed_channels_not_the_notification(
     assert response.status == "answered"
     assert "#sample-collab" in response.answer
     assert "#sample-planning" in response.answer
+    assert [citation.quote for citation in response.citations] == [
+        "Indexed Discord channel #sample-collab.",
+        "Indexed Discord channel #sample-planning.",
+    ]
     assert "New documentation published" not in rendered
+    assert "Sample planning note" not in rendered
     assert "article" not in response.answer.casefold()
+
+
+@pytest.mark.unit
+def test_channel_citations_omit_historic_url_and_secret_text(
+    monkeypatch: pytest.MonkeyPatch, quiet_agent: None
+) -> None:
+    historic = f"Documentation page {_STALE} token {_TOKEN} was announced in 2024."
+    monkeypatch.setattr(
+        agent,
+        "synced_discord_channel_rows",
+        lambda: [("sample-collab", 243, "discord-channel-1.json", _DIGEST, historic)],
+    )
+    monkeypatch.setattr(
+        agent,
+        "retrieve_evidence",
+        lambda *_args, **_kwargs: RetrievalDecision("no_relevant_information", (), None, 0),
+    )
+
+    response = agent.run_agent(CHANNEL_ACCEPTANCE_QUESTIONS[0])
+    rendered = response.model_dump_json()
+
+    assert response.status == "answered"
+    assert "#sample-collab" in response.answer
+    assert response.citations[0].chunk_id == 243
+    assert response.citations[0].quote == "Indexed Discord channel #sample-collab."
+    assert _STALE not in rendered
+    assert _TOKEN not in rendered
+    assert "2024" not in rendered
+
+
+@pytest.mark.unit
+def test_acceptance_labels_safe_unknowns_separately_from_answered_facts() -> None:
+    portal = {
+        "status": "answered",
+        "answer": f"The knowledge base portal is {_HOME}.",
+        "citations": [
+            {
+                "source_file": "portal/guide/index.md",
+                "chunk_id": 286,
+                "quote": "The guide explains how this knowledge base is organized.",
+            }
+        ],
+    }
+    employee = {
+        "status": "no_relevant_information",
+        "answer": "The retrieved evidence does not state a current employee count.",
+        "citations": [],
+    }
+    core = {
+        "status": "no_relevant_information",
+        "answer": "The retrieved evidence does not name a core team.",
+        "citations": [],
+    }
+    channels = {
+        "status": "answered",
+        "answer": "Synced Discord channels in the retrieval index: #sample-collab.",
+        "citations": [
+            {
+                "source_file": "discord-channel-1.json",
+                "chunk_id": 243,
+                "quote": "Indexed Discord channel #sample-collab.",
+            }
+        ],
+    }
+    historic = {
+        "status": "answered",
+        "answer": "Synced Discord channels in the retrieval index: #sample-collab.",
+        "citations": [
+            {
+                "source_file": "discord-channel-1.json",
+                "chunk_id": 243,
+                "quote": f"Documentation page {_STALE}",
+            }
+        ],
+    }
+
+    assert acceptance._check(PORTAL_ACCEPTANCE_QUESTIONS[0], portal, home=_HOME) == []
+    assert acceptance._outcome(PORTAL_ACCEPTANCE_QUESTIONS[0], portal, [])["proves_fact"] is True
+    employee_failures = acceptance._check(EMPLOYEE_ACCEPTANCE_QUESTIONS[0], employee, home=_HOME)
+    assert employee_failures == []
+    employee_outcome = acceptance._outcome(EMPLOYEE_ACCEPTANCE_QUESTIONS[0], employee, [])
+    assert employee_outcome == {"outcome": "unknown", "proves_fact": False, "expectation": "unknown_ok"}
+    core_failures = acceptance._check(CORE_TEAM_ACCEPTANCE_QUESTIONS[0], core, home=_HOME)
+    assert core_failures == []
+    assert acceptance._outcome(CORE_TEAM_ACCEPTANCE_QUESTIONS[0], core, [])["proves_fact"] is False
+    assert acceptance._check(CHANNEL_ACCEPTANCE_QUESTIONS[0], channels, home=_HOME) == []
+    historic_failures = acceptance._check(CHANNEL_ACCEPTANCE_QUESTIONS[0], historic, home=_HOME)
+    assert any("previous Pages host" in item or "provenance" in item for item in historic_failures)
 
 
 @pytest.mark.unit

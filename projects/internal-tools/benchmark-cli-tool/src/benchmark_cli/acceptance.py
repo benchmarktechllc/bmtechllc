@@ -32,6 +32,19 @@ _DIGIT_EMPLOYEE_COUNT = re.compile(r"\b\d+\s+employees?\b", re.IGNORECASE)
 _STALE_HOST = "hussein881.github.io"
 _GENERIC_NO_INFO = "no relevant information was found in the company document library"
 _COUNT_UNCERTAINTY = "does not state a current employee count"
+_NO_CORE_TEAM = "does not name a core team"
+_CHANNEL_PROVENANCE = "Indexed Discord channel #"
+
+# Public repo search found no page that names a BMTech core-team roster.
+# A reviewer handle in another project is not that roster.
+CORE_TEAM_EXPECTATION = (
+    "unknown_ok. No explicit core-team roster is in the public repo. "
+    "Abstaining with no citations is a data gap, not proof that a roster was retrieved."
+)
+EMPLOYEE_EXPECTATION = (
+    "unknown_ok unless an indexed sentence states a digit employee count. "
+    "Uncertainty with no citations is the safe result, not a measured headcount."
+)
 
 
 def _dependencies() -> dict[str, bool]:
@@ -43,7 +56,15 @@ def _dependencies() -> dict[str, bool]:
     }
 
 
+def _displayed_quotes(response_payload: dict[str, object]) -> list[str]:
+    citations = response_payload.get("citations")
+    if not isinstance(citations, list):
+        return []
+    return [str(citation.get("quote") or "") for citation in citations if isinstance(citation, dict)]
+
+
 def _citation_views(response_payload: dict[str, object]) -> list[dict[str, object]]:
+    """Citation identifiers only. Message text stays out of the report."""
     citations = response_payload.get("citations")
     if not isinstance(citations, list):
         return []
@@ -59,6 +80,9 @@ def _citation_views(response_payload: dict[str, object]) -> list[dict[str, objec
                 "chunk_id": citation.get("chunk_id"),
                 "synthetic_source": is_synthetic_canary(source, {}),
                 "boilerplate_quote": is_boilerplate_text(quote),
+                "contains_previous_pages_host": _STALE_HOST in quote,
+                "contains_url": "http://" in quote or "https://" in quote,
+                "provenance_only": quote.startswith(_CHANNEL_PROVENANCE),
             }
         )
     return views
@@ -67,10 +91,11 @@ def _citation_views(response_payload: dict[str, object]) -> list[dict[str, objec
 def _check(question: str, payload: dict[str, object], *, home: str | None) -> list[str]:
     answer = str(payload.get("answer") or "")
     status = str(payload.get("status") or "")
-    blob = json.dumps(payload)
+    quotes = _displayed_quotes(payload)
+    displayed = "\n".join([answer, *quotes])
     failures: list[str] = []
-    if _STALE_HOST in blob:
-        failures.append("contains the previous Pages host")
+    if _STALE_HOST in displayed:
+        failures.append("displayed answer or citation contains the previous Pages host")
     views = _citation_views(payload)
     if any(view["synthetic_source"] for view in views):
         failures.append("citation source is a synthetic canary")
@@ -95,10 +120,47 @@ def _check(question: str, payload: dict[str, object], *, home: str | None) -> li
     elif asks_for_core_team(question):
         if _DIGIT_EMPLOYEE_COUNT.search(answer):
             failures.append("core-team answer states a numeric headcount")
+        if status != "answered" and _NO_CORE_TEAM not in answer.casefold():
+            failures.append("core-team data gap is not explained")
+        if status == "answered" and not views:
+            failures.append("core-team answer has no citation")
     elif asks_for_synced_channels(question):
         if status != "answered" or "#" not in answer:
             failures.append("synced-channel answer did not list indexed channel names")
+        elif not views or not all(view["provenance_only"] for view in views):
+            failures.append("channel citation is not limited to channel provenance")
+        elif any(view["contains_url"] for view in views):
+            failures.append("channel citation includes a URL from message text")
     return failures
+
+
+def _outcome(question: str, payload: dict[str, object], failures: list[str]) -> dict[str, object]:
+    status = str(payload.get("status") or "")
+    if failures:
+        kind = "failed"
+        proves = False
+        expectation = "must_answer"
+    elif asks_for_portal_link(question):
+        kind = "answered"
+        proves = True
+        expectation = "must_answer"
+    elif asks_for_synced_channels(question):
+        kind = "answered"
+        proves = True
+        expectation = "must_answer"
+    elif asks_for_employee_count(question):
+        kind = "unknown" if status != "answered" else "answered"
+        proves = status == "answered"
+        expectation = "unknown_ok"
+    elif asks_for_core_team(question):
+        kind = "unknown" if status != "answered" else "answered"
+        proves = status == "answered"
+        expectation = "unknown_ok"
+    else:
+        kind = "answered" if status == "answered" else "unknown"
+        proves = status == "answered"
+        expectation = "must_answer"
+    return {"outcome": kind, "proves_fact": proves, "expectation": expectation}
 
 
 def run_acceptance() -> dict[str, object]:
@@ -125,12 +187,22 @@ def run_acceptance() -> dict[str, object]:
                     "answer": payload.get("answer"),
                     "citations": _citation_views(payload),
                     "failures": question_failures,
+                    **_outcome(question, payload, question_failures),
                 }
             )
     return {
         "revision": "2026-11-07-ask-retrieval",
         "portal_home": home,
         "dependencies": dependencies,
+        "expectations": {
+            "portal": "must_answer with the configured absolute portal URL and a knowledge-base citation.",
+            "channels": (
+                "must_answer with indexed channel names. Citations are provenance labels. "
+                "A historic URL may remain in the stored chunk and is not rewritten or displayed."
+            ),
+            "employee_count": EMPLOYEE_EXPECTATION,
+            "core_team": CORE_TEAM_EXPECTATION,
+        },
         "question_groups": {
             "portal": list(PORTAL_ACCEPTANCE_QUESTIONS),
             "employee": list(EMPLOYEE_ACCEPTANCE_QUESTIONS),

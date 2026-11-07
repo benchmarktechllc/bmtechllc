@@ -18,6 +18,7 @@ from .grounding import (
     asks_for_employee_count,
     asks_for_portal_link,
     asks_for_synced_channels,
+    channel_provenance_quote,
     core_team_answer,
     credential_refusal,
     employee_count_answer,
@@ -26,7 +27,6 @@ from .grounding import (
     scrub_response,
     stated_employee_count_answer,
     synced_channels_answer,
-    verbatim_excerpt,
 )
 from .ingestion.clean import redact_secrets
 from .llm import call_llm, call_llm_structured
@@ -306,8 +306,7 @@ def _with_phrase(decision: RetrievalDecision | None, phrase: str) -> RetrievalDe
 def _synced_channels() -> tuple[SyncedDiscordChannel, ...]:
     channels: list[SyncedDiscordChannel] = []
     for name, chunk_id, source_file, digest, text in synced_discord_channel_rows():
-        quote = verbatim_excerpt(text)
-        if not quote:
+        if not redact_secrets(text).strip():
             continue
         channels.append(
             SyncedDiscordChannel(
@@ -315,7 +314,7 @@ def _synced_channels() -> tuple[SyncedDiscordChannel, ...]:
                 chunk_id=chunk_id,
                 source_file=source_file,
                 content_sha256=digest,
-                quote=quote,
+                quote=channel_provenance_quote(name),
             )
         )
     return tuple(channels)
