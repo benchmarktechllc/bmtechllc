@@ -89,27 +89,44 @@ def asks_for_credentials(question: str) -> bool:
     return bool(_CREDENTIAL_REQUEST.search(question))
 
 
-def asks_for_portal_link(question: str) -> bool:
-    """Match only an unambiguous request for the knowledge-base home.
+# Closed class for "the site itself." Any other content word is a subresource.
+_PORTAL_REQUEST = frozenset(
+    {
+        "what", "whats", "where", "link", "url", "uri", "address", "open", "find",
+        "visit", "homepage", "send", "give", "show", "tell", "me", "the", "our",
+        "a", "an", "to", "for", "of", "is", "do", "i", "we", "please", "can",
+        "you", "my", "us", "there", "here", "in", "on", "at", "by", "with",
+        "from", "into", "about", "your", "that", "this", "it", "be", "s",
+    }
+)
+_PORTAL_SITE = frozenset({"portal", "knowledge", "base", "kb", "homepage", "home"})
 
-    A subpage, a second question joined by ``and``, or any other document
-    name falls through to the ordinary model path.
+
+def asks_for_portal_link(question: str) -> bool:
+    """Match only a request whose object is the knowledge-base home.
+
+    Procedure questions and any extra content word (a bridge, settings, a
+    status page, a second clause) stay on the ordinary answer path. The
+    allowed words are the request and the site, not a list of forbidden pages.
     """
-    text = question.casefold()
-    if re.search(r"\b(?:and|then)\b", text):
+    if re.search(r"\b(?:and|then|how)\b", question, flags=re.IGNORECASE):
         return False
-    if re.search(r"\b(?:page|status|billing|guide|handbook|article|runbook|playbook)\b", text):
-        return False
-    if re.search(r"\bportal\s+(?!home\b|link\b|url\b)\w+", text):
-        return False
-    asks_for_location = re.search(
-        r"\b(?:link|url|uri|address|homepage|home page)\b"
-        r"|\bwhere\b.+\b(?:open|find)\b"
-        r"|\b(?:open|visit)\b",
-        text,
+    tokens = re.findall(r"[a-z0-9]+", question.casefold().replace("'", ""))
+    asks_location = any(
+        token in {"link", "url", "uri", "address", "where", "open", "find", "visit", "homepage"}
+        for token in tokens
     )
-    names_the_site = re.search(r"\b(?:knowledge[ -]?base|portal|kb)\b", text)
-    return asks_for_location is not None and names_the_site is not None
+    names_site = any(token in {"portal", "kb", "knowledge"} for token in tokens)
+    if not asks_location or not names_site:
+        return False
+    extras = [
+        token
+        for token in tokens
+        if token not in _PORTAL_REQUEST
+        and token not in _PORTAL_SITE
+        and token not in {"bmtech", "benchmark", "benchmarktech"}
+    ]
+    return extras in ([], ["page"], ["pages"])
 
 
 def asks_for_employee_count(question: str) -> bool:
@@ -227,27 +244,6 @@ _SENTENCE_HEDGE = re.compile(
 _COUNT_FUNCTION_WORD = frozenset(
     {"if", "unless", "when", "in", "at", "on", "for", "and", "or", "the", "a", "an", "to", "of", "with"}
 )
-_NON_PERSON = frozenset(
-    {
-        "the",
-        "our",
-        "their",
-        "its",
-        "this",
-        "that",
-        "these",
-        "those",
-        "core",
-        "team",
-        "responsible",
-        "ready",
-        "meeting",
-        "tomorrow",
-        "today",
-        "there",
-        "here",
-    }
-)
 
 
 def _subject_is_this_company(subject: str) -> bool:
@@ -284,13 +280,18 @@ def _company_employee_count(sentence: str) -> bool:
 
 
 def _people_names(sentence: str) -> list[str]:
-    """Ignore capitalized words that are objects of a place preposition."""
+    """A roster entry is a full name or a coordinated list of names.
+
+    One capitalized token is also a place or an ordinary word, so ``Boston``
+    alone is not a person. ``in Boston`` is removed before the scan.
+    """
     without_places = re.sub(r"\b(?:in|at|near|from|into)\s+[A-Z][a-z]+\b", "", sentence)
-    return [
-        word
-        for word in re.findall(r"\b[A-Z][a-z]{2,}\b", without_places)
-        if word.casefold() not in _NON_PERSON
-    ]
+    pairs = re.findall(r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})+\b", without_places)
+    listed = re.findall(
+        r"\b[A-Z][a-z]{2,}(?:\s*,\s*(?:and\s+)?[A-Z][a-z]{2,})+\b",
+        without_places,
+    )
+    return pairs + listed
 
 
 def _core_team_quote(text: str) -> str | None:
@@ -444,30 +445,28 @@ def synced_channels_answer(channels: Sequence[SyncedDiscordChannel]) -> AnswerRe
     )
 
 
-_ANSWER_COMPLETION = re.compile(
-    r"\b(?:was|were|has been|have been)\s+(?:made|decided|approved|completed|finalized|defined|signed off)\b"
-    r"|\b(?:decided|approved|finalized|signed off)\b",
-    re.IGNORECASE,
+# Grammar and answer framing, not a catalog of company nouns.
+_FUNCTION = frozenset(
+    """
+    a an the of to for in on at by with from into about and or but if unless
+    when while our your my me i we you do does did is are was were be been
+    being how what where who which whom whose please can could should would
+    will may might shall tell give show send there here this that these those
+    it its their them than then so not no nor as per via onto upon am have has
+    had also just only next new current bmtech benchmark benchmarktech company
+    discord team core channel channels
+    """.split()
 )
-# Finite decision verbs only. The noun "decision" inside a proposal is not one.
-_EVIDENCE_DONE = re.compile(r"\b(?:decided|approved|agreed|signed off)\b", re.IGNORECASE)
-_FOCUS_STOP = frozenset(
-    {
-        "the", "and", "for", "our", "your", "who", "what", "where", "when", "how",
-        "should", "would", "could", "please", "tell", "does", "did", "are", "was",
-        "next", "new", "current", "bmtech", "company", "discord", "team", "core",
-        "channel", "channels", "with", "from", "that", "this", "you", "have",
-    }
+_FRAMING = frozenset(
+    "relevant retrieved retrieve excerpt excerpts citation citations source sources following".split()
+)
+_IRREGULAR_DONE = frozenset(
+    "made done built sent paid met left kept held found set gone begun".split()
 )
 _NOT_RESPONSIVE = (
     "The retrieved evidence does not address this question. "
     "Missing facts, including any current incident state, are unknown."
 )
-_NO_PROCEDURE = (
-    "The retrieved evidence does not include a supported procedure for this request. "
-    "Missing steps are unknown. I will not invent operational steps."
-)
-_RECOMMENDATION = re.compile(r"\b(?:who|what)\s+should\b|\brecommend\b", re.IGNORECASE)
 _REQUESTED_DOCS = (
     ("deployment guide", ("deployment guide", "deploy guide")),
     ("runbook", ("runbook", "runbooks")),
@@ -475,9 +474,10 @@ _REQUESTED_DOCS = (
     ("employee handbook", ("employee handbook",)),
 )
 _PLAN_QUALIFICATION = (
-    "The retrieved evidence describes planning, a proposal, or to-do work. "
-    "It does not explicitly state that this was approved, decided, or completed."
+    "The retrieved evidence does not explicitly state that this was approved, decided, or completed. "
+    "What follows is cited text, and it is not a final decision."
 )
+_STATUS_TOKEN = re.compile(r"\bno_relevant_information\b", re.IGNORECASE)
 
 
 def _cited_chunks(response: AnswerResponse, chunks: Sequence[SearchChunk]) -> list[SearchChunk]:
@@ -485,17 +485,22 @@ def _cited_chunks(response: AnswerResponse, chunks: Sequence[SearchChunk]) -> li
     return [by_id[citation.chunk_id] for citation in response.citations if citation.chunk_id in by_id]
 
 
-def _claims_completion(answer: str) -> bool:
-    return _ANSWER_COMPLETION.search(answer) is not None
-
-
-def _evidence_records_completion(text: str) -> bool:
-    return _EVIDENCE_DONE.search(text) is not None
-
-
 def _requested_documents(question: str) -> list[tuple[str, tuple[str, ...]]]:
     text = question.casefold()
     return [item for item in _REQUESTED_DOCS if any(alias in text for alias in item[1])]
+
+
+def _norm_phrase(text: str) -> str:
+    """Fold hyphens, underscores, and file extensions into words."""
+    folded = text.casefold()
+    folded = re.sub(r"\.[a-z0-9]{1,8}\b", " ", folded)
+    return f" {re.sub(r'[^a-z0-9]+', ' ', folded).strip()} "
+
+
+def _identity_has(identity: str, alias: str) -> bool:
+    norm = _norm_phrase(identity)
+    phrase = _norm_phrase(alias).strip()
+    return f" {phrase} " in norm or f" {phrase}s " in norm
 
 
 def _chunk_identity_text(chunk: SearchChunk) -> str:
@@ -509,15 +514,118 @@ def _chunk_identity_text(chunk: SearchChunk) -> str:
             str(metadata.get("section") or ""),
             str(metadata.get("kb_section") or ""),
         )
-    ).casefold()
+    )
 
 
-def _focus_terms(question: str) -> set[str]:
-    return {
-        token.casefold()
-        for token in re.findall(r"[A-Za-z][A-Za-z'-]{2,}", question)
-        if token.casefold() not in _FOCUS_STOP
-    }
+def _stem(token: str) -> str:
+    word = token.casefold().replace("'", "")
+    for suffix in ("ing", "ed", "es"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            word = word[: -len(suffix)]
+            break
+    else:
+        if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+            word = word[:-1]
+    if len(word) > 3 and word.endswith("e"):
+        word = word[:-1]
+    return word
+
+
+def _content_stems(text: str) -> set[str]:
+    stems: set[str] = set()
+    for token in re.findall(r"[A-Za-z][A-Za-z'-]{1,}", text):
+        raw = token.casefold().replace("'", "")
+        if raw in _FUNCTION or raw in _FRAMING:
+            continue
+        stem = _stem(token)
+        if len(stem) >= 3 and stem not in _FUNCTION and stem not in _FRAMING:
+            stems.add(stem)
+    return stems
+
+
+def _proper_names(sentence: str) -> list[str]:
+    return [
+        word
+        for word in re.findall(r"\b[A-Z][a-z]{2,}\b", sentence)
+        if word.casefold() not in _FUNCTION and word.casefold() not in _FRAMING
+    ]
+
+
+def _completed(text: str) -> bool:
+    """A finished claim, not a future, modal, or proposal.
+
+    ``decisions made`` counts without a preceding ``were``. ``will discuss``
+    and ``might write`` do not.
+    """
+    if re.search(r"\b(?:will|would|might|could|may|should|shall|can)\b", text, flags=re.IGNORECASE):
+        return False
+    if re.search(
+        r"\b(?:next|tomorrow|later|upcoming|proposal|plan|planning|todo|to-do|draft)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return False
+    for token in re.findall(r"[A-Za-z']+", text):
+        word = token.casefold()
+        if word in _IRREGULAR_DONE or (len(word) > 4 and word.endswith("ed") and not word.endswith("eed")):
+            return True
+    return False
+
+
+def _is_howto(question: str) -> bool:
+    """A procedure question. A comparison that happens to start with ``how`` is not one."""
+    if re.search(
+        r"\b(?:differ(?:s|ence|ent)?|compar(?:e|ison|ing|ed)|versus|vs\.?|between)\b",
+        question,
+        flags=re.IGNORECASE,
+    ):
+        return False
+    return re.search(r"\bhow\s+(?:do|can|should|to)\b", question, flags=re.IGNORECASE) is not None
+
+
+def _asks_outcome(question: str) -> bool:
+    return re.search(
+        r"\b(?:decision|decisions|decided|approved|complete|completed|final|finalized|done|hire|hired)\b",
+        question,
+        flags=re.IGNORECASE,
+    ) is not None
+
+
+def _is_document_lookup(question: str) -> bool:
+    """A page lookup, not a comparison or explanation of the ideas."""
+    if re.search(
+        r"\b(?:differ(?:s|ence|ent)?|compar(?:e|ison|ing|ed)|versus|vs\.?|between|rather)\b",
+        question,
+        flags=re.IGNORECASE,
+    ):
+        return False
+    return re.search(
+        r"\b(?:where|find|link|url|locate|which\s+(?:page|document))\b",
+        question,
+        flags=re.IGNORECASE,
+    ) is not None
+
+
+def _on_topic(question: str, evidence: str) -> bool:
+    return bool(_content_stems(question) & _content_stems(evidence))
+
+
+def _covers(question: str, evidence: str) -> bool:
+    stems = _content_stems(question)
+    return bool(stems) and stems <= _content_stems(evidence)
+
+
+def _sentence_supported(sentence: str, quotes: str) -> bool:
+    """The sentence adds nothing the quotes do not already say, in the same tense."""
+    stems = _content_stems(sentence)
+    if stems and not stems <= _content_stems(quotes):
+        return False
+    folded = quotes.casefold()
+    if any(name.casefold() not in folded for name in _proper_names(sentence)):
+        return False
+    if _completed(sentence) and not _completed(quotes):
+        return False
+    return True
 
 
 def _without_orphan_citation_sentences(answer: str, citation_count: int) -> str:
@@ -546,23 +654,55 @@ def _chunk_label(chunk: SearchChunk) -> str:
 
 
 def _asserts_document(answer: str, aliases: tuple[str, ...]) -> bool:
+    """True when the answer equates a page with the document, not when it discusses the idea."""
     for alias in aliases:
-        if re.search(rf"\b{re.escape(alias)}\b", answer, flags=re.IGNORECASE) is None:
+        if re.search(rf"\b{re.escape(alias)}\s+(?:is|are)\b", answer, flags=re.IGNORECASE) is None:
             continue
         if re.search(
-            rf"\b(?:not|no|isn't|is not|without|closest)\b.{{0,50}}\b{re.escape(alias)}\b",
+            rf"\b{re.escape(alias)}\s+(?:is|are)\s+(?:not|no|different|broader|narrower|unlike)\b",
             answer,
             flags=re.IGNORECASE,
         ):
-            return False
-        if re.search(
-            rf"\b{re.escape(alias)}\b.{{0,50}}\b(?:not found|does not exist|isn't|is not|was not found)\b",
-            answer,
-            flags=re.IGNORECASE,
-        ):
-            return False
+            continue
         return True
     return False
+
+
+def _excerpts(response: AnswerResponse) -> str:
+    return "\n".join(f"- {citation.quote}" for citation in response.citations)
+
+
+def _with_note(response: AnswerResponse, note: str) -> AnswerResponse:
+    return response.model_copy(
+        update={
+            "answer": f"{note}\n\n{_excerpts(response)}",
+            "confidence": min(response.confidence, 0.4),
+        }
+    )
+
+
+def _identity_gap(question: str, answer: str, cited: Sequence[SearchChunk]) -> str | None:
+    """A lookup that names a page the metadata does not identify. Comparisons are not lookups."""
+    if not _is_document_lookup(question):
+        return None
+    for label, aliases in _requested_documents(question):
+        if not _asserts_document(answer, aliases):
+            continue
+        if any(
+            any(_identity_has(_chunk_identity_text(chunk), alias) for alias in aliases) for chunk in cited
+        ):
+            continue
+        closest = _chunk_label(cited[0]) if cited else "the cited page"
+        return (
+            f"No retrieved page is identified as the {label}. "
+            f"The closest cited page is {closest}. "
+            "That page is not established as the requested document."
+        )
+    return None
+
+
+def _split_sentences(answer: str) -> list[str]:
+    return [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", answer.strip()) if sentence.strip()]
 
 
 def qualify_grounded_answer(
@@ -570,7 +710,13 @@ def qualify_grounded_answer(
     response: AnswerResponse,
     chunks: Sequence[SearchChunk],
 ) -> AnswerResponse:
-    """Stop completion claims and document identities the citations do not support."""
+    """Keep a sentence only when a returned citation says it, in the same tense.
+
+    A how-to is answered from quotes that cover the request, not from one shared
+    verb. A finished claim needs finished evidence. A comparison is not rewritten
+    into a missing-page notice. An inline marker with no returned citation drops
+    that sentence.
+    """
     if response.status != "answered" or not response.citations:
         return response
     visible = _without_orphan_citation_sentences(response.answer, len(response.citations))
@@ -579,60 +725,90 @@ def qualify_grounded_answer(
     response = response.model_copy(update={"answer": visible})
     cited = _cited_chunks(response, chunks)
     quoted = "\n".join(citation.quote for citation in response.citations)
-    quoted_folded = quoted.casefold()
-    focus = _focus_terms(question)
-    howto = re.search(r"\bhow\s+(?:do|can|should|to)\b", question, flags=re.IGNORECASE) is not None
-    if howto:
-        procedure = bool(focus) and any(term in quoted_folded for term in focus) and re.search(
-            r"\b(?:step|first|then|run|add|set|open|use)\b",
-            quoted,
-            flags=re.IGNORECASE,
-        )
-        if not procedure:
-            return _abstain(_NO_PROCEDURE)
-        return response.model_copy(
-            update={
-                "answer": (
-                    "Supported steps found in the cited evidence:\n\n"
-                    + "\n".join(f"- {citation.quote}" for citation in response.citations)
-                    + "\n\nAnything not quoted above is unknown."
-                ),
-                "confidence": min(response.confidence, 0.4),
-            }
-        )
-    if _RECOMMENDATION.search(question) and (
-        not focus or not any(term in quoted_folded for term in focus)
-    ):
+    if _is_howto(question) and not _covers(question, quoted):
         return _abstain(_NOT_RESPONSIVE)
-    notes: list[str] = []
-    if _claims_completion(response.answer) and not _evidence_records_completion(quoted):
-        notes.append(_PLAN_QUALIFICATION)
-    for label, aliases in _requested_documents(question):
-        if not _asserts_document(response.answer, aliases):
-            continue
-        if any(any(alias in _chunk_identity_text(chunk) for alias in aliases) for chunk in cited):
-            continue
-        closest = _chunk_label(cited[0]) if cited else "the cited page"
-        notes.append(
-            f"No retrieved page is identified as the {label}. "
-            f"The closest cited page is {closest}. "
-            "That page is not established as the requested document."
-        )
-        break
-    if not notes:
-        return response
-    excerpts = "\n".join(f"- {citation.quote}" for citation in response.citations)
-    return response.model_copy(
-        update={
-            "answer": "\n\n".join(notes) + "\n\n" + excerpts,
-            "confidence": min(response.confidence, 0.4),
-        }
+    sentences = _split_sentences(visible)
+    kept = [sentence for sentence in sentences if _sentence_supported(sentence, quoted)]
+    if len(kept) == len(sentences):
+        kept_answer = visible
+    else:
+        kept_answer = " ".join(kept).strip()
+    identity = _identity_gap(question, visible, cited)
+    if identity is not None:
+        return _with_note(response, identity)
+    if kept_answer:
+        if kept_answer == visible:
+            return response
+        return response.model_copy(update={"answer": kept_answer, "confidence": min(response.confidence, 0.4)})
+    identified = _is_document_lookup(question) and any(
+        any(_identity_has(_chunk_identity_text(chunk), alias) for alias in aliases)
+        for _label, aliases in _requested_documents(question)
+        for chunk in cited
     )
+    if identified:
+        return response.model_copy(
+            update={"answer": _excerpts(response), "confidence": min(response.confidence, 0.4)}
+        )
+    if _is_howto(question) and _covers(question, quoted):
+        return response.model_copy(
+            update={"answer": _excerpts(response), "confidence": min(response.confidence, 0.4)}
+        )
+    if _on_topic(question, quoted) and _completed(quoted):
+        return response.model_copy(
+            update={"answer": _excerpts(response), "confidence": min(response.confidence, 0.4)}
+        )
+    if _on_topic(question, quoted) and (
+        _asks_outcome(question) or (_completed(visible) and not _completed(quoted))
+    ):
+        return _with_note(response, _PLAN_QUALIFICATION)
+    return _abstain(_NOT_RESPONSIVE)
+
+
+def supported_outcome_answer(
+    question: str,
+    results: Sequence[HybridSearchResult],
+) -> AnswerResponse | None:
+    """When the model abstains, still show on-topic outcome evidence.
+
+    A recorded decision is quoted as that decision. A plan is quoted with an
+    explicit note that it is not final. Off-topic chunks are not dumped.
+    """
+    if not _asks_outcome(question):
+        return None
+    citations: list[Citation] = []
+    for result in results:
+        if not _on_topic(question, result.chunk.chunk_text):
+            continue
+        quote = verbatim_excerpt(result.chunk.chunk_text)
+        citation = _citation(result, quote)
+        if citation is not None:
+            citations.append(citation)
+    if not citations:
+        return None
+    completed = [
+        citation.quote
+        for citation in citations
+        if _completed(citation.quote) and _on_topic(question, citation.quote)
+    ]
+    if completed:
+        answer = "\n".join(f"- {quote}" for quote in completed)
+    else:
+        answer = _PLAN_QUALIFICATION + "\n\n" + "\n".join(f"- {citation.quote}" for citation in citations)
+    return AnswerResponse(status="answered", answer=answer, confidence=0.4, citations=citations)
+
+
+def _plain_answer(answer: str) -> str:
+    """The status code is not something to show a person."""
+    if _STATUS_TOKEN.search(answer) is None:
+        return answer
+    cleaned = _STATUS_TOKEN.sub("", answer)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" \n\t-:;,.")
+    return cleaned or _NOT_RESPONSIVE
 
 
 def scrub_response(response: AnswerResponse) -> AnswerResponse:
-    """Remove credential material from answer text and citation quotes."""
-    answer = redact_secrets(response.answer)
+    """Remove credential material and internal status codes from visible text."""
+    answer = _plain_answer(redact_secrets(response.answer))
     citations = []
     for citation in response.citations:
         quote = redact_secrets(citation.quote).strip()

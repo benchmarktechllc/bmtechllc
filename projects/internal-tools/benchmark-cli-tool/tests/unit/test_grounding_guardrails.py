@@ -53,6 +53,10 @@ def _result(text: str) -> HybridSearchResult:
         "How many employees joined last quarter?",
         "Who should we hire next for the core team?",
         "How do I index a new Discord channel?",
+        "Where do I find the kb incident bridge?",
+        "Open the kb settings",
+        "How do I rotate the portal certificate?",
+        "How do I open the portal?",
     ),
 )
 def test_ordinary_prompts_are_not_intercepted(question: str) -> None:
@@ -112,6 +116,8 @@ def test_heading_and_denial_are_not_a_core_team_roster(
             _result("Our core team is ready."),
             _result("The core team is Responsible for deployments."),
             _result("The core team members are in Boston."),
+            _result("Boston is on the core team."),
+            _result("The core team includes Boston."),
         ),
         0.8,
         2,
@@ -567,3 +573,246 @@ def test_tool_results_redact_secrets_before_they_reach_the_model(
     assert secret not in payload
     assert "[REDACTED]" in payload
     assert secret not in evidence[4].chunk_text
+
+
+@pytest.mark.unit
+def test_full_name_is_a_roster_and_a_place_is_not(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agent, "log_agent_diagnostic", lambda **_kwargs: None)
+    monkeypatch.setattr(agent, "call_llm", lambda **_kwargs: pytest.fail("roster extractor must run first"))
+    monkeypatch.setattr(
+        agent,
+        "retrieve_evidence",
+        lambda *_a, **_k: RetrievalDecision(
+            "accepted",
+            (_result("Ada Lovelace is on the core team."),),
+            0.8,
+            1,
+        ),
+    )
+
+    response = agent.run_agent("Who is on the core team?")
+
+    assert response.status == "answered"
+    assert "Ada Lovelace" in response.answer
+    assert "Boston" not in response.answer
+
+
+@pytest.mark.unit
+def test_entailment_keeps_supported_text_and_drops_invented_claims(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    certificate = "Rotate the certificate in the portal settings."
+    planning = (
+        "Kiosk next work is MVP definition and setting the timeline. "
+        "The revised project proposal covers architecture."
+    )
+    hiring = "The core team will discuss hiring next month."
+    comparison = "A playbook explains the approach. A runbook lists the steps."
+
+    def run(question: str, chunk: SearchChunk, claim: str, quote: str | None = None) -> AnswerResponse:
+        monkeypatch.setattr(agent, "log_agent_diagnostic", lambda **_kwargs: None)
+        monkeypatch.setattr(agent, "classify_query", lambda _question: "cheap")
+        monkeypatch.setattr(
+            agent,
+            "retrieve_evidence",
+            lambda *_a, **_k: RetrievalDecision(
+                "accepted",
+                (HybridSearchResult(chunk, 0.2, vector_score=0.8, fts_score=1.0),),
+                0.8,
+                1,
+            ),
+        )
+        monkeypatch.setattr(
+            agent,
+            "call_llm",
+            lambda **_k: SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=None, content=""))]),
+        )
+        monkeypatch.setattr(
+            agent,
+            "call_llm_structured",
+            lambda **_k: AnswerResponse(
+                status="answered",
+                answer=claim,
+                confidence=0.9,
+                citations=[
+                    Citation(
+                        source_file=chunk.source_file,
+                        chunk_id=chunk.id,
+                        content_sha256=chunk.content_sha256 or _DIGEST,
+                        quote=quote or chunk.chunk_text,
+                    )
+                ],
+            ),
+        )
+        return agent.run_agent(question)
+
+    cert_chunk = SearchChunk(
+        8,
+        "portal/security.md",
+        0,
+        certificate,
+        {"source_type": "kb_page", "title": "Security"},
+        1.0,
+        content_sha256=_DIGEST,
+    )
+    rotated = run("How do I rotate the portal certificate?", cert_chunk, certificate)
+    assert rotated.status == "answered"
+    assert certificate in rotated.answer
+    assert "no_relevant_information" not in rotated.answer
+
+    cafeteria = SearchChunk(
+        9,
+        "notes/office.md",
+        0,
+        "Open the cafeteria.",
+        {"source_type": "kb_page", "title": "Office"},
+        1.0,
+        content_sha256=_DIGEST,
+    )
+    opened = run("How do I open the portal?", cafeteria, "Open the cafeteria.")
+    assert opened.status == "no_relevant_information"
+    assert "supported steps" not in opened.answer.casefold()
+    assert "cafeteria" not in opened.answer.casefold()
+    assert "no_relevant_information" not in opened.answer
+
+    plan_chunk = SearchChunk(
+        110,
+        "notes/planning.md",
+        0,
+        planning,
+        {"source_type": "kb_page", "title": "Planning note"},
+        1.0,
+        content_sha256=_DIGEST,
+    )
+    made = run(
+        "What kiosk decisions are complete?",
+        plan_chunk,
+        "Architecture decisions made for the kiosk.",
+    )
+    assert made.status == "answered"
+    assert "does not explicitly state" in made.answer.casefold()
+    assert "not a final decision" in made.answer.casefold()
+    assert "setting the timeline" in made.answer
+    assert "decisions made" not in made.answer.casefold()
+
+    hire_chunk = SearchChunk(
+        12,
+        "notes/hiring.md",
+        0,
+        hiring,
+        {"source_type": "kb_page", "title": "Hiring note"},
+        1.0,
+        content_sha256="c" * 64,
+    )
+    hired = run("Who did the core team hire?", hire_chunk, "The core team hired Ada.")
+    assert "ada" not in hired.answer.casefold()
+    assert "hired ada" not in hired.answer.casefold()
+    assert "discuss hiring" in hired.answer.casefold()
+    assert "does not explicitly state" in hired.answer.casefold()
+
+    guide = SearchChunk(
+        615,
+        "portal/guide/index.md",
+        0,
+        comparison,
+        {"source_type": "kb_page", "title": "Guide", "url": "https://example.test/guide/"},
+        1.0,
+        content_sha256="d" * 64,
+    )
+    compared = run("How do playbooks compare with runbooks?", guide, comparison)
+    assert compared.answer == comparison
+    assert "identified as the runbook" not in compared.answer.casefold()
+    assert "closest cited page" not in compared.answer.casefold()
+
+    named = SearchChunk(
+        70,
+        "kb/deployment-guide.md",
+        0,
+        "Use this deployment guide for releases.",
+        {"source_type": "kb_page", "title": "", "url": ""},
+        1.0,
+        content_sha256="e" * 64,
+    )
+    located = run(
+        "Where is the deployment guide?",
+        named,
+        "The deployment guide is this page.",
+    )
+    assert "not established as the requested document" not in located.answer.casefold()
+    assert "deployment guide" in located.answer.casefold()
+
+    mixed = run(
+        "How do I rotate the portal certificate?",
+        cert_chunk,
+        f"The portal certificate expired. {certificate} [1].",
+    )
+    assert "expired" not in mixed.answer.casefold()
+    assert certificate in mixed.answer
+    assert mixed.citations[0].chunk_id == 8
+
+
+@pytest.mark.unit
+def test_abstention_uses_plain_language_and_keeps_a_cited_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planning = "Kiosk next work is MVP definition and setting the timeline."
+    chunk = SearchChunk(
+        110,
+        "notes/planning.md",
+        0,
+        planning,
+        {"source_type": "kb_page", "title": "Planning note"},
+        1.0,
+        content_sha256=_DIGEST,
+    )
+
+    def stub(question_chunk: SearchChunk, response: AnswerResponse) -> None:
+        monkeypatch.setattr(agent, "log_agent_diagnostic", lambda **_kwargs: None)
+        monkeypatch.setattr(agent, "classify_query", lambda _question: "cheap")
+        monkeypatch.setattr(
+            agent,
+            "retrieve_evidence",
+            lambda *_a, **_k: RetrievalDecision(
+                "accepted",
+                (HybridSearchResult(question_chunk, 0.2, vector_score=0.8, fts_score=1.0),),
+                0.8,
+                1,
+            ),
+        )
+        monkeypatch.setattr(
+            agent,
+            "call_llm",
+            lambda **_k: SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=None, content=""))]),
+        )
+        monkeypatch.setattr(agent, "call_llm_structured", lambda **_k: response)
+
+    stub(
+        chunk,
+        AnswerResponse(status="no_relevant_information", answer="no_relevant_information", confidence=0.0),
+    )
+    kiosk = agent.run_agent("What kiosk decisions are complete?")
+    assert kiosk.status == "answered"
+    assert "setting the timeline" in kiosk.answer
+    assert "does not explicitly state" in kiosk.answer.casefold()
+    assert "not a final decision" in kiosk.answer.casefold()
+    assert "no_relevant_information" not in kiosk.answer
+    assert kiosk.citations[0].chunk_id == 110
+
+    billing = SearchChunk(
+        4,
+        "portal/guide/billing.md",
+        0,
+        "Billing settings live on another team.",
+        {"source_type": "kb_page", "title": "Billing"},
+        1.0,
+        content_sha256=_DIGEST,
+    )
+    stub(
+        billing,
+        AnswerResponse(status="no_relevant_information", answer="no_relevant_information", confidence=0.0),
+    )
+    unknown = agent.run_agent("What's the URL for the billing page in our KB?")
+    assert unknown.status == "no_relevant_information"
+    assert unknown.citations == []
+    assert "no_relevant_information" not in unknown.answer
+    assert "does not address" in unknown.answer.casefold()
