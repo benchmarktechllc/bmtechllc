@@ -327,7 +327,16 @@ async def ask_command(interaction: discord.Interaction, question: str) -> None:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     token, config = load_runtime()
+    from .grounding import ANSWER_PATH_REVISION
+    from .portal_urls import canonical_portal_base_url
+
+    logger.info(
+        "benchmark-discord-ask revision=%s portal_base_configured=%s",
+        ANSWER_PATH_REVISION,
+        bool(canonical_portal_base_url()),
+    )
     AskClient(config).run(token)
 
 

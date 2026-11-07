@@ -30,6 +30,7 @@ class ChunkMetadata(BaseModel):
     visibility: str | None = None
     kb_section: str | None = None
     kb_status: str | None = None
+    portal_base: str | None = None
     board: str | None = None
     column: str | None = None
     card_id: str | None = None

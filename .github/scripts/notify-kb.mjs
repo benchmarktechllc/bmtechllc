@@ -3,17 +3,30 @@ import { pathToFileURL } from 'node:url';
 
 const branch = 'kb-notification-state';
 const statePath = 'kb-delivery-state.json';
-const origin = 'https://hussein881.github.io';
-const prefix = '/bmtechllc/portal/';
 
-export function newPages(manifest, state) {
+export function portalLocation(env = process.env) {
+  const configured = (env.PORTAL_BASE_URL || '').trim().replace(/\/$/, '');
+  if (configured) {
+    const url = new URL(configured.includes('://') ? configured : `https://${configured}`);
+    const pathname = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`;
+    return { origin: url.origin, prefix: pathname };
+  }
+  const repository = env.GITHUB_REPOSITORY || '';
+  const owner = (env.GITHUB_REPOSITORY_OWNER || repository.split('/')[0] || '').trim();
+  if (!/^[A-Za-z0-9-]+$/.test(owner)) {
+    throw new Error('Set PORTAL_BASE_URL or GITHUB_REPOSITORY_OWNER to the current GitHub Pages owner');
+  }
+  return { origin: `https://${owner}.github.io`, prefix: '/bmtechllc/portal/' };
+}
+
+export function newPages(manifest, state, location = portalLocation()) {
   if (!Array.isArray(manifest) || !Array.isArray(state.announced)) {
     throw new Error('Invalid manifest or delivery history');
   }
   const seen = new Set(state.announced);
   return manifest.filter(page => {
-    if (typeof page.url !== 'string' || !page.url.startsWith(prefix) ||
-        new URL(page.url, origin).origin !== origin ||
+    if (typeof page.url !== 'string' || !page.url.startsWith(location.prefix) ||
+        new URL(page.url, location.origin).origin !== location.origin ||
         typeof page.title !== 'string' || typeof page.description !== 'string') {
       throw new Error('Invalid portal page');
     }
@@ -23,14 +36,14 @@ export function newPages(manifest, state) {
   });
 }
 
-export function payload(page) {
+export function payload(page, location = portalLocation()) {
   return {
     username: 'BMTech KB',
     allowed_mentions: { parse: [] },
     content: '📚 New documentation published',
     embeds: [{
       title: page.title.slice(0, 256),
-      url: new URL(page.url, origin).href,
+      url: new URL(page.url, location.origin).href,
       description: page.description.slice(0, 1500),
       color: 0x5865f2,
       footer: { text: 'BenchmarkTech Knowledge Base' },
@@ -38,7 +51,7 @@ export function payload(page) {
   };
 }
 
-export async function send(webhook, page, request = fetch, sleep = ms => new Promise(r => setTimeout(r, ms))) {
+export async function send(webhook, page, request = fetch, sleep = ms => new Promise(r => setTimeout(r, ms)), location = portalLocation()) {
   const url = new URL(webhook);
   if (url.protocol !== 'https:' || url.hostname !== 'discord.com' ||
       !/^\/api(?:\/v\d+)?\/webhooks\/\d+\/[^/]+$/.test(url.pathname)) {
@@ -50,7 +63,7 @@ export async function send(webhook, page, request = fetch, sleep = ms => new Pro
     try {
       response = await request(url, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload(page)), signal: AbortSignal.timeout(30000),
+        body: JSON.stringify(payload(page, location)), signal: AbortSignal.timeout(30000),
         redirect: 'error',
       });
     } catch {
@@ -90,7 +103,8 @@ export async function main(manifestPath) {
   let stored = await api(`contents/${statePath}?ref=${branch}`);
   let state = stored ? JSON.parse(Buffer.from(stored.content, 'base64').toString())
     : JSON.parse(await readFile(new URL('./kb-baseline.json', import.meta.url), 'utf8'));
-  const pages = newPages(manifest, state);
+  const location = portalLocation();
+  const pages = newPages(manifest, state, location);
   const save = async () => {
     const result = await api(`contents/${statePath}`, {
       method: 'PUT', body: JSON.stringify({
@@ -112,7 +126,7 @@ export async function main(manifestPath) {
     await save();
   }
   for (const page of pages) {
-    const messageId = await send(webhook, page);
+    const messageId = await send(webhook, page, fetch, ms => new Promise(r => setTimeout(r, ms)), location);
     state.announced.push(page.url);
     state.lastDelivery = { url: page.url, messageId, at: new Date().toISOString() };
     await save();

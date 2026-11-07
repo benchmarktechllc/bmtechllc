@@ -29,6 +29,18 @@ _SECRET_PATTERNS = (
     re.compile(r"\b(?:bearer\s+)[A-Za-z0-9._~+/=-]{12,}\b", re.IGNORECASE),
     re.compile(r"-----BEGIN(?: [A-Z]+)? PRIVATE KEY-----.*?-----END(?: [A-Z]+)? PRIVATE KEY-----", re.DOTALL),
     re.compile(r"\bpassword\s*=\s*[^\s;]+", re.IGNORECASE),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+)
+_NON_AUTHORITATIVE = re.compile(
+    r"no relevant information was found in the company document library"
+    r"|there is no information available regarding"
+    r"|retrieved evidence does not contain any specific link"
+    r"|i couldn't answer that just now"
+    r"|new documentation published",
+    re.IGNORECASE,
 )
 _SECTION_PATTERN = re.compile(r"^\s*(?:\d+[.)]\s*)?([^:]{2,100}):(?:\s|$)")
 _NUMBERED_HEADING_PATTERN = re.compile(r"^\s*\d+(?:\.\d+)*\.?\s+(.{2,100})\s*$")
@@ -121,12 +133,26 @@ def _timestamp_for_turn(value: Any, meeting_date: Date | None) -> datetime | Non
         return None
 
 
+def redact_secrets(text: str) -> str:
+    """Replace recognized credential patterns. The replacement is not reversible."""
+    redacted = text
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
+
+
+def discord_message_is_authoritative(text: str, author_name: str = "") -> bool:
+    """Drop bot abstentions and notification templates so they cannot become evidence."""
+    if _BOT_NAME.search(author_name or ""):
+        return False
+    return _NON_AUTHORITATIVE.search(text) is None
+
+
 def normalize_text(text: str) -> str:
     """Normalize presentation noise and redact secrets before text reaches the API."""
     normalized = unicodedata.normalize("NFKC", text).replace("\ufeff", "").replace("\u200b", "")
     normalized = normalized.translate(str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"}))
-    for pattern in _SECRET_PATTERNS:
-        normalized = pattern.sub("[REDACTED]", normalized)
+    normalized = redact_secrets(normalized)
 
     in_fence = False
     lines: list[str] = []
@@ -195,7 +221,14 @@ def discord_units_from_messages(
             or author.get("Name")
             or "unknown"
         )
-        if author.get("isBot") or author.get("bot") or _BOT_NAME.search(author_name):
+        if (
+            author.get("isBot")
+            or author.get("bot")
+            or author.get("system")
+            or message.get("webhook_id")
+            or message.get("application_id")
+            or _BOT_NAME.search(author_name)
+        ):
             continue
         kind = str(message.get("type", message.get("Type", "Default")))
         if kind.casefold() not in {"default", "reply", "0", "19"}:
@@ -205,6 +238,8 @@ def discord_units_from_messages(
         )
         content = normalize_text(content)
         if len(content) < 3 or _URL_ONLY.fullmatch(content):
+            continue
+        if not discord_message_is_authoritative(content, author_name):
             continue
         reference = message.get("message_reference", message.get("reference", message.get("replyTo")))
         reply_to: str | None
@@ -262,6 +297,8 @@ def parse_discord(path: Path) -> Iterator[RawUnit]:
         speaker = match.group("speaker").strip()
         content = normalize_text(match.group("text"))
         if _BOT_NAME.search(speaker) or len(content) < 3 or _URL_ONLY.fullmatch(content):
+            continue
+        if not discord_message_is_authoritative(content, speaker):
             continue
         timestamp = _parse_datetime(match.group("time"))
         if timestamp is not None and timestamp.tzinfo is None and export_timezone is not None:

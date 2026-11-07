@@ -1,23 +1,35 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { newPages, payload, send } from './notify-kb.mjs';
+import { newPages, payload, portalLocation, send } from './notify-kb.mjs';
 const page = { url: '/bmtechllc/portal/reference/new/', title: 'New article', description: 'A summary', status: 'published' };
 const webhook = 'https://discord.com/api/webhooks/123/test-token';
+const location = { origin: 'https://example-org.github.io', prefix: '/bmtechllc/portal/' };
 
 test('announces new pages and draft promotions; ignores edits, drafts, archives and duplicates', () => {
   const old = { ...page, url: '/bmtechllc/portal/reference/old/' };
   assert.deepEqual(newPages([old, page, page, { ...page, url: `${page.url}draft/`, status: 'draft' },
-    { ...page, url: `${page.url}archive/`, status: 'archived' }], { announced: [old.url] }), [page]);
-  assert.deepEqual(newPages([page], { announced: [page.url] }), []);
-  assert.deepEqual(newPages([page], { announced: [] }), [page]);
+    { ...page, url: `${page.url}archive/`, status: 'archived' }], { announced: [old.url] }, location), [page]);
+  assert.deepEqual(newPages([page], { announced: [page.url] }, location), []);
+  assert.deepEqual(newPages([page], { announced: [] }, location), [page]);
 });
 test('rejects malformed manifest and foreign URLs', () => {
-  assert.throws(() => newPages({}, { announced: [] }));
-  assert.throws(() => newPages([{ ...page, url: 'https://example.com/' }], { announced: [] }));
+  assert.throws(() => newPages({}, { announced: [] }, location));
+  assert.throws(() => newPages([{ ...page, url: 'https://example.com/' }], { announced: [] }, location));
+});
+test('portal host follows the current repository owner', () => {
+  assert.deepEqual(portalLocation({ GITHUB_REPOSITORY_OWNER: 'benchmarktechllc' }), {
+    origin: 'https://benchmarktechllc.github.io',
+    prefix: '/bmtechllc/portal/',
+  });
+  assert.equal(
+    portalLocation({ PORTAL_BASE_URL: 'https://pages.example/bmtechllc/portal' }).origin,
+    'https://pages.example',
+  );
+  assert.throws(() => portalLocation({}));
 });
 test('payload includes live link, bounded text and no mentions', () => {
-  const result = payload({ ...page, title: 'a'.repeat(400), description: '@everyone'.repeat(1000) });
-  assert.equal(result.embeds[0].url, `https://hussein881.github.io${page.url}`);
+  const result = payload({ ...page, title: 'a'.repeat(400), description: '@everyone'.repeat(1000) }, location);
+  assert.equal(result.embeds[0].url, `https://example-org.github.io${page.url}`);
   assert.equal(result.embeds[0].title.length, 256);
   assert.equal(result.embeds[0].description.length, 1500);
   assert.deepEqual(result.allowed_mentions, { parse: [] });
@@ -30,16 +42,16 @@ test('waits for confirmation and respects rate limits', async () => {
     assert.equal(options.method, 'POST');
     return ++calls === 1 ? new Response(JSON.stringify({ retry_after: 0.5 }), { status: 429 })
       : new Response(JSON.stringify({ id: 'message-123' }));
-  }, async ms => pauses.push(ms));
+  }, async ms => pauses.push(ms), location);
   assert.equal(id, 'message-123');
   assert.deepEqual(pauses, [750]);
 });
 test('failures do not expose webhook secret or retry ambiguous deliveries', async () => {
   let calls = 0;
-  await assert.rejects(send(webhook, page, async () => { calls++; throw new Error(webhook); }), error => !error.message.includes('test-token'));
+  await assert.rejects(send(webhook, page, async () => { calls++; throw new Error(webhook); }, undefined, location), error => !error.message.includes('test-token'));
   assert.equal(calls, 1);
-  await assert.rejects(send(webhook, page, async () => new Response('{}', { status: 401 })), /HTTP 401/);
-  await assert.rejects(send(webhook, page, async () => new Response('{}')), /message ID/);
+  await assert.rejects(send(webhook, page, async () => new Response('{}', { status: 401 }), undefined, location), /HTTP 401/);
+  await assert.rejects(send(webhook, page, async () => new Response('{}'), undefined, location), /message ID/);
 });
 
 test('persists confirmed deliveries and suppresses them on rerun', async () => {
@@ -51,9 +63,11 @@ test('persists confirmed deliveries and suppresses them on rerun', async () => {
   const file = join(directory, 'index.json');
   await writeFile(file, JSON.stringify([page]));
   const savedFetch = globalThis.fetch;
-  const keys = ['GH_TOKEN', 'GITHUB_REPOSITORY', 'DISCORD_KB_WEBHOOK_URL'];
+  const keys = ['GH_TOKEN', 'GITHUB_REPOSITORY', 'GITHUB_REPOSITORY_OWNER', 'PORTAL_BASE_URL', 'DISCORD_KB_WEBHOOK_URL'];
   const savedEnv = keys.map(key => process.env[key]);
   Object.assign(process.env, { GH_TOKEN: 'test', GITHUB_REPOSITORY: 'test/repo', DISCORD_KB_WEBHOOK_URL: webhook });
+  delete process.env.PORTAL_BASE_URL;
+  delete process.env.GITHUB_REPOSITORY_OWNER;
   let state = null;
   let messages = 0;
   let writes = 0;

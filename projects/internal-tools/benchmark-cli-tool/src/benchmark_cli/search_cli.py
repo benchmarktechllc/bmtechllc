@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from .config import PARENT_CONTEXT_MAX_TOKENS
+from .ingestion.clean import redact_secrets
 from .providers.openai import embed_texts
 from .retrieval import HybridSearchResult, search_docs
 from .safety import delimit_untrusted_chunk
@@ -23,7 +24,7 @@ def _chunk_payload(chunk: SearchChunk, rank: int, score: float, score_name: str)
         "content_sha256": chunk.content_sha256,
         score_name: score,
         "untrusted": True,
-        "text": delimit_untrusted_chunk(chunk.chunk_text),
+        "text": delimit_untrusted_chunk(redact_secrets(chunk.chunk_text)),
         "metadata": chunk.metadata,
     }
 
@@ -55,7 +56,7 @@ def _parent_context_payload(context: ParentContext) -> dict[str, Any]:
                 "chunk_id": chunk.id,
                 "chunk_index": chunk.chunk_index,
                 "untrusted": True,
-                "text": delimit_untrusted_chunk(chunk.chunk_text),
+                "text": delimit_untrusted_chunk(redact_secrets(chunk.chunk_text)),
                 "metadata": chunk.metadata,
                 "token_count": chunk.token_count,
             }

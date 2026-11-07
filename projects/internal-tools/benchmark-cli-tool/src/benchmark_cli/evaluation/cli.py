@@ -21,6 +21,17 @@ from .reporting import summarize_cost_rows, usage_rows
 from .telemetry import append_evaluation_log
 
 
+def _search_including_fixtures(query: str, top_k: int = 5, **kwargs: object):
+    """Golden-set measurement still sees synthetic fixtures. Ordinary answers do not."""
+    kwargs["include_synthetic"] = True
+    return search_docs(query, top_k, **kwargs)  # type: ignore[arg-type]
+
+
+def _vector_including_fixtures(query: str, top_k: int = 5, **kwargs: object):
+    kwargs["include_synthetic"] = True
+    return vector_only_search(query, top_k, **kwargs)  # type: ignore[arg-type]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, default=GOLDEN_DATASET_PATH)
@@ -64,8 +75,8 @@ def main() -> None:
     if args.compare_vector:
         comparison = compare_retrieval_modes(
             cases,
-            vector_search=vector_only_search,
-            hybrid_search=search_docs,
+            vector_search=_vector_including_fixtures,
+            hybrid_search=_search_including_fixtures,
         )
         append_evaluation_log(
             args.metrics_csv,
@@ -85,7 +96,7 @@ def main() -> None:
             args.comparison_report.write_text(comparison_markdown(comparison) + "\n", encoding="utf-8")
             payload["comparison_report"] = str(args.comparison_report)
     else:
-        summary = evaluate_retrieval(cases, search_docs)
+        summary = evaluate_retrieval(cases, _search_including_fixtures)
         append_evaluation_log(args.metrics_csv, args.dataset, summary, retrieval_mode="hybrid_rrf")
         payload = summary.as_dict()
     if args.answers:
@@ -109,7 +120,7 @@ def main() -> None:
             args.answer_report.write_text(json.dumps(payload["answers"], indent=2) + "\n", encoding="utf-8")
             payload["answer_report"] = str(args.answer_report)
     if args.calibrate_abstention:
-        payload["abstention_calibration"] = calibrate_abstention(cases, search_docs).as_dict()
+        payload["abstention_calibration"] = calibrate_abstention(cases, _search_including_fixtures).as_dict()
     payload["metrics_csv"] = str(args.metrics_csv)
     print(json.dumps(payload, indent=2))
 

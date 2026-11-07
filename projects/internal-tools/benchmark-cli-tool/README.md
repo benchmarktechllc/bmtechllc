@@ -88,12 +88,16 @@ From this directory the command finds `portal/content` by walking up from the
 working directory. Override it with `--content-dir` or `PORTAL_CONTENT_DIR`.
 `--index-json` (or `PORTAL_INDEX_JSON`) can further restrict the sync to a
 built `/index.json`: an entry must be `published` and not `isStale`.
-`PORTAL_BASE_URL` is optional; when set, chunk URLs use that prefix.
+`PORTAL_BASE_URL` is the current GitHub Pages origin plus `/bmtechllc/portal`.
+The portal ingestion workflow sets it from `github.repository_owner`, so an
+organization transfer changes the host without pinning a previous owner.
+Chunk metadata stores that absolute page URL and the portal home. Relative
+`/guide/...` paths are only what older rows contain before the next sync.
 
 ```bash
 DATABASE_URL=...
 OPENAI_API_KEY=...
-PORTAL_BASE_URL=https://example.internal/bmtechllc/portal   # optional
+PORTAL_BASE_URL=https://<owner>.github.io/bmtechllc/portal
 ```
 
 Keep those values in the secret manager or the gitignored `.env` / `.env.local`
@@ -286,7 +290,46 @@ DISCORD_ASK_CHANNEL_ID=...       # required snowflake of #ask-bmtech
 DATABASE_URL=...                 # required by run_agent
 OPENAI_API_KEY=...               # required by run_agent
 DISCORD_ASK_GUILD_ID=...         # optional; guild command sync
+PORTAL_BASE_URL=https://<owner>.github.io/bmtechllc/portal
 ```
+
+`PORTAL_BASE_URL` is required for a clickable portal answer until portal sync
+has rewritten knowledge-base chunk metadata. Use the current repository
+owner. Do not set a previous GitHub Pages host.
+
+Non-posting check of the production answer path (this does not connect to
+Discord):
+
+```bash
+set -a
+source /etc/bmtech/discord-ask.env
+set +a
+python -m benchmark_cli.acceptance
+```
+
+The same path, one question at a time:
+
+```bash
+benchmark-answer --question 'What is the link to the knowledge base portal?'
+benchmark-answer --question 'How many employees does BMTech currently have?'
+benchmark-answer --question 'Who are the core team members at BMTech?'
+benchmark-answer --question 'Which Discord channels are synced?'
+```
+
+Runtime logs record retrieval status, chunk ids, source file names, cosine,
+and keyword overlap. They do not record chunk text. `benchmark-search` prints
+redacted chunk text; do not paste that output into a ticket if a backfill has
+not yet rewritten stored Discord rows.
+
+After deploying this revision, re-run the portal ingestion workflow and the
+Discord ingestion workflow once. Portal sync stores the current absolute URL.
+Discord sync redacts recognized tokens in stored messages, drops indexed bot
+abstentions and notification templates, and rebuilds those channel chunks.
+The next portal or Discord sync applies the full-text migration that indexes
+URL path words such as `portal`. The ask process does not alter the schema on
+startup. Revoke any exposed credential and delete the original Discord
+message separately; sync rewrites the indexed copy and does not delete Discord
+history.
 
 `DISCORD_ANSWER_BOT_TOKEN` is independent of `DISCORD_INGEST_BOT_TOKEN`.
 
@@ -330,21 +373,39 @@ sudo systemctl enable --now benchmark-discord-ask
 sudo systemctl status benchmark-discord-ask
 ```
 
+Rollback is a checkout of the previous revision, reinstall, and restart. Keep
+the previous container if you deployed with Docker:
+
+```bash
+git checkout <previous-revision>
+python -m pip install -e .
+sudo systemctl restart benchmark-discord-ask
+```
+
+```bash
+docker stop benchmark-discord-ask
+docker rm benchmark-discord-ask
+docker rename benchmark-discord-ask-previous benchmark-discord-ask
+docker start benchmark-discord-ask
+```
+
 A local image can run the same process. Build from this directory and pass
 the env file at runtime:
 
 ```bash
-docker build -t benchmark-discord-ask .
+docker build -t benchmark-discord-ask:ask-retrieval .
+docker rename benchmark-discord-ask benchmark-discord-ask-previous
 docker run -d --name benchmark-discord-ask --restart unless-stopped \
-  --env-file /etc/bmtech/discord-ask.env benchmark-discord-ask
+  --env-file /etc/bmtech/discord-ask.env benchmark-discord-ask:ask-retrieval
 ```
 
 Replies are capped at Discord's 2000-character limit. Citations from the
 agent are included when they fit.
 
-`search_docs(query, top_k=5)` embeds the query once, concurrently retrieves 20
-pgvector candidates and 20 PostgreSQL FTS candidates, then merges them with
-RRF (`k = 60`). It returns chunks and fused search scores only. The optional
+`search_docs(query, top_k=5)` embeds the query once, concurrently retrieves 40
+pgvector candidates and 40 PostgreSQL FTS candidates, then merges them with
+RRF (`k = 60`). Ordinary answers omit synthetic canary transcripts and indexed
+bot abstentions. It returns chunks and fused search scores only. The optional
 `speaker`, `source` (source filename), and ISO-8601 `date` filters apply to
 both retrieval arms.
 

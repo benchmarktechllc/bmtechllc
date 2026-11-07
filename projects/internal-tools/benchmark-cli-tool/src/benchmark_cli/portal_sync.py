@@ -32,6 +32,7 @@ from typing import Any
 
 from .ingestion.clean import RawUnit, normalize_text
 from .ingestion.pipeline import content_hash, ingest_units
+from .portal_urls import SITE_PREFIX, canonical_portal_base_url, join_portal_url, portal_home_url
 from .storage.postgres import (
     PortalSyncState,
     create_indexes,
@@ -196,6 +197,17 @@ def units_for_page(page: PortalPage) -> list[RawUnit]:
     stamp = datetime.combine(page.updated, time.min, tzinfo=UTC)
     units: list[RawUnit] = []
     ordinal = 0
+    home = portal_home_url()
+    locator = normalize_text(
+        "Knowledge base portal: "
+        + (home or join_portal_url(None, SITE_PREFIX + "/"))
+        + f"\nPage URL: {page.url}"
+    )
+    if locator:
+        units.append(
+            RawUnit(locator, None, stamp, ordinal, _page_extra(page, page.title, boundary=True))
+        )
+        ordinal += 1
     intro = normalize_text(f"{page.title}\n\n{page.description}")
     if intro:
         units.append(
@@ -394,13 +406,12 @@ def _page_from_path(path: Path, content_dir: Path) -> PortalPage | None:
 def _page_url(section: str, relative: Path) -> str:
     rest = list(relative.with_suffix("").parts[1:])
     if not rest or rest == ["index"]:
-        path = f"/{section}/"
+        path = f"{SITE_PREFIX}/{section}/"
     else:
         if rest[-1] == "index":
             rest = rest[:-1]
-        path = f"/{section}/{'/'.join(rest)}/"
-    base = os.getenv("PORTAL_BASE_URL", "").strip().rstrip("/")
-    return f"{base}{path}" if base else path
+        path = f"{SITE_PREFIX}/{section}/{'/'.join(rest)}/"
+    return join_portal_url(canonical_portal_base_url(), path)
 
 
 def _page_extra(page: PortalPage, section: str, *, boundary: bool) -> dict[str, Any]:
@@ -413,6 +424,7 @@ def _page_extra(page: PortalPage, section: str, *, boundary: bool) -> dict[str, 
         "tags": list(page.tags),
         "visibility": page.visibility,
         "kb_status": page.status,
+        "portal_base": portal_home_url(),
         "boundary": boundary,
     }
 
