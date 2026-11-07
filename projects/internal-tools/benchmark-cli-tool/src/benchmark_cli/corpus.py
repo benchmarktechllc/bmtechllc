@@ -31,20 +31,9 @@ SYNTHETIC_CORPUS_SQL = """
 )
 """
 
-BOILERPLATE_SQL = """
-(
-    lower(btrim(chunk_text)) IN (
-        'no relevant information was found in the company document library',
-        'no relevant information was found in the company document library.',
-        'i couldn''t answer that just now',
-        'i couldn''t answer that just now.',
-        'retrieved evidence does not contain any specific link',
-        'retrieved evidence does not contain any specific link.',
-        'new documentation published',
-        'new documentation published.'
-    )
-)
-"""
+# Kept for callers that still import the name. Retrieval does not exclude
+# human messages that happen to use these words.
+BOILERPLATE_SQL = "FALSE"
 
 
 def is_synthetic_canary(source_file: str, metadata: Mapping[str, object] | None = None) -> bool:

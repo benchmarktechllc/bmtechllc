@@ -12,10 +12,6 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-_BOT_NAME = re.compile(
-    r"(?:^|[\s_\-])(?:bot|webhook|github|ci|jenkins|dependabot)$",
-    re.IGNORECASE,
-)
 _URL_ONLY = re.compile(r"^https?://\S+$", re.IGNORECASE)
 _TIMESTAMP_GUTTER = re.compile(
     r"(?:^|\s)(?:\[?\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\]?\s*(?:-->)?|\(\d{1,2}:\d{2}\))(?:\s|$)"
@@ -36,6 +32,9 @@ _SECRET_PATTERNS = (
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    # Discord bot and MFA tokens are three dot-separated segments, or an mfa. prefix.
+    re.compile(r"\b[\w-]{24,}\.[\w-]{6}\.[\w-]{27,}\b"),
+    re.compile(r"\bmfa\.[\w-]{20,}\b"),
 )
 # Whole-message templates only. A longer human sentence that merely contains
 # one of these phrases is historical evidence and must be kept.
@@ -157,10 +156,13 @@ def message_is_exact_bot_template(text: str) -> bool:
 
 
 def discord_message_is_authoritative(text: str, author_name: str = "") -> bool:
-    """Drop bot accounts and exact bot templates. Keep longer human messages."""
-    if _BOT_NAME.search(author_name or ""):
-        return False
-    return not message_is_exact_bot_template(text)
+    """Keep stored messages. Display names and template text are not bot identity.
+
+    Live ingestion skips accounts only when Discord marks ``bot``, ``webhook_id``,
+    or ``application_id``. Reconcile must not delete rows from a name or a phrase.
+    """
+    del text, author_name
+    return True
 
 
 def normalize_text(text: str) -> str:
@@ -242,7 +244,6 @@ def discord_units_from_messages(
             or author.get("system")
             or message.get("webhook_id")
             or message.get("application_id")
-            or _BOT_NAME.search(author_name)
         ):
             continue
         kind = str(message.get("type", message.get("Type", "Default")))
@@ -253,8 +254,6 @@ def discord_units_from_messages(
         )
         content = normalize_text(content)
         if len(content) < 3 or _URL_ONLY.fullmatch(content):
-            continue
-        if not discord_message_is_authoritative(content, author_name):
             continue
         reference = message.get("message_reference", message.get("reference", message.get("replyTo")))
         reply_to: str | None
@@ -311,9 +310,7 @@ def parse_discord(path: Path) -> Iterator[RawUnit]:
             continue
         speaker = match.group("speaker").strip()
         content = normalize_text(match.group("text"))
-        if _BOT_NAME.search(speaker) or len(content) < 3 or _URL_ONLY.fullmatch(content):
-            continue
-        if not discord_message_is_authoritative(content, speaker):
+        if len(content) < 3 or _URL_ONLY.fullmatch(content):
             continue
         timestamp = _parse_datetime(match.group("time"))
         if timestamp is not None and timestamp.tzinfo is None and export_timezone is not None:

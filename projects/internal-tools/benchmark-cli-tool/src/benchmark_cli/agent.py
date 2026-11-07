@@ -23,6 +23,7 @@ from .grounding import (
     credential_refusal,
     employee_count_answer,
     portal_link_answer,
+    qualify_grounded_answer,
     retrieval_log_fields,
     scrub_response,
     stated_employee_count_answer,
@@ -50,7 +51,12 @@ A list of named collaborators, a core team, or contributors is not an employee
 or payroll count. State a current employee count only when the evidence states
 that count. For the knowledge-base link, use the portal URL attached to
 knowledge-base evidence and do not replace it with a different host from chat
-history. Never repeat tokens, passwords, or private keys."""
+history. Plans, proposals, drafts, and to-dos are not completed decisions.
+Do not say work was decided, approved, defined, or completed unless the
+evidence explicitly says so. If the question asks for a named document and
+the evidence is a different page, call that page the closest related page
+and do not give it the requested document's name. Never repeat tokens,
+passwords, or private keys."""
 
 TOOLS: list[dict[str, Any]] = [
     {
@@ -432,6 +438,13 @@ def run_agent(
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 output = json.dumps({"error": f"Tool input rejected: {exc}"})
             messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": output})
+    def _deliver(response: AnswerResponse, *, outcome: str, synthesis_attempts: int) -> AnswerResponse:
+        qualified = qualify_grounded_answer(question, response, tuple(evidence.values()))
+        if qualified.answer != response.answer:
+            outcome = f"{outcome}_qualified"
+        log_agent_diagnostic(outcome=outcome, synthesis_attempts=synthesis_attempts)
+        return scrub_response(qualified)
+
     response = _synthesize_answer(tier=selected_tier, messages=messages)
     if response is None:
         log_agent_diagnostic(outcome="synthesis_error", synthesis_attempts=1)
@@ -448,8 +461,7 @@ def run_agent(
             if len(repaired.citations) < len(response.citations)
             else "answered_with_citation_normalization"
         )
-        log_agent_diagnostic(outcome=outcome, synthesis_attempts=1)
-        return scrub_response(repaired)
+        return _deliver(repaired, outcome=outcome, synthesis_attempts=1)
 
     retry_messages = [*messages, {"role": "system", "content": CITATION_RETRY_PROMPT}]
     retry = _synthesize_answer(tier=selected_tier, messages=retry_messages)
@@ -468,12 +480,10 @@ def run_agent(
             if len(repaired_retry.citations) < len(retry.citations)
             else "answered_after_citation_retry_with_normalization"
         )
-        log_agent_diagnostic(outcome=outcome, synthesis_attempts=2)
-        return scrub_response(repaired_retry)
+        return _deliver(repaired_retry, outcome=outcome, synthesis_attempts=2)
     fallback = _evidence_excerpt_response(question, decision.results)
     outcome = "evidence_excerpt_fallback" if fallback.status == "answered" else "citation_retry_validation_failed"
-    log_agent_diagnostic(outcome=outcome, synthesis_attempts=2)
-    return scrub_response(fallback)
+    return _deliver(fallback, outcome=outcome, synthesis_attempts=2)
 
 
 def main() -> None:
