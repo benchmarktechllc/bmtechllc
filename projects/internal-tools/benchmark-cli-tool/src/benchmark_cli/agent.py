@@ -6,7 +6,7 @@ import argparse
 import json
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -49,11 +49,16 @@ from .storage.postgres import (
     trello_card_rows,
 )
 from .trello_answers import (
+    active_projects_answer,
+    answer_is_bare_cards,
+    asks_for_active_projects,
+    asks_for_project_status,
     asks_for_trello_board_link,
     bare_list_name,
     board_link_from_chunk_rows,
     cards_from_rows,
     indexed_list_request,
+    project_status_answer,
     requested_trello_list,
     trello_board_link_answer,
     trello_list_answer,
@@ -434,6 +439,32 @@ def _model_question(question: str, thread_question: str | None) -> str:
     )
 
 
+def _project_status_response(question: str) -> AnswerResponse | None:
+    """Match a project-status question to indexed card titles before the model runs."""
+    if not asks_for_project_status(question):
+        return None
+    try:
+        catalog = cards_from_rows(trello_card_rows())
+    except RuntimeError:
+        logger.warning("Trello card list is unavailable.")
+        return None
+    return project_status_answer(question, catalog)
+
+
+def _active_project_fallback(
+    question: str, chunks: Sequence[SearchChunk]
+) -> AnswerResponse | None:
+    """Doing cards and cited project notes when the model answer did not survive."""
+    if not asks_for_active_projects(question):
+        return None
+    try:
+        catalog = cards_from_rows(trello_card_rows())
+    except RuntimeError:
+        logger.warning("Trello card list is unavailable.")
+        catalog = ()
+    return active_projects_answer(catalog, chunks)
+
+
 def _retrieval_question(question: str, thread_question: str | None) -> str:
     """A bare list follow-up that is not an indexed list keeps the thread topic."""
     current = question.strip()
@@ -465,6 +496,9 @@ def run_agent(
     if trello_response is not None:
         outcome = "trello_board" if asks_for_trello_board_link(question) else "trello_list"
         return _finish(trello_response, outcome=outcome, synthesis_attempts=0)
+    project_status = _project_status_response(question)
+    if project_status is not None:
+        return _finish(project_status, outcome="project_status", synthesis_attempts=0)
     decision: RetrievalDecision | None
     try:
         decision = retrieve_evidence(
@@ -554,6 +588,11 @@ def run_agent(
         qualified = qualify_grounded_answer(question, response, tuple(evidence.values()))
         if qualified.answer != response.answer:
             outcome = f"{outcome}_qualified"
+        if qualified.status != "answered" or answer_is_bare_cards(qualified.answer):
+            built = _active_project_fallback(question, tuple(evidence.values()))
+            if built is not None:
+                log_agent_diagnostic(outcome=f"{outcome}_projects", synthesis_attempts=synthesis_attempts)
+                return scrub_response(built)
         log_agent_diagnostic(outcome=outcome, synthesis_attempts=synthesis_attempts)
         return scrub_response(qualified)
 
@@ -565,9 +604,13 @@ def run_agent(
         excerpts = _evidence_excerpt_response(question, decision.results) if decision.results else None
         if excerpts is not None and excerpts.status == "answered":
             qualified = qualify_grounded_answer(question, excerpts, tuple(evidence.values()))
-            if qualified.status == "answered":
+            if qualified.status == "answered" and not answer_is_bare_cards(qualified.answer):
                 log_agent_diagnostic(outcome=f"{outcome}_excerpt", synthesis_attempts=synthesis_attempts)
                 return scrub_response(qualified)
+        built = _active_project_fallback(question, tuple(evidence.values()))
+        if built is not None:
+            log_agent_diagnostic(outcome=f"{outcome}_projects", synthesis_attempts=synthesis_attempts)
+            return scrub_response(built)
         log_agent_diagnostic(outcome=outcome, synthesis_attempts=synthesis_attempts)
         return scrub_response(response)
 

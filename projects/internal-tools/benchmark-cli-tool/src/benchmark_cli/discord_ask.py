@@ -12,6 +12,7 @@ import asyncio
 import inspect
 import logging
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -164,14 +165,31 @@ def _linked_list_answer(answer: str) -> bool:
     return "Trello cards in " in answer and "](https://" in answer
 
 
+def _summary_total(answer: str) -> int | None:
+    """Sum of the per-list counts on the first line, such as ``Backlog 11, Doing 4``."""
+    first = answer.splitlines()[0].strip() if answer else ""
+    if not first or "Trello cards in " in first:
+        return None
+    total = 0
+    for part in first.split(","):
+        match = re.search(r"(\d+)\s*$", part.strip())
+        if match is None:
+            return None
+        total += int(match.group(1))
+    return total or None
+
+
 def format_discord_answer(response: AnswerResponse, *, limit: int = DISCORD_MESSAGE_LIMIT) -> str:
     """Render an agent response, keeping citations when they fit in one message."""
     answer = response.answer.strip() or "No answer text was returned."
     if response.citations and _linked_list_answer(answer):
-        noun = "card" if len(response.citations) == 1 else "cards"
-        citation_block = (
-            f"**Sources**\n{len(response.citations)} indexed {noun}; links are in the list above."
-        )
+        shown = len(response.citations)
+        total = _summary_total(answer)
+        if total is not None and total != shown:
+            citation_block = f"**Sources**\n{shown} shown of {total}; links are in the list above."
+        else:
+            noun = "card" if shown == 1 else "cards"
+            citation_block = f"**Sources**\n{shown} indexed {noun}; links are in the list above."
     elif response.citations:
         citation_block = "**Citations**\n" + "\n".join(
             _format_citation(index, citation)

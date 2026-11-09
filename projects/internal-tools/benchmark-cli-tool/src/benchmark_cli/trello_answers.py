@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 from .ingestion.clean import redact_secrets
 from .models import AnswerResponse, Citation
+from .storage.postgres import SearchChunk
 
 MAX_LISTED_CARDS = 25
 OPEN_LISTS = "__open_lists__"
@@ -474,3 +475,174 @@ def trello_board_link_answer(rows: Sequence[TrelloCardRow]) -> AnswerResponse:
         confidence=0.0,
         citations=[],
     )
+
+
+_CARD_HEADER = re.compile(r"^(?:Card|Board|List|URL|Labels|Due):")
+_PROJECT_STATUS = re.compile(r"\bstatus\b", re.IGNORECASE)
+_ACTIVE_PROJECTS = re.compile(r"\b(?:working|work(?:ing)?\s+on)\b", re.IGNORECASE)
+_PROJECT_WORD = re.compile(r"\bprojects?\b", re.IGNORECASE)
+_STATUS_SKIP = frozenset(
+    {
+        "project",
+        "projects",
+        "status",
+        "current",
+        "currently",
+        "bmtech",
+        "what",
+        "which",
+        "the",
+        "and",
+        "for",
+        "our",
+        "are",
+        "does",
+        "how",
+    }
+)
+
+
+def asks_for_project_status(question: str) -> bool:
+    """A status question about one named project, not a list catalog."""
+    return _PROJECT_STATUS.search(question) is not None and _PROJECT_WORD.search(question) is not None
+
+
+def asks_for_active_projects(question: str) -> bool:
+    """Which projects are in progress. A single project's status stays on that path."""
+    if asks_for_project_status(question):
+        return False
+    return _PROJECT_WORD.search(question) is not None and _ACTIVE_PROJECTS.search(question) is not None
+
+
+def _project_terms(question: str) -> list[str]:
+    terms: list[str] = []
+    for token in re.findall(r"[a-z0-9]+", question.casefold()):
+        if len(token) < 3 or token in _STATUS_SKIP or token in terms:
+            continue
+        terms.append(token)
+    return terms
+
+
+def _title_has_term(title: str, term: str) -> bool:
+    folded = title.casefold()
+    if term in folded:
+        return True
+    stem = term[:-1] if term.endswith("s") and len(term) > 3 else term
+    return stem in folded
+
+
+def project_status_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
+    """Card title, list, and link for a project named in the question."""
+    terms = _project_terms(question)
+    if not terms:
+        return None
+    matched = [
+        card
+        for card in _usable_cards(rows)
+        if all(_title_has_term(card.title, term) for term in terms)
+    ]
+    if not matched:
+        return None
+    lines = [f"Indexed cards for {' '.join(terms)}:"]
+    for card in matched:
+        title = " ".join(redact_secrets(card.title).split()) or "Untitled card"
+        where = _list_label(card)
+        if card.url.startswith("https://"):
+            lines.append(f"- [{title}]({card.url}) — {where}")
+        else:
+            lines.append(f"- {title} — {where}")
+    return AnswerResponse(
+        status="answered",
+        answer="\n".join(lines),
+        confidence=0.8,
+        citations=[_citation(card) for card in matched],
+    )
+
+
+def _card_description(card: TrelloCardRow) -> str:
+    lines: list[str] = []
+    for raw in card.chunk_text.splitlines():
+        line = _strip_marker(raw)
+        if not line or _CARD_HEADER.match(line):
+            continue
+        if line.casefold() == card.title.casefold():
+            continue
+        lines.append(line)
+    return " ".join(lines)
+
+
+def _strip_marker(text: str) -> str:
+    return re.sub(r"^(?:[-*]\s+)+", "", text.strip()).strip()
+
+
+def _project_chunk_line(chunk: SearchChunk) -> tuple[str, str] | None:
+    """A cited project note and a verbatim quote. Bare card headers are skipped."""
+    if str((chunk.metadata or {}).get("source_type") or "") == "trello":
+        return None
+    if not chunk.content_sha256:
+        return None
+    title = str((chunk.metadata or {}).get("title") or "").strip()
+    sentences: list[str] = []
+    for raw in chunk.chunk_text.splitlines():
+        line = _strip_marker(raw)
+        if not line or _CARD_HEADER.match(line) or line not in chunk.chunk_text:
+            continue
+        sentences.append(line)
+    if not sentences:
+        return None
+    body = " ".join(sentences).strip()
+    if body.lower().startswith("card:"):
+        return None
+    if "project" not in f"{title} {body}".casefold():
+        return None
+    shown = f"{title}: {body}" if title and body else body
+    return shown, sentences[0]
+
+
+def active_projects_answer(
+    rows: Sequence[TrelloCardRow], chunks: Sequence[SearchChunk]
+) -> AnswerResponse | None:
+    """Doing cards plus cited project notes. Card-header lines are not the answer."""
+    lines: list[str] = []
+    citations: list[Citation] = []
+    doing = [card for card in _usable_cards(rows) if _list_matches(card.list_name, "doing")]
+    if doing:
+        lines.append("Active work on the Doing list:")
+        for card in doing:
+            title = " ".join(redact_secrets(card.title).split()) or "Untitled card"
+            where = _list_label(card)
+            item = f"[{title}]({card.url})" if card.url.startswith("https://") else title
+            description = _card_description(card)
+            if description:
+                lines.append(f"- {item} — {where}: {description}")
+            else:
+                lines.append(f"- {item} — {where}")
+            citations.append(_citation(card))
+    for chunk in chunks:
+        rendered = _project_chunk_line(chunk)
+        if rendered is None or not chunk.content_sha256:
+            continue
+        shown, quote = rendered
+        lines.append(f"- {shown}")
+        citations.append(
+            Citation(
+                source_file=chunk.source_file,
+                chunk_id=chunk.id,
+                content_sha256=chunk.content_sha256,
+                quote=quote,
+            )
+        )
+    if not lines or not citations:
+        return None
+    answer = "\n".join(lines)
+    if re.search(r"(?m)^- Card:", answer):
+        return None
+    return AnswerResponse(status="answered", answer=answer, confidence=0.6, citations=citations)
+
+
+def answer_is_bare_cards(answer: str) -> bool:
+    """True when every line is only a Trello header such as ``Card:``."""
+    lines = [re.sub(r"^[-*]\s+", "", line.strip()) for line in answer.splitlines() if line.strip()]
+    if not lines:
+        return False
+    return all(_CARD_HEADER.match(line) for line in lines)

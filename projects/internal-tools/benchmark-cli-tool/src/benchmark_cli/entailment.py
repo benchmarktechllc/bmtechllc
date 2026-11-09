@@ -308,6 +308,12 @@ def touches_question(question: str, text: str) -> bool:
     return total == 0 or matched >= 1
 
 
+def shared_term_count(question: str, text: str) -> int:
+    """How many content words in the question also appear in the text."""
+    matched, _total = _matched(question, text)
+    return matched
+
+
 def answers_question(question: str, text: str, *, require_all: bool = False) -> bool:
     """One shared word does not answer a question that asked for several things."""
     matched, total = _matched(question, text)

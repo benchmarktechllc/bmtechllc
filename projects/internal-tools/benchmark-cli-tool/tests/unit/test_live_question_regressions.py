@@ -648,6 +648,7 @@ def test_status_excerpts_drop_extra_list_markers_and_join_card_headers(
         {"source_type": "trello", "title": "Sample kiosk", "column": "Doing"},
         digest="b" * 64,
     )
+    monkeypatch.setattr(agent, "trello_card_rows", lambda: [])
     response = _run(
         monkeypatch,
         "Current status of the smart kiosk project?",
@@ -682,3 +683,227 @@ def test_open_trello_answer_prefixes_a_per_list_count(
     assert "Done" not in response.answer.splitlines()[0]
     assert "Sample done card" not in response.answer
     assert len(rendered) <= DISCORD_MESSAGE_LIMIT
+
+
+_PAGE = """\
+1. Open the section the page belongs in, e.g.
+Guide or Projects.
+2. Choose New page in the sample editor.
+3. Fill in the form:
+| Field | Value |
+| --- | --- |
+| Section | Guide |
+| Title | Page name |
+| Description | What the page covers |
+| Owner | The author |
+| Markdown | The page body |
+4. Watch the sample preview panel as you type.
+It shows the exact file path.
+5. Save the sample draft.
+6. Ask a teammate to read the sample page.
+7. Publish the sample page.
+"""
+
+
+@pytest.mark.unit
+def test_add_page_procedure_keeps_examples_and_table_fields(
+    monkeypatch: pytest.MonkeyPatch, quiet_model: None
+) -> None:
+    guide = _chunk(
+        61,
+        "portal/guide/adding-a-page-from-the-portal.md",
+        _PAGE,
+        {"source_type": "kb_page", "title": "Adding a page", "section": "Guide"},
+    )
+    short_quote = _PAGE[:120]
+    assert short_quote.rstrip().endswith("e.g.") or "e.g." in short_quote
+    monkeypatch.setattr(
+        agent,
+        "retrieve_evidence",
+        lambda *_a, **_k: RetrievalDecision(
+            "accepted",
+            (HybridSearchResult(guide, 0.2, vector_score=0.8, fts_score=1.0),),
+            0.8,
+            1,
+        ),
+    )
+    monkeypatch.setattr(
+        agent,
+        "call_llm_structured",
+        lambda **_k: AnswerResponse(
+            status="answered",
+            answer="1. Open the section the page belongs in, e.g.\n3. Fill in the form:\n4. Watch the sample preview panel as you type.",
+            confidence=0.9,
+            citations=[_citation(guide, short_quote)],
+        ),
+    )
+
+    response = agent.run_agent("How do I add a page to the KB?")
+
+    assert response.status == "answered"
+    assert "e.g. Guide or Projects." in response.answer
+    assert "Section: Guide" in response.answer
+    assert "Title: Page name" in response.answer
+    assert "Description: What the page covers" in response.answer
+    assert "Owner: The author" in response.answer
+    assert "Markdown: The page body" in response.answer
+    for number in range(1, 8):
+        assert f"{number}." in response.answer
+    for line in response.answer.splitlines():
+        body = line.split(".", 1)[-1].strip()
+        assert not body.endswith((":", "e.g.", "e.g"))
+    assert "exact file path." in response.answer
+
+
+@pytest.mark.unit
+def test_project_status_reports_the_matching_card_list_and_link(
+    monkeypatch: pytest.MonkeyPatch, quiet_model: None
+) -> None:
+    title = "MVP definition and setting a timeline for the smart kiosk and cli-tool projects"
+    card = _row("Doing", title, "mvp", 70)
+    other = _row("Backlog", "Sample cafeteria refresh", "cafe", 71)
+    monkeypatch.setattr(agent, "trello_card_rows", lambda: [_as_tuple(card), _as_tuple(other)])
+    monkeypatch.setattr(agent, "call_llm", lambda **_k: pytest.fail("model"))
+    monkeypatch.setattr(agent, "retrieve_evidence", lambda *_a, **_k: pytest.fail("retrieval"))
+
+    response = agent.run_agent("Current status of the smart kiosk project?")
+
+    assert response.status == "answered"
+    assert title in response.answer
+    assert "Doing" in response.answer
+    assert "https://trello.com/c/mvp" in response.answer
+    assert "cafeteria" not in response.answer.casefold()
+    assert "does not address" not in response.answer.casefold()
+    assert "- -" not in response.answer
+
+
+@pytest.mark.unit
+def test_supported_project_answer_is_kept_and_fallback_uses_doing_cards(
+    monkeypatch: pytest.MonkeyPatch, quiet_model: None
+) -> None:
+    bot = (
+        "The Discord bot and RAG card is in progress. "
+        "Phase 2 portfolio projects are listed beside it."
+    )
+    kiosk = "MVP definition and setting a timeline for the smart kiosk and cli-tool projects is on the Doing list."
+    note = _chunk(
+        81,
+        "portal/projects/sample-portfolio.md",
+        f"{bot} {kiosk}",
+        {"source_type": "kb_page", "title": "Sample portfolio"},
+        digest="e" * 64,
+    )
+    doing_bot = _row(
+        "Doing",
+        "Discord bot and RAG integration",
+        "bot",
+        82,
+        chunk_text=(
+            "Card: Discord bot and RAG integration\n"
+            "List: Doing\n"
+            "URL: https://trello.com/c/bot\n"
+            "\n"
+            "The bot answers company questions from retrieved notes."
+        ),
+    )
+    doing_kiosk = _row(
+        "Doing",
+        "MVP definition and setting a timeline for the smart kiosk and cli-tool projects",
+        "mvp2",
+        83,
+    )
+    monkeypatch.setattr(
+        agent, "trello_card_rows", lambda: [_as_tuple(doing_bot), _as_tuple(doing_kiosk)]
+    )
+    monkeypatch.setattr(
+        agent,
+        "retrieve_evidence",
+        lambda *_a, **_k: RetrievalDecision(
+            "accepted",
+            (HybridSearchResult(note, 0.2, vector_score=0.8, fts_score=1.0),),
+            0.8,
+            1,
+        ),
+    )
+    kept = f"{bot} {kiosk}"
+    monkeypatch.setattr(
+        agent,
+        "call_llm_structured",
+        lambda **_k: AnswerResponse(
+            status="answered",
+            answer=kept,
+            confidence=0.9,
+            citations=[_citation(note, note.chunk_text[:80])],
+        ),
+    )
+
+    supported = agent.run_agent("What projects is BMTech working on?")
+
+    assert supported.status == "answered"
+    assert supported.answer == kept
+    assert "Discord bot and RAG" in supported.answer
+    assert "smart kiosk and cli-tool" in supported.answer
+    assert "- Card:" not in supported.answer
+
+    card_note = _chunk(
+        84,
+        "trello/tIvVZqio/bot.md",
+        doing_bot.chunk_text,
+        {"source_type": "trello", "title": doing_bot.title, "column": "Doing"},
+        digest="f" * 64,
+    )
+    monkeypatch.setattr(
+        agent,
+        "retrieve_evidence",
+        lambda *_a, **_k: RetrievalDecision(
+            "accepted",
+            (HybridSearchResult(card_note, 0.2, vector_score=0.8, fts_score=1.0),),
+            0.8,
+            1,
+        ),
+    )
+    monkeypatch.setattr(
+        agent,
+        "call_llm_structured",
+        lambda **_k: AnswerResponse(
+            status="answered",
+            answer="The retrieved evidence does not address this question.",
+            confidence=0.2,
+            citations=[_citation(card_note, "Card: Discord bot and RAG integration")],
+        ),
+    )
+    fallback = agent.run_agent("What projects is BMTech working on?")
+
+    assert fallback.status == "answered"
+    assert "Discord bot and RAG" in fallback.answer
+    assert "smart kiosk and cli-tool" in fallback.answer
+    assert "Doing" in fallback.answer
+    assert "https://trello.com/c/bot" in fallback.answer
+    assert "- Card:" not in fallback.answer
+    assert not fallback.answer.strip().startswith("Card:")
+
+
+@pytest.mark.unit
+def test_open_list_footer_counts_shown_cards_against_the_summary() -> None:
+    from benchmark_cli.models import Citation
+
+    summary = "Backlog 11, Doing 4, Sev 1 12, Sev 2 2, Sev 3 3"
+    citations = [
+        Citation(
+            source_file=f"trello/tIvVZqio/c{index}.md",
+            chunk_id=index + 1,
+            content_sha256="ab" * 32,
+            quote=f"Card: Sample {index}",
+        )
+        for index in range(20)
+    ]
+    rendered = format_discord_answer(
+        AnswerResponse(
+            status="answered",
+            answer=f"{summary}\n\nTrello cards in Backlog:\n- [Sample](https://trello.com/c/sample)",
+            confidence=0.8,
+            citations=citations,
+        )
+    )
+
+    assert "20 shown of 32" in rendered
