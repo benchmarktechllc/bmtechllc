@@ -472,6 +472,70 @@ def synced_discord_channel_rows() -> list[tuple[str, int, str, str, str]]:
     return selected
 
 
+def trello_card_rows() -> list[tuple[str, str, str, str, str, int, str, str, str]]:
+    """Return the first indexed chunk of every Trello card.
+
+    Each tuple is ``(board, list_name, card_id, title, url, chunk_id,
+    source_file, content_sha256, chunk_text)``. ``list_name`` is the Trello
+    list stored on metadata as ``column``. Rows that cannot be cast to that
+    shape are omitted.
+    """
+    statement = """
+        SELECT board, list_name, card_id, title, url, chunk_id, source_file,
+               content_sha256, chunk_text
+        FROM (
+            SELECT DISTINCT ON (metadata ->> 'board', metadata ->> 'card_id')
+                   metadata ->> 'board' AS board,
+                   metadata ->> 'column' AS list_name,
+                   metadata ->> 'card_id' AS card_id,
+                   metadata ->> 'title' AS title,
+                   metadata ->> 'url' AS url,
+                   id AS chunk_id,
+                   source_file,
+                   content_sha256,
+                   chunk_text
+            FROM document_chunks
+            WHERE metadata ->> 'source_type' = 'trello'
+              AND coalesce(metadata ->> 'card_id', '') <> ''
+              AND coalesce(metadata ->> 'column', '') <> ''
+            ORDER BY metadata ->> 'board', metadata ->> 'card_id', chunk_index, id
+        ) AS trello_cards
+        ORDER BY lower(list_name), lower(title), card_id
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement)
+        fetched = cursor.fetchall()
+    rows: list[tuple[str, str, str, str, str, int, str, str, str]] = []
+    for record in fetched:
+        if len(record) != 9:
+            continue
+        board, list_name, card_id, title, url, chunk_id, source_file, digest, chunk_text = record
+        if isinstance(chunk_id, bool):
+            continue
+        try:
+            parsed_id = int(chunk_id)
+        except (TypeError, ValueError):
+            continue
+        card_text = str(card_id or "").strip()
+        list_text = str(list_name or "").strip()
+        if parsed_id < 1 or not card_text or not list_text:
+            continue
+        rows.append(
+            (
+                str(board or "").strip(),
+                list_text,
+                card_text,
+                str(title or "").strip(),
+                str(url or "").strip(),
+                parsed_id,
+                str(source_file or "").strip(),
+                str(digest or "").strip().lower(),
+                str(chunk_text or ""),
+            )
+        )
+    return rows
+
+
 def discord_source_messages(channel_id: str) -> list[DiscordSourceMessage]:
     """Return a channel's normalized source messages in chronological order."""
     statement = """

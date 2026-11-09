@@ -39,7 +39,14 @@ from .portal_urls import canonical_portal_base_url
 from .retrieval import HybridSearchResult, RetrievalDecision, retrieve_evidence
 from .router import classify_query
 from .safety import delimit_evidence
-from .storage.postgres import SearchChunk, fts_search, read_doc, synced_discord_channel_rows
+from .storage.postgres import (
+    SearchChunk,
+    fts_search,
+    read_doc,
+    synced_discord_channel_rows,
+    trello_card_rows,
+)
+from .trello_answers import cards_from_rows, requested_trello_list, trello_list_answer
 
 logger = logging.getLogger(__name__)
 
@@ -378,6 +385,18 @@ def run_agent(
     if asks_for_credentials(question):
         logger.info("retrieval revision=%s outcome=credential_refused", ANSWER_PATH_REVISION)
         return _finish(credential_refusal(), outcome="credential_refused", synthesis_attempts=0)
+    requested_list = requested_trello_list(question)
+    if requested_list is not None:
+        try:
+            catalog = cards_from_rows(trello_card_rows())
+        except RuntimeError:
+            logger.warning("Trello card list is unavailable.")
+        else:
+            return _finish(
+                trello_list_answer(requested_list, catalog),
+                outcome="trello_list",
+                synthesis_attempts=0,
+            )
     decision: RetrievalDecision | None
     try:
         decision = retrieve_evidence(question, speaker=speaker, source=source, date=date)
