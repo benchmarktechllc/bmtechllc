@@ -42,6 +42,7 @@ from .router import classify_query
 from .safety import delimit_evidence
 from .storage.postgres import (
     SearchChunk,
+    board_url_chunk_rows,
     fts_search,
     read_doc,
     synced_discord_channel_rows,
@@ -50,6 +51,7 @@ from .storage.postgres import (
 from .trello_answers import (
     asks_for_trello_board_link,
     bare_list_name,
+    board_link_from_chunk_rows,
     cards_from_rows,
     indexed_list_request,
     requested_trello_list,
@@ -377,6 +379,19 @@ def _finish(response: AnswerResponse, *, outcome: str, synthesis_attempts: int) 
     return scrubbed
 
 
+def _board_link_response(catalog: tuple[object, ...] | None) -> AnswerResponse | None:
+    """Card rows first, then any chunk that already contains a board URL."""
+    from_cards = trello_board_link_answer(catalog) if catalog is not None else None
+    if from_cards is not None and from_cards.status == "answered":
+        return from_cards
+    try:
+        hits = board_url_chunk_rows()
+    except RuntimeError:
+        logger.warning("Board-link lookup is unavailable.")
+        return from_cards
+    return board_link_from_chunk_rows(hits) or from_cards
+
+
 def _trello_response(question: str) -> AnswerResponse | None:
     """List, open-board, board-link, or bare ``in <list> state?`` answers."""
     if not (
@@ -389,9 +404,11 @@ def _trello_response(question: str) -> AnswerResponse | None:
         catalog = cards_from_rows(trello_card_rows())
     except RuntimeError:
         logger.warning("Trello card list is unavailable.")
-        return None
+        catalog = None
     if asks_for_trello_board_link(question):
-        return trello_board_link_answer(catalog)
+        return _board_link_response(catalog)
+    if catalog is None:
+        return None
     requested = requested_trello_list(question)
     if requested is None:
         bare = bare_list_name(question)

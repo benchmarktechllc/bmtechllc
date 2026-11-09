@@ -536,6 +536,46 @@ def trello_card_rows() -> list[tuple[str, str, str, str, str, int, str, str, str
     return rows
 
 
+def board_url_chunk_rows(limit: int = 8) -> list[tuple[int, str, str, str]]:
+    """Chunks that mention a Trello board URL, including invite links.
+
+    Each tuple is ``(chunk_id, source_file, content_sha256, chunk_text)``.
+    Card rows only store ``/c/`` links, so a Discord line can still carry
+    ``trello.com/b/<id>/<slug>``.
+    """
+    if limit < 1:
+        return []
+    statement = """
+        SELECT id, source_file, content_sha256, chunk_text
+        FROM document_chunks
+        WHERE chunk_text ILIKE %s
+           OR chunk_text ILIKE %s
+        ORDER BY id
+        LIMIT %s
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, ("%trello.com/b/%", "%trello.com/invite/b/%", limit))
+        fetched = cursor.fetchall()
+    rows: list[tuple[int, str, str, str]] = []
+    for record in fetched:
+        if len(record) != 4:
+            continue
+        chunk_id, source_file, digest, chunk_text = record
+        if isinstance(chunk_id, bool):
+            continue
+        try:
+            parsed_id = int(chunk_id)
+        except (TypeError, ValueError):
+            continue
+        text = str(chunk_text or "")
+        source = str(source_file or "").strip()
+        hashed = str(digest or "").strip().lower()
+        if parsed_id < 1 or not source or not text:
+            continue
+        rows.append((parsed_id, source, hashed, text))
+    return rows
+
+
 def discord_source_messages(channel_id: str) -> list[DiscordSourceMessage]:
     """Return a channel's normalized source messages in chronological order."""
     statement = """

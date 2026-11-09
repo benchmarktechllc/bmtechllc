@@ -522,3 +522,163 @@ def test_headcount_and_missing_certificate_stay_unknown(
     assert "anthropic" not in certificate.answer.casefold()
     assert "claude" not in certificate.answer.casefold()
     assert "does not address" in certificate.answer.casefold()
+
+
+_STEPS = (
+    "1. Open the section the page belongs in.",
+    "2. Choose the sample editor.",
+    "3. Fill in the form (Section, Title, Description, Owner, Markdown).",
+    "4. Write a sample paragraph.",
+    "5. Set the sample owner.",
+    "6. Check the sample preview.",
+    "7. Publish the sample draft.",
+)
+
+
+@pytest.mark.unit
+def test_board_link_uses_another_chunk_when_cards_only_have_card_urls(
+    monkeypatch: pytest.MonkeyPatch, quiet_model: None
+) -> None:
+    row = _row("Doing", "Sample card", "card", 8, url="https://trello.com/c/card")
+    note = "Board link - https://trello.com/b/tIvVZqio/bmtech-general-board"
+    monkeypatch.setattr(agent, "trello_card_rows", lambda: [_as_tuple(row)])
+    monkeypatch.setattr(
+        agent,
+        "board_url_chunk_rows",
+        lambda limit=8: [(90, "discord-sample.json", "d" * 64, note)],
+    )
+    monkeypatch.setattr(agent, "retrieve_evidence", lambda *_a, **_k: pytest.fail("retrieval"))
+    monkeypatch.setattr(agent, "call_llm", lambda **_k: pytest.fail("model"))
+
+    response = agent.run_agent("link our trello board")
+    rendered = response.model_dump_json()
+
+    assert response.status == "answered"
+    assert response.answer == f"The Trello board is {_BOARD}."
+    assert response.citations[0].quote == note
+    assert "trello/tIvVZqio/" in row.source_file
+    assert "ATTI" not in rendered
+    assert "/invite/" not in rendered
+    assert "https://trello.com/c/" not in response.answer
+
+
+@pytest.mark.unit
+def test_projects_question_returns_excerpts_without_work_or_bmtech_words(
+    monkeypatch: pytest.MonkeyPatch, quiet_model: None
+) -> None:
+    portal = _chunk(
+        31,
+        "portal/projects/sample-portal.md",
+        "The sample portal project is in a pilot.",
+        {"source_type": "kb_page", "title": "Sample portal"},
+        digest="1" * 64,
+    )
+    discord = _chunk(
+        32,
+        "discord-sample-projects.json",
+        "Notes: the sample kiosk project continues.",
+        {"source_type": "discord", "channel": "sample-projects"},
+        digest="2" * 64,
+    )
+    other = _chunk(
+        33,
+        "portal/office/cafeteria.md",
+        "The cafeteria menu changes on Monday.",
+        {"source_type": "kb_page", "title": "Cafeteria"},
+        digest="3" * 64,
+    )
+    for text in (portal.chunk_text, discord.chunk_text, other.chunk_text):
+        lowered = text.casefold()
+        assert "work" not in lowered
+        assert "bmtech" not in lowered
+        assert "currently" not in lowered
+
+    response = _run(
+        monkeypatch,
+        "What projects is BMTech working on?",
+        (portal, discord, other),
+        "The retrieved evidence does not address this question.",
+    )
+
+    assert response.status == "answered"
+    assert "sample portal project" in response.answer.casefold()
+    assert "sample kiosk project" in response.answer.casefold()
+    assert "cafeteria" not in response.answer.casefold()
+    assert "does not address" not in response.answer.casefold()
+
+
+@pytest.mark.unit
+def test_add_page_howto_keeps_every_numbered_step(
+    monkeypatch: pytest.MonkeyPatch, quiet_model: None
+) -> None:
+    guide = _chunk(
+        41,
+        "portal/guide/adding-a-page-from-the-portal.md",
+        "\n".join(_STEPS),
+        {"source_type": "kb_page", "title": "Adding a page", "section": "Guide"},
+    )
+    response = _run(
+        monkeypatch,
+        "How do I add a page to the KB?",
+        (guide,),
+        "Choose the sample editor. Write a sample paragraph. Set the sample owner. Check the sample preview.",
+    )
+
+    assert response.status == "answered"
+    for step in _STEPS:
+        assert step in response.answer
+    assert "does not address" not in response.answer.casefold()
+
+
+@pytest.mark.unit
+def test_status_excerpts_drop_extra_list_markers_and_join_card_headers(
+    monkeypatch: pytest.MonkeyPatch, quiet_model: None
+) -> None:
+    note = _chunk(
+        51,
+        "portal/projects/sample-kiosk.md",
+        "- MVP definition for the smart kiosk project.",
+        {"source_type": "kb_page", "title": "Sample kiosk"},
+        digest="a" * 64,
+    )
+    card = _chunk(
+        52,
+        "trello/tIvVZqio/kiosk.md",
+        "Card: Sample kiosk\nBoard: Sample Board\nList: Doing\n- MVP definition for the smart kiosk project.",
+        {"source_type": "trello", "title": "Sample kiosk", "column": "Doing"},
+        digest="b" * 64,
+    )
+    response = _run(
+        monkeypatch,
+        "Current status of the smart kiosk project?",
+        (note, card),
+        "The retrieved evidence does not address this question.",
+    )
+
+    assert response.status == "answered"
+    assert "- -" not in response.answer
+    assert "MVP definition for the smart kiosk project." in response.answer
+    assert "Board: Sample Board / List: Doing" in response.answer
+
+
+@pytest.mark.unit
+def test_open_trello_answer_prefixes_a_per_list_count(
+    monkeypatch: pytest.MonkeyPatch, quiet_model: None
+) -> None:
+    rows = [
+        _row("Backlog", f"Sample backlog {index}", f"b{index}", index + 1) for index in range(2)
+    ]
+    rows.append(_row("Doing", "Sample doing card", "doing", 20))
+    rows.extend(_row("Sev 1", f"Sample sev {index}", f"s{index}", 30 + index) for index in range(3))
+    rows.append(_row("Done", "Sample done card", "done", 40))
+    monkeypatch.setattr(agent, "trello_card_rows", lambda: [_as_tuple(row) for row in rows])
+    monkeypatch.setattr(agent, "retrieve_evidence", lambda *_a, **_k: pytest.fail("retrieval"))
+    monkeypatch.setattr(agent, "call_llm", lambda **_k: pytest.fail("model"))
+
+    response = agent.run_agent("Which Trello tickets are still open?")
+    rendered = format_discord_answer(response)
+
+    assert response.answer.splitlines()[0] == "Backlog 2, Doing 1, Sev 1 3"
+    assert "Done" not in response.answer.splitlines()[0]
+    assert "Sample done card" not in response.answer
+    assert len(rendered) <= DISCORD_MESSAGE_LIMIT

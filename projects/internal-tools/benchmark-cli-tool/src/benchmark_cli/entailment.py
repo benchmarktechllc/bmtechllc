@@ -50,6 +50,8 @@ _VAGUE = frozenset(
         "bmtech",
         "currently",
         "status",
+        "work",
+        "working",
     }
 )
 _REPORT_BASES = (

@@ -701,15 +701,73 @@ def _is_comparison(question: str) -> bool:
     ) is not None
 
 
+_HEADER_LINE = re.compile(r"^(?:Card|Board|List|URL|Labels|Due):")
+_STEP_LINE = re.compile(r"^\d+[.)]\s+\S")
+
+
+def _strip_list_marker(text: str) -> str:
+    """Drop a leading bullet or number so a quote is not rendered as ``- -``."""
+    return re.sub(r"^(?:[-*]\s+|\d+[.)]\s+)+", "", text.strip()).strip()
+
+
+def _present_quote(quote: str) -> str:
+    """One readable excerpt. Trello header rows share a line; list markers do not double."""
+    headers: list[str] = []
+    body: list[str] = []
+    for raw in quote.splitlines() or [quote]:
+        line = _strip_list_marker(raw)
+        if not line:
+            continue
+        if _HEADER_LINE.match(line):
+            headers.append(line)
+        else:
+            body.append(line)
+    parts: list[str] = []
+    if headers:
+        parts.append(" / ".join(headers))
+    if body:
+        parts.append(" ".join(body))
+    return "\n".join(parts)
+
+
+def _numbered_steps(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if _STEP_LINE.match(line.strip())]
+
+
+def _howto_procedure(
+    question: str,
+    citations: Sequence[Citation],
+    by_id: Mapping[int, SearchChunk],
+) -> str | None:
+    """The cited page's full numbered steps, when this how-to is that procedure."""
+    best: list[str] = []
+    for citation in citations:
+        chunk = by_id.get(citation.chunk_id)
+        sources = [citation.quote]
+        if chunk is not None:
+            sources.append(chunk.chunk_text)
+            sources.append(f"{chunk.chunk_text}\n{_chunk_identity_text(chunk)}")
+        if not any(answers_question(question, source, require_all=True) for source in sources):
+            continue
+        for source in sources[:2]:
+            steps = _numbered_steps(source)
+            if len(steps) > len(best):
+                best = steps
+    if len(best) < 2:
+        return None
+    return "\n".join(best)
+
+
 def _clean_excerpts(citations: Sequence[Citation]) -> str:
     """Short verbatim quotes. Fragments and whole-page dumps are left out."""
     lines: list[str] = []
     for citation in citations:
         kept: list[str] = []
         for sentence in _split_sentences(citation.quote):
-            if output_is_rejected(sentence) or not meaningful_text(sentence):
+            presented = _present_quote(sentence)
+            if not presented or output_is_rejected(presented) or not meaningful_text(presented):
                 continue
-            kept.append(sentence)
+            kept.append(presented)
             if len(kept) == 2:
                 break
         if not kept:
@@ -766,6 +824,15 @@ def qualify_grounded_answer(
         for citation in topical
         if answers_question(question, _coverage_text(citation.quote, by_id.get(citation.chunk_id)))
     ]
+    if _is_howto(question):
+        procedure = _howto_procedure(question, relevant or response.citations, by_id)
+        if procedure:
+            rendered = _rendered(
+                response.model_copy(update={"citations": relevant or response.citations}),
+                procedure,
+            )
+            if rendered is not None:
+                return rendered
     kept: list[str] = []
     unsupported_decision = False
     for sentence in _split_sentences(visible):

@@ -184,10 +184,9 @@ def trello_list_answer(requested: str, rows: Sequence[TrelloCardRow]) -> AnswerR
             confidence=0.0,
             citations=[],
         )
-    shown, hidden = _cards_that_fit(matched)
-    lines = _render_groups(shown)
-    if hidden:
-        lines.append(f"…and {hidden} more.")
+    prefix = _open_summary(matched) if requested == OPEN_LISTS else ""
+    shown, hidden = _cards_that_fit(matched, prefix=prefix)
+    lines = _answer_lines(shown, prefix=prefix, hidden=hidden)
     return AnswerResponse(
         status="answered",
         answer="\n".join(lines),
@@ -288,14 +287,39 @@ def _bullet(card: TrelloCardRow) -> str:
     return f"- {title}"
 
 
-def _cards_that_fit(matched: Sequence[TrelloCardRow]) -> tuple[list[TrelloCardRow], int]:
+def _list_label(card: TrelloCardRow) -> str:
+    return " ".join(redact_secrets(card.list_name).split()) or "Untitled list"
+
+
+def _open_summary(cards: Sequence[TrelloCardRow]) -> str:
+    """Per-list counts for every open card, including ones past the Discord cap."""
+    counts: dict[str, int] = {}
+    for card in cards:
+        label = _list_label(card)
+        counts[label] = counts.get(label, 0) + 1
+    return ", ".join(f"{name} {count}" for name, count in counts.items())
+
+
+def _answer_lines(cards: Sequence[TrelloCardRow], *, prefix: str, hidden: int) -> list[str]:
+    lines: list[str] = []
+    if prefix:
+        lines.append(prefix)
+        lines.append("")
+    lines.extend(_render_groups(cards))
+    if hidden:
+        lines.append(f"…and {hidden} more.")
+    return lines
+
+
+def _cards_that_fit(
+    matched: Sequence[TrelloCardRow], *, prefix: str = ""
+) -> tuple[list[TrelloCardRow], int]:
     """Keep every card that fits in a Discord message, then say how many remain."""
     cap = min(len(matched), MAX_LISTED_CARDS)
     chosen = 1 if matched else 0
     for size in range(cap, 0, -1):
         hidden = len(matched) - size
-        extra = [f"…and {hidden} more."] if hidden else []
-        body = "\n".join([*_render_groups(matched[:size]), *extra])
+        body = "\n".join(_answer_lines(matched[:size], prefix=prefix, hidden=hidden))
         if len(body) + _LIST_CITATION_RESERVE <= _DISCORD_MESSAGE_LIMIT:
             chosen = size
             break
@@ -313,18 +337,23 @@ def asks_for_trello_board_link(question: str) -> bool:
     return re.search(r"\b(?:link|url|uri|address)\b", text) is not None
 
 
-def board_url_from_cards(rows: Sequence[TrelloCardRow]) -> str | None:
-    """Canonical ``/b/<id>/<slug>`` URL from card rows, never an invite token."""
-    text = "\n".join(
-        "\n".join((card.url, card.chunk_text, card.source_file, card.board)) for card in rows
-    )
+def _url_in_text(text: str) -> str | None:
+    """Canonical ``/b/<id>/<slug>`` URL. An invite is rewritten and its token dropped."""
     direct = _BOARD_LINK.search(text)
-    if direct is not None:
+    if direct is not None and "/invite/" not in direct.group(0).casefold():
         return f"https://trello.com/b/{direct.group('id')}/{direct.group('slug')}"
     invite = _INVITE_LINK.search(text)
     if invite is None:
         return None
     return f"https://trello.com/b/{invite.group('id')}/{invite.group('slug')}"
+
+
+def board_url_from_cards(rows: Sequence[TrelloCardRow]) -> str | None:
+    """Canonical ``/b/<id>/<slug>`` URL from card rows, never an invite token."""
+    text = "\n".join(
+        "\n".join((card.url, card.chunk_text, card.source_file, card.board)) for card in rows
+    )
+    return _url_in_text(text)
 
 
 def bare_list_name(question: str) -> str | None:
@@ -362,6 +391,52 @@ def _board_quote(card: TrelloCardRow, url: str) -> str | None:
         quote = _quote(card)
         if quote and "ATTI" not in quote and "/invite/" not in quote.casefold():
             return quote
+    return None
+
+
+def board_link_from_chunk_rows(rows: Sequence[tuple[int, str, str, str]]) -> AnswerResponse | None:
+    """Cite a ``trello.com/b/`` line from any chunk. Invite tokens stay out of the answer."""
+    ranked: list[tuple[bool, int, str, str, str, str]] = []
+    for chunk_id, source_file, digest, chunk_text in rows:
+        hashed = (digest or "").strip().lower()
+        if chunk_id < 1 or not source_file or _HASH.fullmatch(hashed) is None:
+            continue
+        url = _url_in_text(chunk_text)
+        if url is None or "ATTI" in url or "/invite/" in url:
+            continue
+        quote = _line_with_url(chunk_text, url)
+        if quote is None:
+            continue
+        direct = "/invite/" not in chunk_text.casefold() and "ATTI" not in chunk_text
+        ranked.append((direct, chunk_id, source_file, hashed, url, quote))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: (not item[0], item[1]))
+    _direct, chunk_id, source_file, digest, url, quote = ranked[0]
+    return AnswerResponse(
+        status="answered",
+        answer=f"The Trello board is {url}.",
+        confidence=0.8,
+        citations=[
+            Citation(
+                source_file=source_file,
+                chunk_id=chunk_id,
+                content_sha256=digest,
+                quote=quote,
+            )
+        ],
+    )
+
+
+def _line_with_url(text: str, url: str) -> str | None:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or "ATTI" in stripped or "/invite/" in stripped.casefold():
+            continue
+        if url in stripped:
+            redacted = redact_secrets(stripped).strip()
+            if url in redacted and "ATTI" not in redacted:
+                return redacted
     return None
 
 
