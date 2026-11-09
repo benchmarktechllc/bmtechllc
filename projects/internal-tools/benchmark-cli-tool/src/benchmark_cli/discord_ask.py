@@ -19,7 +19,7 @@ from dataclasses import dataclass
 import discord
 from discord import app_commands
 
-from .agent import run_agent
+from .agent import MODEL_UNAVAILABLE_REPLY, run_agent
 from .contributions import (
     THANKS_REPLY,
     UNKNOWN_INVITE,
@@ -232,7 +232,11 @@ def format_discord_messages(
         )
     else:
         text = answer
-    if response.status == "no_relevant_information" and UNKNOWN_INVITE not in text:
+    if (
+        response.status == "no_relevant_information"
+        and UNKNOWN_INVITE not in text
+        and MODEL_UNAVAILABLE_REPLY not in text
+    ):
         text = f"{text.rstrip()}\n\n{UNKNOWN_INVITE}"
     return split_discord_messages(discord.utils.escape_mentions(text), limit=limit)
 
@@ -240,7 +244,11 @@ def format_discord_messages(
 def format_discord_answer(response: AnswerResponse, *, limit: int = DISCORD_MESSAGE_LIMIT) -> str:
     """Render an agent response, keeping citations when they fit in one message."""
     answer = response.answer.strip() or "No answer text was returned."
-    if response.status == "no_relevant_information" and UNKNOWN_INVITE not in answer:
+    if (
+        response.status == "no_relevant_information"
+        and UNKNOWN_INVITE not in answer
+        and MODEL_UNAVAILABLE_REPLY not in answer
+    ):
         answer = f"{answer.rstrip()}\n\n{UNKNOWN_INVITE}"
     if response.citations and _linked_list_answer(answer):
         shown = len(response.citations)
@@ -337,38 +345,70 @@ class AddAnswerModal(discord.ui.Modal, title="Add answer"):
         await interaction.response.send_message(THANKS_REPLY, ephemeral=True)
 
 
+ADD_ANSWER_CUSTOM_ID = "bmtech:add_answer"
+
+
+async def original_question_message(bot_message: discord.Message) -> discord.Message | None:
+    """The human question this unknown reply was posted for.
+
+    After a restart the button has no saved state, so the question is read from
+    the message the bot replied to, or from the thread starter.
+    """
+    reference = bot_message.reference
+    if reference is not None:
+        resolved = reference.resolved
+        if isinstance(resolved, discord.Message):
+            return resolved
+        message_id = reference.message_id
+        if message_id is not None:
+            try:
+                return await bot_message.channel.fetch_message(message_id)
+            except (discord.HTTPException, AttributeError):
+                logger.warning("Could not read the question message %s.", message_id)
+    channel = bot_message.channel
+    if isinstance(channel, discord.Thread):
+        starter = channel.starter_message
+        if starter is None and channel.parent is not None:
+            try:
+                starter = await channel.parent.fetch_message(channel.id)
+            except discord.HTTPException:
+                starter = None
+        if starter is not None and starter.id != bot_message.id:
+            return starter
+    return None
+
+
 class AddAnswerView(discord.ui.View):
-    """Button that opens the contribution modal."""
+    """Persistent button that opens the contribution modal."""
 
-    def __init__(
-        self,
-        *,
-        question: str,
-        author_id: int,
-        author_name: str,
-        channel_id: int,
-        message_id: int,
-        message_url: str,
-    ) -> None:
-        super().__init__(timeout=86_400)
-        self.question = question
-        self.author_id = author_id
-        self.author_name = author_name
-        self.channel_id = channel_id
-        self.message_id = message_id
-        self.message_url = message_url
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
 
-    @discord.ui.button(label="Add answer", style=discord.ButtonStyle.primary)
+    @discord.ui.button(
+        label="Add answer",
+        style=discord.ButtonStyle.primary,
+        custom_id=ADD_ANSWER_CUSTOM_ID,
+    )
     async def add_answer(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        bot_message = interaction.message
+        original = await original_question_message(bot_message) if bot_message is not None else None
+        target = original or bot_message
+        question = original.content if original is not None else ""
         user = interaction.user
+        if target is None:
+            await interaction.response.send_message(
+                "I couldn't find the original question. Reply to my message with the answer instead.",
+                ephemeral=True,
+            )
+            return
         await interaction.response.send_modal(
             AddAnswerModal(
-                question=self.question,
-                author_id=getattr(user, "id", self.author_id),
-                author_name=getattr(user, "display_name", self.author_name),
-                channel_id=self.channel_id,
-                message_id=self.message_id,
-                message_url=self.message_url,
+                question=question,
+                author_id=user.id,
+                author_name=getattr(user, "display_name", "") or getattr(user, "name", "a teammate"),
+                channel_id=target.channel.id,
+                message_id=target.id,
+                message_url=message_jump_url(target),
             )
         )
 
@@ -464,6 +504,7 @@ class AskClient(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
+        self.add_view(AddAnswerView())
         self.tree.add_command(ask_command)
         await self.sync_commands()
 
@@ -598,15 +639,8 @@ class AskClient(discord.Client):
                 logger.exception("Failed to send the error reply for message %s.", message.id)
             return
         view = None
-        if response.status == "no_relevant_information":
-            view = AddAnswerView(
-                question=message.content,
-                author_id=message.author.id,
-                author_name=getattr(message.author, "display_name", "") or message.author.name,
-                channel_id=message.channel.id,
-                message_id=message.id,
-                message_url=message_jump_url(message),
-            )
+        if response.status == "no_relevant_information" and MODEL_UNAVAILABLE_REPLY not in response.answer:
+            view = AddAnswerView()
         try:
             await deliver_channel_messages(message, parts, view=view)
         except discord.HTTPException:
