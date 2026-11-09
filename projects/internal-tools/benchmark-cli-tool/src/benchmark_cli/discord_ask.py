@@ -9,6 +9,7 @@ stays in ``discord_sync``.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 from collections.abc import Callable
@@ -85,6 +86,15 @@ def gateway_intents() -> discord.Intents:
     return intents
 
 
+def thread_question_for(content: str, starter: str | None) -> str | None:
+    """The thread's starting question, when this message is a follow-up."""
+    current = " ".join(content.split())
+    prior = " ".join((starter or "").split())
+    if not prior or prior == current:
+        return None
+    return prior
+
+
 def in_ask_channel(*, channel_id: int, parent_channel_id: int | None, ask_channel_id: int) -> bool:
     """Return whether a message lives in the ask channel or one of its threads."""
     return channel_id == ask_channel_id or parent_channel_id == ask_channel_id
@@ -149,14 +159,27 @@ def _format_citation(index: int, citation: Citation) -> str:
     return f"{index}. `{source}` (chunk {citation.chunk_id}): {quote}"
 
 
+def _linked_list_answer(answer: str) -> bool:
+    """Trello list replies already put each card link in the body."""
+    return "Trello cards in " in answer and "](https://" in answer
+
+
 def format_discord_answer(response: AnswerResponse, *, limit: int = DISCORD_MESSAGE_LIMIT) -> str:
     """Render an agent response, keeping citations when they fit in one message."""
     answer = response.answer.strip() or "No answer text was returned."
-    if response.citations:
+    if response.citations and _linked_list_answer(answer):
+        noun = "card" if len(response.citations) == 1 else "cards"
+        citation_block = (
+            f"**Sources**\n{len(response.citations)} indexed {noun}; links are in the list above."
+        )
+    elif response.citations:
         citation_block = "**Citations**\n" + "\n".join(
             _format_citation(index, citation)
             for index, citation in enumerate(response.citations, start=1)
         )
+    else:
+        citation_block = ""
+    if citation_block:
         separator = "\n\n"
         if len(separator) + len(citation_block) < limit:
             answer_limit = limit - len(separator) - len(citation_block)
@@ -168,6 +191,23 @@ def format_discord_answer(response: AnswerResponse, *, limit: int = DISCORD_MESS
         composed = truncate_discord(answer, limit=limit)
     rendered = truncate_discord(discord.utils.escape_mentions(composed), limit=limit)
     return rendered or "No answer text was returned."[:limit]
+
+
+async def read_thread_starter(message: discord.Message) -> str | None:
+    """Text of the message that opened this thread, when Discord still has it."""
+    channel = message.channel
+    if not isinstance(channel, discord.Thread):
+        return None
+    starter = channel.starter_message
+    if starter is None and channel.parent is not None:
+        try:
+            starter = await channel.parent.fetch_message(channel.id)
+        except discord.HTTPException:
+            logger.warning("Could not read the thread starter for message %s.", message.id)
+            starter = None
+    if starter is None or starter.id == message.id:
+        return None
+    return starter.content
 
 
 async def deliver_channel_answer(message: discord.Message, body: str) -> None:
@@ -245,17 +285,24 @@ class AskClient(discord.Client):
             self.config.ask_channel_id,
         )
 
-    async def answer_question(self, question: str) -> str:
+    async def answer_question(self, question: str, *, thread_question: str | None = None) -> str:
         """Run the RAG agent and format the reply.
 
         Questions run one at a time. Usage telemetry is appended without a file
-        lock, and one in-flight retrieval is enough for this bot.
+        lock, and one in-flight retrieval is enough for this bot. A thread
+        follow-up also receives the thread's starting question.
         """
         cleaned = question.strip()
         if not cleaned:
             raise ValueError("question must not be empty.")
+
+        def _invoke() -> AnswerResponse:
+            if thread_question and "thread_question" in inspect.signature(self._agent).parameters:
+                return self._agent(cleaned, thread_question=thread_question)
+            return self._agent(cleaned)
+
         async with self._agent_lock:
-            response = await asyncio.to_thread(self._agent, cleaned)
+            response = await asyncio.to_thread(_invoke)
         return format_discord_answer(response)
 
     async def on_message(self, message: discord.Message) -> None:
@@ -291,7 +338,11 @@ class AskClient(discord.Client):
         logger.info("Answering message %s in channel %s.", message.id, message.channel.id)
         try:
             async with message.channel.typing():
-                body = await self.answer_question(message.content)
+                starter = await read_thread_starter(message)
+                body = await self.answer_question(
+                    message.content,
+                    thread_question=thread_question_for(message.content, starter),
+                )
         except Exception:
             logger.exception("Failed to answer message %s.", message.id)
             try:

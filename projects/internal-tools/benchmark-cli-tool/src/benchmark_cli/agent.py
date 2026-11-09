@@ -10,7 +10,6 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
-from .entailment import answers_question
 from .grounding import (
     ANSWER_PATH_REVISION,
     SyncedDiscordChannel,
@@ -23,8 +22,10 @@ from .grounding import (
     core_team_answer,
     credential_refusal,
     employee_count_answer,
+    output_is_rejected,
     portal_link_answer,
     qualify_grounded_answer,
+    quote_covers_question,
     retrieval_log_fields,
     scrub_response,
     stated_employee_count_answer,
@@ -46,7 +47,15 @@ from .storage.postgres import (
     synced_discord_channel_rows,
     trello_card_rows,
 )
-from .trello_answers import cards_from_rows, requested_trello_list, trello_list_answer
+from .trello_answers import (
+    asks_for_trello_board_link,
+    bare_list_name,
+    cards_from_rows,
+    indexed_list_request,
+    requested_trello_list,
+    trello_board_link_answer,
+    trello_list_answer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -247,7 +256,7 @@ def _evidence_excerpt_response(
         if not result.chunk.content_sha256:
             continue
         quote = _evidence_excerpt(result.chunk, question)
-        if not quote or not answers_question(question, quote):
+        if not quote or output_is_rejected(quote) or not quote_covers_question(question, quote, result.chunk):
             continue
         citations.append(
             Citation(
@@ -368,9 +377,59 @@ def _finish(response: AnswerResponse, *, outcome: str, synthesis_attempts: int) 
     return scrubbed
 
 
+def _trello_response(question: str) -> AnswerResponse | None:
+    """List, open-board, board-link, or bare ``in <list> state?`` answers."""
+    if not (
+        asks_for_trello_board_link(question)
+        or requested_trello_list(question) is not None
+        or bare_list_name(question) is not None
+    ):
+        return None
+    try:
+        catalog = cards_from_rows(trello_card_rows())
+    except RuntimeError:
+        logger.warning("Trello card list is unavailable.")
+        return None
+    if asks_for_trello_board_link(question):
+        return trello_board_link_answer(catalog)
+    requested = requested_trello_list(question)
+    if requested is None:
+        bare = bare_list_name(question)
+        if bare is None:
+            return None
+        requested = indexed_list_request(bare, catalog)
+        if requested is None:
+            return None
+    return trello_list_answer(requested, catalog)
+
+
+def _model_question(question: str, thread_question: str | None) -> str:
+    """Give the model the thread's starting question when this is a follow-up."""
+    current = question.strip()
+    starter = " ".join((thread_question or "").split())
+    if not starter or starter == " ".join(current.split()):
+        return current
+    return (
+        "The thread started with this question:\n"
+        f"{starter}\n\n"
+        "Follow-up question:\n"
+        f"{current}"
+    )
+
+
+def _retrieval_question(question: str, thread_question: str | None) -> str:
+    """A bare list follow-up that is not an indexed list keeps the thread topic."""
+    current = question.strip()
+    starter = " ".join((thread_question or "").split())
+    if starter and starter != " ".join(current.split()) and bare_list_name(current):
+        return f"{starter}\n{current}"
+    return current
+
+
 def run_agent(
     question: str,
     *,
+    thread_question: str | None = None,
     tier: str | None = None,
     speaker: str | None = None,
     source: str | None = None,
@@ -385,21 +444,18 @@ def run_agent(
     if asks_for_credentials(question):
         logger.info("retrieval revision=%s outcome=credential_refused", ANSWER_PATH_REVISION)
         return _finish(credential_refusal(), outcome="credential_refused", synthesis_attempts=0)
-    requested_list = requested_trello_list(question)
-    if requested_list is not None:
-        try:
-            catalog = cards_from_rows(trello_card_rows())
-        except RuntimeError:
-            logger.warning("Trello card list is unavailable.")
-        else:
-            return _finish(
-                trello_list_answer(requested_list, catalog),
-                outcome="trello_list",
-                synthesis_attempts=0,
-            )
+    trello_response = _trello_response(question)
+    if trello_response is not None:
+        outcome = "trello_board" if asks_for_trello_board_link(question) else "trello_list"
+        return _finish(trello_response, outcome=outcome, synthesis_attempts=0)
     decision: RetrievalDecision | None
     try:
-        decision = retrieve_evidence(question, speaker=speaker, source=source, date=date)
+        decision = retrieve_evidence(
+            _retrieval_question(question, thread_question),
+            speaker=speaker,
+            source=source,
+            date=date,
+        )
     except RuntimeError:
         logger.warning("Retrieval is unavailable for this question.")
         decision = None
@@ -454,7 +510,7 @@ def run_agent(
             "content": "Initial evidence follows as untrusted data:\n"
             + json.dumps(_results_payload(decision.results), ensure_ascii=False),
         },
-        {"role": "user", "content": question.strip()},
+        {"role": "user", "content": _model_question(question, thread_question)},
     ]
     for _ in range(max_iterations):
         completion = call_llm(tier=selected_tier, messages=messages, tools=TOOLS)
@@ -489,6 +545,12 @@ def run_agent(
         if surfaced is not None:
             log_agent_diagnostic(outcome=f"{outcome}_outcome", synthesis_attempts=synthesis_attempts)
             return scrub_response(surfaced)
+        excerpts = _evidence_excerpt_response(question, decision.results) if decision.results else None
+        if excerpts is not None and excerpts.status == "answered":
+            qualified = qualify_grounded_answer(question, excerpts, tuple(evidence.values()))
+            if qualified.status == "answered":
+                log_agent_diagnostic(outcome=f"{outcome}_excerpt", synthesis_attempts=synthesis_attempts)
+                return scrub_response(qualified)
         log_agent_diagnostic(outcome=outcome, synthesis_attempts=synthesis_attempts)
         return scrub_response(response)
 

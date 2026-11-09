@@ -282,7 +282,10 @@ def test_non_https_url_is_not_linked() -> None:
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("question", _NOT_MEMBERSHIP)
+@pytest.mark.parametrize(
+    "question",
+    [question for question in _NOT_MEMBERSHIP if question != "In doing state?"],
+)
 def test_non_membership_questions_fall_through_to_retrieval(
     monkeypatch: pytest.MonkeyPatch, quiet_agent: None, question: str
 ) -> None:

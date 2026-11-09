@@ -172,15 +172,19 @@ def asks_for_core_team(question: str) -> bool:
 
 
 def asks_for_synced_channels(question: str) -> bool:
-    """Match only a catalog question. How-to requests fall through."""
+    """Match a catalog of channels that are synced, ingested, or indexed.
+
+    How-to and decision questions stay on the ordinary path. Discord does not
+    have to be named: "what channels has BMTech synced into the KB" is the
+    same catalog question.
+    """
     text = question.casefold()
     if re.search(r"\bhow\s+(?:do|can|should|to)\b", text):
         return False
     if re.search(r"\b(?:decide|decided|decision|said|discuss(?:ed)?)\b", text):
         return False
     return (
-        re.search(r"\bdiscord\b", text) is not None
-        and re.search(r"\bchannels\b", text) is not None
+        re.search(r"\bchannels?\b", text) is not None
         and re.search(r"\b(?:sync\w*|ingest\w*|index\w*)\b", text) is not None
         and re.search(r"\b(?:which|what|list)\b", text) is not None
     )
@@ -503,17 +507,83 @@ def _identity_has(identity: str, alias: str) -> bool:
 
 
 def _chunk_identity_text(chunk: SearchChunk) -> str:
-    """Identity comes from source metadata, not a passing mention in the body."""
+    """Identity comes from the path, title, and KB page type, not the body."""
     metadata = chunk.metadata or {}
-    return " ".join(
-        (
-            chunk.source_file,
-            str(metadata.get("title") or ""),
-            str(metadata.get("url") or ""),
-            str(metadata.get("section") or ""),
-            str(metadata.get("kb_section") or ""),
-        )
-    )
+    source_type = str(metadata.get("source_type") or "")
+    parts = [
+        chunk.source_file,
+        str(metadata.get("title") or ""),
+        str(metadata.get("url") or ""),
+        str(metadata.get("section") or ""),
+        str(metadata.get("kb_section") or ""),
+    ]
+    if source_type == "kb_page":
+        # The page type is the knowledge base. "page" stays a body/path word
+        # so a different KB page is not treated as an article about pages.
+        parts.append("knowledge base kb")
+    elif source_type:
+        parts.append(source_type.replace("_", " "))
+    return " ".join(parts)
+
+
+def _coverage_text(quote: str, chunk: SearchChunk | None) -> str:
+    """Quote plus document identity, so a how-to can be covered by its path."""
+    if chunk is None:
+        return quote
+    return f"{quote}\n{_chunk_identity_text(chunk)}"
+
+
+def quote_covers_question(question: str, quote: str, chunk: SearchChunk) -> bool:
+    """Whether the quote or the cited document's identity answers the question."""
+    return answers_question(question, _coverage_text(quote, chunk))
+
+
+_CONTINUATION_START = re.compile(
+    r"^(?:so|and|but|or|nor|because|which|that)\b",
+    re.IGNORECASE,
+)
+_CLOSER_START = "]).,;:}>\"”」"
+
+
+def starts_mid_sentence(text: str) -> bool:
+    """A fragment that begins after the sentence has already started."""
+    body = re.sub(r"^(?:[-*]\s+|\d+[.)]\s+)+", "", text.strip()).strip()
+    if not body:
+        return False
+    if body[0] in _CLOSER_START or body[0].islower():
+        return True
+    return _CONTINUATION_START.match(body) is not None
+
+
+def has_unbalanced_delimiters(text: str) -> bool:
+    """Quotes and brackets that open and never close, or the reverse."""
+    pairs = {")": "(", "]": "[", "}": "{", "】": "【", "”": "“"}
+    opening = set(pairs.values())
+    stack: list[str] = []
+    straight = 0
+    for char in text:
+        if char == '"':
+            straight += 1
+            continue
+        if char in opening:
+            stack.append(char)
+            continue
+        if char in pairs:
+            if not stack or stack[-1] != pairs[char]:
+                return True
+            stack.pop()
+    return bool(stack) or straight % 2 == 1
+
+
+def output_is_rejected(text: str) -> bool:
+    """Reject a mid-sentence fragment or an unbalanced quote or bracket."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if has_unbalanced_delimiters(stripped):
+        return True
+    first = re.split(r"[\n\r]+", stripped, maxsplit=1)[0]
+    return starts_mid_sentence(first)
 
 
 def _is_howto(question: str) -> bool:
@@ -631,10 +701,27 @@ def _is_comparison(question: str) -> bool:
     ) is not None
 
 
+def _clean_excerpts(citations: Sequence[Citation]) -> str:
+    """Short verbatim quotes. Fragments and whole-page dumps are left out."""
+    lines: list[str] = []
+    for citation in citations:
+        kept: list[str] = []
+        for sentence in _split_sentences(citation.quote):
+            if output_is_rejected(sentence) or not meaningful_text(sentence):
+                continue
+            kept.append(sentence)
+            if len(kept) == 2:
+                break
+        if not kept:
+            continue
+        lines.append("- " + " ".join(kept))
+    return "\n".join(lines)
+
+
 def _rendered(response: AnswerResponse, text: str) -> AnswerResponse | None:
     """Ship only an answer that still says something."""
     cleaned = text.strip()
-    if not meaningful_text(cleaned):
+    if not meaningful_text(cleaned) or output_is_rejected(cleaned):
         return None
     if cleaned == response.answer.strip():
         return response
@@ -656,14 +743,29 @@ def qualify_grounded_answer(
     if response.status != "answered" or not response.citations:
         return response
     visible = _without_orphan_citation_sentences(response.answer, len(response.citations))
+    visible = " ".join(
+        sentence for sentence in _split_sentences(visible) if not output_is_rejected(sentence)
+    )
     response = response.model_copy(update={"answer": visible})
     cited = _cited_chunks(response, chunks)
+    by_id = {chunk.id: chunk for chunk in chunks}
     quoted = "\n".join(citation.quote for citation in response.citations)
     identity = " ".join(_chunk_identity_text(chunk) for chunk in cited)
-    if _is_howto(question) and not answers_question(question, quoted, require_all=True):
+    coverage = "\n".join(
+        _coverage_text(citation.quote, by_id.get(citation.chunk_id)) for citation in response.citations
+    )
+    if _is_howto(question) and not answers_question(question, coverage, require_all=True):
         return _abstain(_NOT_RESPONSIVE)
-    topical = [citation for citation in response.citations if touches_question(question, citation.quote)]
-    relevant = [citation for citation in topical if answers_question(question, citation.quote)]
+    topical = [
+        citation
+        for citation in response.citations
+        if touches_question(question, _coverage_text(citation.quote, by_id.get(citation.chunk_id)))
+    ]
+    relevant = [
+        citation
+        for citation in topical
+        if answers_question(question, _coverage_text(citation.quote, by_id.get(citation.chunk_id)))
+    ]
     kept: list[str] = []
     unsupported_decision = False
     for sentence in _split_sentences(visible):
@@ -678,13 +780,19 @@ def qualify_grounded_answer(
             "unknown",
         )
         if verdict == "supported":
-            kept.append(sentence)
+            if not output_is_rejected(sentence):
+                kept.append(sentence)
             continue
         if claim_status(sentence) == "decided":
             unsupported_decision = True
             continue
         partial = supported_steps(sentence, quoted)
-        if partial and meaningful_text(partial) and answers_question(question, partial):
+        if (
+            partial
+            and meaningful_text(partial)
+            and answers_question(question, partial)
+            and not output_is_rejected(partial)
+        ):
             kept.append(partial)
     disclaimer = _identity_gap(question, cited)
     topical_text = "\n".join(f"- {citation.quote}" for citation in topical)
@@ -753,8 +861,12 @@ def qualify_grounded_answer(
         rendered = _rendered(response.model_copy(update={"citations": relevant}), relevant_text)
         if rendered is not None:
             return rendered
-    if _is_howto(question) and relevant_text and answers_question(question, relevant_text, require_all=True):
-        rendered = _rendered(response.model_copy(update={"citations": relevant}), relevant_text)
+    relevant_coverage = "\n".join(
+        _coverage_text(citation.quote, by_id.get(citation.chunk_id)) for citation in relevant
+    )
+    clean = _clean_excerpts(relevant)
+    if clean and answers_question(question, relevant_coverage, require_all=_is_howto(question)):
+        rendered = _rendered(response.model_copy(update={"citations": relevant}), clean)
         if rendered is not None:
             return rendered
     return _abstain(_NOT_RESPONSIVE)

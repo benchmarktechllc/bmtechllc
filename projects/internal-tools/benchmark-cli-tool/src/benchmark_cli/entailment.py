@@ -36,7 +36,22 @@ _FRAMING = frozenset(
     "relevant retrieved retrieve excerpt excerpts citation citations source sources following document evidence text section article chunk".split()
 )
 _YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
-_VAGUE = frozenset({"result", "thing", "information", "detail", "anything", "something"})
+# "knowledge" and "base" are the two words of the vague phrase "knowledge base".
+_VAGUE = frozenset(
+    {
+        "result",
+        "thing",
+        "information",
+        "detail",
+        "anything",
+        "something",
+        "knowledge",
+        "base",
+        "bmtech",
+        "currently",
+        "status",
+    }
+)
 _REPORT_BASES = (
     "say",
     "describe",
@@ -179,7 +194,10 @@ def _related(left: str, right: str) -> bool:
 
 
 def _covered(term: str, terms: set[str]) -> bool:
-    return any(_related(term, other) for other in terms)
+    """A question word is covered by the same word, or by ``kb`` == ``knowledge base``."""
+    if any(_related(term, other) for other in terms):
+        return True
+    return term == "kb" and {"knowledge", "base"} <= terms
 
 
 def content_terms(text: str) -> set[str]:
@@ -188,6 +206,9 @@ def content_terms(text: str) -> set[str]:
     for token in re.findall(r"[A-Za-z][A-Za-z'-]{1,}", text):
         raw = token.casefold().replace("'", "")
         if raw in _FUNCTION or raw in _FRAMING or _is_reporting(token):
+            continue
+        if raw == "kb":
+            terms.add("kb")
             continue
         lemma = _lemma(token)
         if len(lemma) >= 3 and lemma not in _FUNCTION and lemma not in _FRAMING:

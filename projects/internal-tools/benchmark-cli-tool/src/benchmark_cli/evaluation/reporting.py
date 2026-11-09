@@ -6,14 +6,15 @@ import csv
 from collections import defaultdict
 from pathlib import Path
 
-from ..logging import USAGE_LOG_PATH
+from ..logging import usage_log_path
 
 
-def usage_rows(path: Path = USAGE_LOG_PATH) -> list[dict[str, str]]:
+def usage_rows(path: Path | None = None) -> list[dict[str, str]]:
     """Load usage rows so a benchmark run can be reported independently of history."""
-    if not path.exists():
+    selected = usage_log_path() if path is None else path
+    if not selected.exists():
         return []
-    with path.open(encoding="utf-8", newline="") as stream:
+    with selected.open(encoding="utf-8", newline="") as stream:
         return list(csv.DictReader(stream))
 
 
@@ -39,6 +40,6 @@ def summarize_cost_rows(rows: list[dict[str, str]]) -> dict[str, dict[str, float
     return {key: dict(value) for key, value in sorted(totals.items())}
 
 
-def model_cost_breakdown(path: Path = USAGE_LOG_PATH) -> dict[str, dict[str, float]]:
+def model_cost_breakdown(path: Path | None = None) -> dict[str, dict[str, float]]:
     """Return exact totals for every row currently stored in the usage log."""
     return summarize_cost_rows(usage_rows(path))
