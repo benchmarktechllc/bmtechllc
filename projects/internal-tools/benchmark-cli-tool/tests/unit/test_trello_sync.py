@@ -29,6 +29,7 @@ _BOARD = {
     "name": "BMTech General Board",
     "shortLink": "tIvVZqio",
     "url": "https://trello.com/b/tIvVZqio/bmtech-general-board",
+    "members": [{"id": "member-1", "fullName": "Sample Person", "username": "sample"}],
     "lists": [{"id": "list-1", "name": "Doing"}],
     "cards": [
         {
@@ -40,6 +41,7 @@ _BOARD = {
             "idList": "list-1",
             "labels": [{"name": "Ops", "color": "green"}, {"name": "", "color": "red"}],
             "dateLastActivity": "2026-11-01T00:00:00.000Z",
+            "idMembers": ["member-1"],
             "checklists": [
                 {
                     "name": "Steps",
@@ -93,6 +95,9 @@ def test_board_parser_keeps_open_cards_and_redacts_secrets() -> None:
     assert "- [x] Review" in text
     assert trello_source_file(board.short_link, card.card_id) == "trello/tIvVZqio/card-1.md"
     assert "Board URL: https://trello.com/b/tIvVZqio/bmtech-general-board" in text
+    assert "Members: Sample Person" in text
+    assert "Last activity: 2026-11-01" in text
+    assert "Checklists: 1 (1/2 items complete)" in text
     assert "ATTI" not in text
 
     chunk = chunk_units(units, target_tokens=400, max_tokens=500, min_tokens=1)[0]

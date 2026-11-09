@@ -86,6 +86,7 @@ class TrelloCard:
     last_activity: datetime | None
     checklists: tuple[TrelloChecklist, ...] = ()
     comments: tuple[TrelloComment, ...] = ()
+    members: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,8 +160,10 @@ class TrelloRestClient:
                 "lists": "open",
                 "list_fields": "name",
                 "cards": "open",
-                "card_fields": "name,desc,due,url,shortUrl,idList,labels,dateLastActivity",
+                "card_fields": "name,desc,due,url,shortUrl,idList,labels,dateLastActivity,idMembers",
                 "card_checklists": "all",
+                "members": "all",
+                "member_fields": "fullName,username",
             },
         )
         if not isinstance(payload, dict):
@@ -216,7 +219,7 @@ def parse_board(payload: dict[str, Any]) -> TrelloBoard:
     for item in cards:
         if not isinstance(item, dict):
             continue
-        card = _parse_card(item, list_names)
+        card = _parse_card(item, list_names, _member_names(payload))
         if card is not None:
             parsed.append(card)
     board_id = str(payload.get("id") or "").strip()
@@ -230,6 +233,20 @@ def parse_board(payload: dict[str, Any]) -> TrelloBoard:
         url=_board_url(payload, short_link),
         cards=tuple(parsed),
     )
+
+
+def _member_names(payload: dict[str, Any]) -> dict[str, str]:
+    names: dict[str, str] = {}
+    members = payload.get("members")
+    if not isinstance(members, list):
+        return names
+    for member in members:
+        if not isinstance(member, dict) or not member.get("id"):
+            continue
+        label = normalize_text(str(member.get("fullName") or member.get("username") or ""))
+        if label:
+            names[str(member["id"])] = label
+    return names
 
 
 def _board_url(payload: dict[str, Any], short_link: str) -> str:
@@ -295,6 +312,18 @@ def units_for_card(board: TrelloBoard, card: TrelloCard) -> list[RawUnit]:
         lines.append("Labels: " + ", ".join(card.labels))
     if card.due is not None:
         lines.append(f"Due: {card.due.date().isoformat()}")
+    if card.members:
+        lines.append("Members: " + ", ".join(card.members))
+    if card.last_activity is not None:
+        lines.append(f"Last activity: {card.last_activity.date().isoformat()}")
+    if card.checklists:
+        total = sum(len(checklist.items) for checklist in card.checklists)
+        complete = sum(
+            1 for checklist in card.checklists for item in checklist.items if item.complete
+        )
+        lines.append(f"Checklists: {len(card.checklists)} ({complete}/{total} items complete)")
+    for comment in card.comments[-3:]:
+        lines.append(f"Recent comment by {comment.author}: {comment.text[:180]}")
     if card.description:
         lines.extend(("", card.description))
     units.append(RawUnit("\n".join(lines), None, stamp, ordinal, extra))
@@ -452,12 +481,21 @@ def _card_extra(board: TrelloBoard, card: TrelloCard) -> dict[str, Any]:
     }
 
 
-def _parse_card(item: dict[str, Any], list_names: dict[str, str]) -> TrelloCard | None:
+def _parse_card(
+    item: dict[str, Any],
+    list_names: dict[str, str],
+    members_by_id: dict[str, str] | None = None,
+) -> TrelloCard | None:
     card_id = str(item.get("id") or "").strip()
     list_name = list_names.get(str(item.get("idList") or ""))
     url = str(item.get("shortUrl") or item.get("url") or "").strip()
     if not card_id or not list_name or not url:
         return None
+    directory = members_by_id or {}
+    member_ids = item.get("idMembers") if isinstance(item.get("idMembers"), list) else []
+    members = tuple(
+        directory[str(member_id)] for member_id in member_ids if str(member_id) in directory
+    )
     return TrelloCard(
         card_id=card_id,
         name=normalize_text(str(item.get("name") or "")) or "Untitled card",
@@ -468,6 +506,7 @@ def _parse_card(item: dict[str, Any], list_names: dict[str, str]) -> TrelloCard 
         url=url,
         last_activity=_parse_time(item.get("dateLastActivity")),
         checklists=_checklists(item.get("checklists")),
+        members=members,
     )
 
 

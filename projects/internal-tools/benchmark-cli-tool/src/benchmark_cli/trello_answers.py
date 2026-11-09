@@ -47,8 +47,14 @@ _BARE_STATE = re.compile(
     """
 )
 _NOT_MEMBERSHIP = re.compile(
-    r"\b(?:how|why|set[\s-]?up|setup|configure|config|integrat\w*|connector|"
+    r"\b(?:why|set[\s-]?up|setup|configure|config|integrat\w*|connector|"
     r"api|sync\w*|ingest\w*|tokens?|webhooks?|work(?:ing|s)?)\b",
+    re.IGNORECASE,
+)
+_PROCEDURE = re.compile(r"\bhow\s+(?:do|does|can|should|to|did)\b", re.IGNORECASE)
+_HISTORY = re.compile(r"\b(?:add|added|did)\b", re.IGNORECASE)
+_FILLER = re.compile(
+    r"\b(?:right now|currently|today|please|just|still|on trello|on the board)\b",
     re.IGNORECASE,
 )
 _LIST_TAIL = re.compile(
@@ -128,27 +134,36 @@ def requested_trello_list(question: str) -> str | None:
     return ``None`` so ordinary retrieval still answers them.
     """
     text = " ".join(question.split())
-    if not text or _NOT_MEMBERSHIP.search(text):
+    if not text or _PROCEDURE.search(text) or _NOT_MEMBERSHIP.search(text):
         return None
     folded = text.casefold()
     if re.search(r"\b(?:cards?|tickets?|trello)\b", folded) is None:
         return None
-    if re.search(r"\b(?:which|what|list|show)\b", folded) is None:
+    if re.search(r"\b(?:which|what|list|show|how many)\b", folded) is None:
         return None
+    if _OPEN_PHRASE.search(text):
+        return OPEN_LISTS
     match = _LIST_TAIL.search(text)
     if match is None:
-        if _OPEN_PHRASE.search(text):
-            return OPEN_LISTS
         return None
-    normalized = _normalize(match.group("name").strip("\"'“”‘’"))
+    normalized = _clean_list_name(match.group("name"))
     if not normalized or len(normalized) > 40:
         return None
-    if normalized in _PROGRESS:
+    if normalized in _PROGRESS or _is_progress(normalized) or (
+        normalized == "progress" and re.search(r"\bin\s+progress\b", folded)
+    ):
         return "doing"
+    if normalized in {"done", "completed", "closed", "finished"}:
+        return "done"
     return normalized
 
 
-def trello_list_answer(requested: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse:
+def trello_list_answer(
+    requested: str,
+    rows: Sequence[TrelloCardRow],
+    *,
+    fit_to_discord: bool = True,
+) -> AnswerResponse:
     """List indexed cards in one Trello list, without descriptions or comments."""
     usable = _usable_cards(rows)
     if not usable:
@@ -186,7 +201,7 @@ def trello_list_answer(requested: str, rows: Sequence[TrelloCardRow]) -> AnswerR
             citations=[],
         )
     prefix = _open_summary(matched) if requested == OPEN_LISTS else ""
-    shown, hidden = _cards_that_fit(matched, prefix=prefix)
+    shown, hidden = _cards_that_fit(matched, prefix=prefix, fit_to_discord=fit_to_discord)
     lines = _answer_lines(shown, prefix=prefix, hidden=hidden)
     return AnswerResponse(
         status="answered",
@@ -194,6 +209,18 @@ def trello_list_answer(requested: str, rows: Sequence[TrelloCardRow]) -> AnswerR
         confidence=0.8,
         citations=[_citation(card) for card in shown],
     )
+
+
+def _clean_list_name(name: str) -> str:
+    """Drop filler and a trailing list/column word from a captured list name."""
+    text = _FILLER.sub(" ", name)
+    text = re.sub(
+        r"\b(?:column|list|lane|state|status|stage|tickets?|cards?)\b",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return _normalize(text)
 
 
 def _normalize(value: str) -> str:
@@ -313,9 +340,14 @@ def _answer_lines(cards: Sequence[TrelloCardRow], *, prefix: str, hidden: int) -
 
 
 def _cards_that_fit(
-    matched: Sequence[TrelloCardRow], *, prefix: str = ""
+    matched: Sequence[TrelloCardRow],
+    *,
+    prefix: str = "",
+    fit_to_discord: bool = True,
 ) -> tuple[list[TrelloCardRow], int]:
-    """Keep every card that fits in a Discord message, then say how many remain."""
+    """Keep every card that fits in one Discord message, unless the caller will split."""
+    if not fit_to_discord:
+        return list(matched), 0
     cap = min(len(matched), MAX_LISTED_CARDS)
     chosen = 1 if matched else 0
     for size in range(cap, 0, -1):
@@ -668,3 +700,292 @@ def answer_is_bare_cards(answer: str) -> bool:
     if not lines:
         return False
     return all(_CARD_HEADER.match(line) for line in lines)
+
+
+_BOARD_SIGNAL = re.compile(
+    r"\b(?:trello|tickets?|cards?|backlog|doing|done|sev\s*\d|in progress|in-progress|"
+    r"completed|closed|finished|assigned|assignee|due)\b|\bwhat(?:'s| is)\s+in\b",
+    re.IGNORECASE,
+)
+_DEFINITION = re.compile(r"\bwhat(?:'s| is)\s+trello\b", re.IGNORECASE)
+_DONE_WORD = re.compile(r"\b(?:completed|closed|finished)\b|\bare\s+done\b|\bbeen\s+completed\b", re.IGNORECASE)
+_DOING_WORD = re.compile(
+    r"\b(?:in progress|in-progress|active in progress)\b",
+    re.IGNORECASE,
+)
+
+
+def board_question(question: str, thread_question: str | None = None) -> bool:
+    """Whether this question, or a Trello thread follow-up, should use the card index."""
+    if _blocked_board_question(question):
+        return False
+    if (
+        requested_trello_list(question) is not None
+        or bare_list_name(question) is not None
+        or asks_for_trello_board_link(question)
+    ):
+        return True
+    if _BOARD_SIGNAL.search(question):
+        return True
+    opener = thread_question or ""
+    if opener and not _blocked_board_question(opener) and _BOARD_SIGNAL.search(opener) and _BOARD_SIGNAL.search(question):
+        return True
+    return False
+
+
+def _blocked_board_question(question: str) -> bool:
+    if _PROCEDURE.search(question) or _HISTORY.search(question) or _DEFINITION.search(question):
+        return True
+    return _NOT_MEMBERSHIP.search(question) is not None
+
+
+def _members_of(card: TrelloCardRow) -> list[str]:
+    for line in card.chunk_text.splitlines():
+        if line.strip().lower().startswith("members:"):
+            return [part.strip() for part in line.split(":", 1)[1].split(",") if part.strip()]
+    return []
+
+
+def _has_due(card: TrelloCardRow) -> bool:
+    return any(line.strip().lower().startswith("due:") for line in card.chunk_text.splitlines())
+
+
+def snapshot_payload(rows: Sequence[TrelloCardRow]) -> dict[str, object]:
+    """Structured board the model may see. Counts come from every indexed card."""
+    cards = []
+    counts: dict[str, int] = {}
+    for card in _usable_cards(rows):
+        label = _list_label(card)
+        counts[label] = counts.get(label, 0) + 1
+        cards.append(
+            {
+                "title": card.title,
+                "list": card.list_name,
+                "url": card.url,
+                "chunk_id": card.chunk_id,
+                "members": _members_of(card),
+                "due": next(
+                    (line.split(":", 1)[1].strip() for line in card.chunk_text.splitlines() if line.lower().startswith("due:")),
+                    None,
+                ),
+                "excerpt": _card_description(card)[:240],
+            }
+        )
+    return {"counts": counts, "cards": cards}
+
+
+def answer_matches_snapshot(answer: str, rows: Sequence[TrelloCardRow]) -> bool:
+    """Cited titles, URLs, list counts, and none-claims have to match the board."""
+    payload = snapshot_payload(rows)
+    cards = payload["cards"]
+    counts = payload["counts"]
+    if not isinstance(cards, list) or not isinstance(counts, dict):
+        return False
+    titles = {str(card["title"]).casefold() for card in cards if isinstance(card, dict)}
+    urls = {str(card["url"]) for card in cards if isinstance(card, dict)}
+    for url in re.findall(r"https://trello\.com/c/[A-Za-z0-9]+", answer):
+        if url not in urls:
+            return False
+    for title in re.findall(r"\[([^\]]+)\]\(https://trello\.com/c/", answer):
+        if title.casefold() not in titles:
+            return False
+    for label, count in counts.items():
+        if not isinstance(label, str) or not isinstance(count, int):
+            continue
+        escaped = re.escape(label)
+        for pattern in (
+            rf"\b{escaped}\b[^\n.]{{0,24}}?\b(\d+)\b",
+            rf"\b(\d+)\b[^\n.]{{0,24}}?\b{escaped}\b",
+        ):
+            for match in re.finditer(pattern, answer, re.IGNORECASE):
+                if int(match.group(1)) != count:
+                    return False
+        if count and re.search(
+            rf"\bno\b[^\n.]{{0,40}}\b{escaped}\b",
+            answer,
+            re.IGNORECASE,
+        ):
+            return False
+    if re.search(r"\bnone\b[^\n.]{0,40}\bdue\b", answer, re.IGNORECASE):
+        if any(isinstance(card, dict) and card.get("due") for card in cards):
+            return False
+    return True
+
+
+def prefer_validated_draft(
+    draft: AnswerResponse | None,
+    rows: Sequence[TrelloCardRow],
+    deterministic: AnswerResponse,
+) -> AnswerResponse:
+    """Keep a model draft only when every card it names is on the board."""
+    if (
+        draft is not None
+        and draft.status == "answered"
+        and draft.answer.strip()
+        and answer_matches_snapshot(draft.answer, rows)
+    ):
+        return draft
+    return deterministic
+
+
+def resolve_board_list(question: str, known_lists: Sequence[str]) -> str | None:
+    """List name from anywhere in the question. Filler such as ``right now`` is ignored."""
+    named = requested_trello_list(question)
+    if named is not None:
+        return named
+    if bare_list_name(question):
+        return bare_list_name(question)
+    if _blocked_board_question(question):
+        return None
+    text = " ".join(question.split())
+    folded = _FILLER.sub(" ", text.casefold())
+    folded = re.sub(r"\s+", " ", folded)
+    if _OPEN_PHRASE.search(text) or re.search(r"\bopen\s+(?:tickets?|cards?)\b", folded):
+        return OPEN_LISTS
+    if _DONE_WORD.search(folded):
+        return "done"
+    if _DOING_WORD.search(folded):
+        return "doing"
+    known = sorted({_normalize(name) for name in known_lists if name.strip()}, key=len, reverse=True)
+    for name in known:
+        if name and re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", folded):
+            if name in _PROGRESS or _is_progress(name):
+                return "doing"
+            if name == "done":
+                return "done"
+            return name
+    match = re.search(r"\bwhat(?:'s| is)\s+in\s+(?:the\s+)?([a-z0-9]+(?:\s+[a-z0-9]+)?)", folded)
+    if match:
+        guessed = _clean_list_name(match.group(1))
+        if guessed and guessed not in known:
+            return guessed
+    return None
+
+
+def _focus_terms(question: str) -> list[str]:
+    skip = _STATUS_SKIP | {"tell", "about", "card", "cards", "ticket", "tickets", "trello", "any", "open"}
+    terms = []
+    for token in re.findall(r"[a-z0-9]+", question.casefold()):
+        if len(token) < 3 or token in skip or token in terms:
+            continue
+        terms.append(token)
+    return terms
+
+
+def _card_focus_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
+    if re.search(r"\b(?:about|describe)\b", question, re.IGNORECASE) is None:
+        return None
+    if re.search(r"\bcards?\b", question, re.IGNORECASE) is None:
+        return None
+    terms = _focus_terms(question)
+    if not terms:
+        return None
+    usable = _usable_cards(rows)
+    matched = [card for card in usable if all(_title_has_term(card.title, term) for term in terms)]
+    if len(matched) != 1:
+        matched = [card for card in usable if any(_title_has_term(card.title, term) for term in terms)]
+    if not matched:
+        return None
+    card = matched[0]
+    excerpt = _card_description(card) or card.title
+    link = f"[{card.title}]({card.url})" if card.url.startswith("https://") else card.title
+    return AnswerResponse(
+        status="answered",
+        answer=f"{link} is on {_list_label(card)}.\n\n{excerpt}",
+        confidence=0.8,
+        citations=[_citation(card)],
+    )
+
+
+def _assignee_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
+    match = re.search(r"\b(?:assigned to|assignee)\s+([A-Za-z][A-Za-z' -]{1,40})", question, re.IGNORECASE)
+    if match is None and re.search(r"\bassigned\b", question, re.IGNORECASE) is None:
+        return None
+    usable = _usable_cards(rows)
+    if not any(_members_of(card) for card in usable):
+        return AnswerResponse(
+            status="no_relevant_information",
+            answer="Assignees are not indexed on these cards.",
+            confidence=0.0,
+            citations=[],
+        )
+    if match is None:
+        return None
+    who = match.group(1).strip(" ?.")
+    matched = [card for card in usable if any(who.casefold() in name.casefold() for name in _members_of(card))]
+    if not matched:
+        return AnswerResponse(
+            status="no_relevant_information",
+            answer=f'No indexed card lists {who} as a member.',
+            confidence=0.0,
+            citations=[],
+        )
+    return trello_list_answer(OPEN_LISTS, matched, fit_to_discord=False)
+
+
+def _due_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
+    if re.search(r"\bdue\b", question, re.IGNORECASE) is None:
+        return None
+    usable = _usable_cards(rows)
+    dated = [card for card in usable if _has_due(card)]
+    if not dated:
+        return AnswerResponse(
+            status="answered",
+            answer="None of the indexed Trello cards have a due date.",
+            confidence=0.8,
+            citations=[_citation(card) for card in usable[:1]],
+        )
+    return trello_list_answer(OPEN_LISTS, dated, fit_to_discord=False)
+
+
+def _topic_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
+    match = re.search(r"\babout\s+(?:the\s+)?(.+?)\s*\??\s*$", question, re.IGNORECASE)
+    if match is None or re.search(r"\bcards?\b", question, re.IGNORECASE):
+        return None
+    topic = match.group(1).strip(" ?.")
+    terms = [token for token in re.findall(r"[a-z0-9]+", topic.casefold()) if len(token) >= 3]
+    if not terms:
+        return None
+    usable = [
+        card
+        for card in _usable_cards(rows)
+        if _normalize(card.list_name) != "done"
+        and all(term in f"{card.title} {_card_description(card)}".casefold() for term in terms)
+    ]
+    if not usable:
+        return AnswerResponse(
+            status="no_relevant_information",
+            answer="No open Trello card matches that description.",
+            confidence=0.0,
+            citations=[],
+        )
+    return trello_list_answer(OPEN_LISTS, usable, fit_to_discord=False)
+
+
+def answer_board_question(
+    question: str,
+    rows: Sequence[TrelloCardRow],
+    *,
+    thread_question: str | None = None,
+    draft: AnswerResponse | None = None,
+) -> AnswerResponse | None:
+    """Deterministic board answer. A model draft is kept only when it matches the snapshot."""
+    if not board_question(question, thread_question) and requested_trello_list(question) is None and bare_list_name(question) is None:
+        return None
+    known = _indexed_list_names(rows)
+    bare = bare_list_name(question)
+    if bare and not any(_list_matches(name, bare) for name in known):
+        if requested_trello_list(question) is None:
+            return None
+    deterministic = (
+        _card_focus_answer(question, rows)
+        or _assignee_answer(question, rows)
+        or _due_answer(question, rows)
+        or _topic_answer(question, rows)
+    )
+    if deterministic is None:
+        requested = resolve_board_list(question, known)
+        if requested is None:
+            return None
+        deterministic = trello_list_answer(requested, rows, fit_to_discord=False)
+    return prefer_validated_draft(draft, rows, deterministic)

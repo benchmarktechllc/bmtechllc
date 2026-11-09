@@ -179,6 +179,56 @@ def _summary_total(answer: str) -> int | None:
     return total or None
 
 
+def split_discord_messages(text: str, *, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
+    """Split a long reply on line boundaries so each Discord message fits."""
+    cleaned = text.strip() or "No answer text was returned."
+    if len(cleaned) <= limit:
+        return [cleaned]
+    parts: list[str] = []
+    buffer = ""
+    for line in cleaned.split("\n"):
+        piece = line if not buffer else f"{buffer}\n{line}"
+        if len(piece) <= limit:
+            buffer = piece
+            continue
+        if buffer:
+            parts.append(buffer)
+        if len(line) <= limit:
+            buffer = line
+            continue
+        while line:
+            parts.append(line[:limit])
+            line = line[limit:]
+        buffer = ""
+    if buffer:
+        parts.append(buffer)
+    return parts or ["No answer text was returned."[:limit]]
+
+
+def format_discord_messages(
+    response: AnswerResponse, *, limit: int = DISCORD_MESSAGE_LIMIT
+) -> list[str]:
+    """One or more Discord messages. Long board lists are split, not dropped."""
+    answer = response.answer.strip() or "No answer text was returned."
+    if response.citations and _linked_list_answer(answer):
+        shown = len(response.citations)
+        total = _summary_total(answer)
+        if total is not None and total != shown:
+            footer = f"\n\n**Sources**\n{shown} shown of {total}; links are in the list above."
+        else:
+            noun = "card" if shown == 1 else "cards"
+            footer = f"\n\n**Sources**\n{shown} indexed {noun}; links are in the list above."
+        text = answer + footer
+    elif response.citations:
+        text = answer + "\n\n**Citations**\n" + "\n".join(
+            _format_citation(index, citation)
+            for index, citation in enumerate(response.citations, start=1)
+        )
+    else:
+        text = answer
+    return split_discord_messages(discord.utils.escape_mentions(text), limit=limit)
+
+
 def format_discord_answer(response: AnswerResponse, *, limit: int = DISCORD_MESSAGE_LIMIT) -> str:
     """Render an agent response, keeping citations when they fit in one message."""
     answer = response.answer.strip() or "No answer text was returned."
@@ -228,27 +278,40 @@ async def read_thread_starter(message: discord.Message) -> str | None:
     return starter.content
 
 
-async def deliver_channel_answer(message: discord.Message, body: str) -> None:
-    """Reply in the current thread, or open one on the channel message."""
+async def deliver_channel_messages(message: discord.Message, parts: list[str]) -> None:
+    """Post every part in the thread. A long answer is several messages, not one cut reply."""
+    if not parts:
+        return
     if isinstance(message.channel, discord.Thread):
-        await message.reply(body, mention_author=False, allowed_mentions=NO_MENTIONS)
+        await message.reply(parts[0], mention_author=False, allowed_mentions=NO_MENTIONS)
+        for extra in parts[1:]:
+            await message.channel.send(extra, allowed_mentions=NO_MENTIONS)
         return
     existing = message.thread
     if existing is not None:
         try:
-            await existing.send(body, allowed_mentions=NO_MENTIONS)
+            for part in parts:
+                await existing.send(part, allowed_mentions=NO_MENTIONS)
             return
         except discord.HTTPException:
             logger.warning("Could not post in the existing thread for message %s.", message.id)
     try:
         thread = await message.create_thread(name=thread_name_for(message.content))
-        await thread.send(body, allowed_mentions=NO_MENTIONS)
+        for part in parts:
+            await thread.send(part, allowed_mentions=NO_MENTIONS)
     except (discord.HTTPException, ValueError):
         logger.warning(
             "Could not open a thread on message %s; replying in the channel.",
             message.id,
         )
-        await message.reply(body, mention_author=False, allowed_mentions=NO_MENTIONS)
+        await message.reply(parts[0], mention_author=False, allowed_mentions=NO_MENTIONS)
+        for extra in parts[1:]:
+            await message.reply(extra, mention_author=False, allowed_mentions=NO_MENTIONS)
+
+
+async def deliver_channel_answer(message: discord.Message, body: str) -> None:
+    """Reply in the current thread, or open one on the channel message."""
+    await deliver_channel_messages(message, [body])
 
 
 async def _safe_followup(interaction: discord.Interaction, body: str) -> None:
@@ -323,6 +386,21 @@ class AskClient(discord.Client):
             response = await asyncio.to_thread(_invoke)
         return format_discord_answer(response)
 
+    async def answer_messages(self, question: str, *, thread_question: str | None = None) -> list[str]:
+        """Format the reply as one Discord message per 2000 characters."""
+        cleaned = question.strip()
+        if not cleaned:
+            raise ValueError("question must not be empty.")
+
+        def _invoke() -> AnswerResponse:
+            if thread_question and "thread_question" in inspect.signature(self._agent).parameters:
+                return self._agent(cleaned, thread_question=thread_question)
+            return self._agent(cleaned)
+
+        async with self._agent_lock:
+            response = await asyncio.to_thread(_invoke)
+        return format_discord_messages(response)
+
     async def on_message(self, message: discord.Message) -> None:
         channel = message.channel
         parent_id = channel.parent_id if isinstance(channel, discord.Thread) else None
@@ -357,7 +435,7 @@ class AskClient(discord.Client):
         try:
             async with message.channel.typing():
                 starter = await read_thread_starter(message)
-                body = await self.answer_question(
+                parts = await self.answer_messages(
                     message.content,
                     thread_question=thread_question_for(message.content, starter),
                 )
@@ -369,7 +447,7 @@ class AskClient(discord.Client):
                 logger.exception("Failed to send the error reply for message %s.", message.id)
             return
         try:
-            await deliver_channel_answer(message, body)
+            await deliver_channel_messages(message, parts)
         except discord.HTTPException:
             logger.exception("Failed to deliver the answer for message %s.", message.id)
 
@@ -387,12 +465,13 @@ async def ask_command(interaction: discord.Interaction, question: str) -> None:
         return
     await interaction.response.defer(thinking=True, ephemeral=False)
     try:
-        body = await client.answer_question(question)
+        parts = await client.answer_messages(question)
     except Exception:
         logger.exception("Failed to answer /ask in channel %s.", interaction.channel_id)
         await _safe_followup(interaction, FAILURE_REPLY)
         return
-    await _safe_followup(interaction, body)
+    for part in parts:
+        await _safe_followup(interaction, part)
 
 
 def main() -> None:

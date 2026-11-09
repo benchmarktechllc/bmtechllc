@@ -50,18 +50,19 @@ from .storage.postgres import (
 )
 from .trello_answers import (
     active_projects_answer,
+    answer_board_question,
     answer_is_bare_cards,
     asks_for_active_projects,
     asks_for_project_status,
     asks_for_trello_board_link,
     bare_list_name,
     board_link_from_chunk_rows,
+    board_question,
     cards_from_rows,
     indexed_list_request,
     project_status_answer,
     requested_trello_list,
     trello_board_link_answer,
-    trello_list_answer,
 )
 
 logger = logging.getLogger(__name__)
@@ -397,12 +398,16 @@ def _board_link_response(catalog: tuple[object, ...] | None) -> AnswerResponse |
     return board_link_from_chunk_rows(hits) or from_cards
 
 
-def _trello_response(question: str) -> AnswerResponse | None:
-    """List, open-board, board-link, or bare ``in <list> state?`` answers."""
+def _trello_response(question: str, thread_question: str | None = None) -> AnswerResponse | None:
+    """List, open-board, board-link, or bare ``in <list> state?`` answers.
+
+    The thread opener is an intent hint only. It is not appended to the question.
+    """
     if not (
         asks_for_trello_board_link(question)
         or requested_trello_list(question) is not None
         or bare_list_name(question) is not None
+        or board_question(question, thread_question)
     ):
         return None
     try:
@@ -414,15 +419,10 @@ def _trello_response(question: str) -> AnswerResponse | None:
         return _board_link_response(catalog)
     if catalog is None:
         return None
-    requested = requested_trello_list(question)
-    if requested is None:
-        bare = bare_list_name(question)
-        if bare is None:
+    if bare_list_name(question) and indexed_list_request(bare_list_name(question) or "", catalog) is None:
+        if requested_trello_list(question) is None:
             return None
-        requested = indexed_list_request(bare, catalog)
-        if requested is None:
-            return None
-    return trello_list_answer(requested, catalog)
+    return answer_board_question(question, catalog, thread_question=thread_question)
 
 
 def _model_question(question: str, thread_question: str | None) -> str:
@@ -492,7 +492,7 @@ def run_agent(
     if asks_for_credentials(question):
         logger.info("retrieval revision=%s outcome=credential_refused", ANSWER_PATH_REVISION)
         return _finish(credential_refusal(), outcome="credential_refused", synthesis_attempts=0)
-    trello_response = _trello_response(question)
+    trello_response = _trello_response(question, thread_question)
     if trello_response is not None:
         outcome = "trello_board" if asks_for_trello_board_link(question) else "trello_list"
         return _finish(trello_response, outcome=outcome, synthesis_attempts=0)
