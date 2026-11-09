@@ -12,11 +12,22 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from .corpus import is_boilerplate_text, is_synthetic_canary
+from .corpus import is_synthetic_canary
+from .entailment import (
+    answers_question,
+    asks_recommendation,
+    assess_claim,
+    claim_status,
+    is_not_current_recommendation,
+    meaningful_text,
+    supported_steps,
+    touches_question,
+)
 from .ingestion.clean import redact_secrets
 from .models import AnswerResponse, Citation
 from .portal_urls import portal_home_from_metadata, portal_home_url
 from .retrieval import HybridSearchResult
+from .storage.postgres import SearchChunk
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +63,6 @@ ACCEPTANCE_QUESTIONS = (
 )
 
 _CORE_TEAM = re.compile(r"\bcore[\s-]+team(?:mates?| members?)?\b", re.IGNORECASE)
-_EXPLICIT_EMPLOYEE_COUNT = re.compile(
-    r"\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+employees?\b",
-    re.IGNORECASE,
-)
 _CREDENTIAL_REQUEST = re.compile(
     r"\b(api[_ -]?key|access[_ -]?token|password|passwd|secret|private key|"
     r"personal access token|github pat|credential)\b|\bgh[pousr]_|\bgithub_pat_",
@@ -92,35 +99,90 @@ def asks_for_credentials(question: str) -> bool:
     return bool(_CREDENTIAL_REQUEST.search(question))
 
 
+# Closed class for "the site itself." Any other content word is a subresource.
+_PORTAL_REQUEST = frozenset(
+    {
+        "what", "whats", "where", "link", "url", "uri", "address", "open", "find",
+        "visit", "homepage", "send", "give", "show", "tell", "me", "the", "our",
+        "a", "an", "to", "for", "of", "is", "do", "i", "we", "please", "can",
+        "you", "my", "us", "there", "here", "in", "on", "at", "by", "with",
+        "from", "into", "about", "your", "that", "this", "it", "be", "s",
+    }
+)
+_PORTAL_SITE = frozenset({"portal", "knowledge", "base", "kb", "homepage", "home"})
+
+
 def asks_for_portal_link(question: str) -> bool:
-    """Match requests for the knowledge-base home, including paraphrases."""
-    text = question.casefold()
-    mentions_portal = re.search(r"\b(portal|knowledge[ -]?base|kb)\b", text) is not None
-    asks_where = re.search(r"\b(link|url|uri|address|homepage|home page|where)\b", text) is not None
-    return mentions_portal and asks_where
+    """Match only a request whose object is the knowledge-base home.
+
+    Procedure questions and any extra content word (a bridge, settings, a
+    status page, a second clause) stay on the ordinary answer path. The
+    allowed words are the request and the site, not a list of forbidden pages.
+    """
+    if re.search(r"\b(?:and|then|how)\b", question, flags=re.IGNORECASE):
+        return False
+    tokens = re.findall(r"[a-z0-9]+", question.casefold().replace("'", ""))
+    asks_location = any(
+        token in {"link", "url", "uri", "address", "where", "open", "find", "visit", "homepage"}
+        for token in tokens
+    )
+    names_site = any(token in {"portal", "kb", "knowledge"} for token in tokens)
+    if not asks_location or not names_site:
+        return False
+    extras = [
+        token
+        for token in tokens
+        if token not in _PORTAL_REQUEST
+        and token not in _PORTAL_SITE
+        and token not in {"bmtech", "benchmark", "benchmarktech"}
+    ]
+    return extras in ([], ["page"], ["pages"])
 
 
 def asks_for_employee_count(question: str) -> bool:
-    """Match headcount questions without treating a core-team roster as payroll."""
+    """Match only an unambiguous current BMTech headcount question."""
     text = question.casefold()
-    if re.search(r"\bcore[\s-]+team", text) and re.search(r"\b(employees?|headcount|staff)\b", text) is None:
+    if re.search(r"\b(?:joined|hired|left|rotation|on-call|on call)\b", text):
         return False
-    has_workforce = re.search(r"\b(employees?|headcount|staff)\b", text) is not None
-    asks_count = re.search(r"\b(how many|number of|count of|headcount|current)\b", text) is not None
-    return has_workforce and asks_count
+    if re.search(r"\bhow many\b.+\b(?:on|in)\s+(?:the|our)\b", text):
+        return False
+    other_subject = re.search(r"\bhow many\s+employees\s+does\s+([a-z]+)\b", text)
+    if other_subject and other_subject.group(1) not in {"bmtech", "benchmark", "benchmarktech"}:
+        return False
+    return re.search(
+        r"\bhow many\s+employees\s+does\s+bmtech\b"
+        r"|\bhow many\s+staff\s+do\s+we\b"
+        r"|\b(?:our|bmtech(?:'s)?)\s+(?:current\s+)?headcount\b",
+        text,
+    ) is not None
 
 
 def asks_for_core_team(question: str) -> bool:
-    return re.search(r"\bcore[\s-]+team", question, re.IGNORECASE) is not None
+    """Match only who the members are. Hiring and decisions fall through."""
+    text = question.casefold()
+    if re.search(r"\bcore[\s-]+team", text) is None:
+        return False
+    return re.search(
+        r"\bwho\s+(?:is|are)\b.{0,40}\bcore[\s-]+team\b"
+        r"|\bwho\s+is\s+on\s+the\s+core[\s-]+team\b"
+        r"|\bcore[\s-]+team\s+members\b"
+        r"|\bmembers\s+of\s+(?:the\s+)?core[\s-]+team\b",
+        text,
+    ) is not None
 
 
 def asks_for_synced_channels(question: str) -> bool:
-    """Match questions about which Discord channels are in the index."""
+    """Match only a catalog question. How-to requests fall through."""
     text = question.casefold()
+    if re.search(r"\bhow\s+(?:do|can|should|to)\b", text):
+        return False
+    if re.search(r"\b(?:decide|decided|decision|said|discuss(?:ed)?)\b", text):
+        return False
     return (
         re.search(r"\bdiscord\b", text) is not None
-        and re.search(r"\bchannels?\b", text) is not None
-        and re.search(r"\b(sync\w*|ingest\w*|index\w*|corpus|which|what|list)\b", text) is not None
+        and re.search(r"\bchannels\b", text) is not None
+        and re.search(r"\b(?:sync\w*|ingest\w*|index\w*)\b", text) is not None
+        and re.search(r"\b(?:which|what|list)\b", text) is not None
     )
 
 
@@ -172,17 +234,94 @@ def _company_results(results: Sequence[HybridSearchResult]) -> list[HybridSearch
     for result in results:
         if is_synthetic_canary(result.chunk.source_file, result.chunk.metadata):
             continue
-        if is_boilerplate_text(result.chunk.chunk_text):
-            continue
         kept.append(result)
     return kept
 
 
+_AFFIRMED_COUNT = re.compile(
+    r"(?P<subject>.{0,60}?)\s+"
+    r"(?<![\w'])(?:has|have|employs|employ)\s+(?:got\s+)?"
+    r"(?P<number>\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+    r"(?P<noun>employees?)\b(?P<after>\s+[A-Za-z]+)?",
+    re.IGNORECASE,
+)
+_CONDITIONAL_CLAUSE = re.compile(r"^(?:when|if|unless|whenever)\b", re.IGNORECASE)
+_CLAUSE_BREAK = re.compile(r",|(?=\b(?:while|whereas|although|though|but)\b)", re.IGNORECASE)
+_SENTENCE_HEDGE = re.compile(
+    r"\b(?:if|unless|when|whenever|would|might|could|may|should)\b|\b(?:19|20)\d{2}\b",
+    re.IGNORECASE,
+)
+_COUNT_FUNCTION_WORD = frozenset(
+    {"if", "unless", "when", "in", "at", "on", "for", "and", "or", "the", "a", "an", "to", "of", "with"}
+)
+
+
+def _subject_is_this_company(subject: str) -> bool:
+    """Require the proper name. ``The company`` alone is not attributed."""
+    folded = " ".join(subject.split()).casefold()
+    if re.search(r"\b(?:would|might|could|may|should|not)\b|\w+n't\b", folded):
+        return False
+    if re.search(r"\b(?:acme|client|customer|vendor|prospect|competitor)\b", folded):
+        return False
+    return re.search(r"\bbmtech\b|\bbenchmarktech\b|\bbenchmark tech\b", folded) is not None
+
+
+def _company_employee_count(sentence: str) -> bool:
+    """Accept only a present, unconditional count whose head noun is employees.
+
+    ``employee handbook`` is a modifier, ``would``/``might``/``if`` are not
+    current facts, ``had`` plus a year is history, and another party's subject
+    is not this company. ``hasn't`` never matches the bare verb ``has``.
+    """
+    if _SENTENCE_HEDGE.search(sentence):
+        return False
+    for clause in _CLAUSE_BREAK.split(sentence):
+        clause = clause.strip()
+        if not clause or _CONDITIONAL_CLAUSE.match(clause):
+            continue
+        match = _AFFIRMED_COUNT.search(clause)
+        if not match or not _subject_is_this_company(match.group("subject")):
+            continue
+        following = (match.group("after") or "").strip().casefold()
+        if match.group("noun").casefold() == "employee" and following and following not in _COUNT_FUNCTION_WORD:
+            continue
+        return True
+    return False
+
+
+def _people_names(sentence: str) -> list[str]:
+    """A roster entry is a full name or a coordinated list of names.
+
+    One capitalized token is also a place or an ordinary word, so ``Boston``
+    alone is not a person. ``in Boston`` is removed before the scan.
+    """
+    without_places = re.sub(r"\b(?:in|at|near|from|into)\s+[A-Z][a-z]+\b", "", sentence)
+    pairs = re.findall(r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})+\b", without_places)
+    listed = re.findall(
+        r"\b[A-Z][a-z]{2,}(?:\s*,\s*(?:and\s+)?[A-Z][a-z]{2,})+\b",
+        without_places,
+    )
+    return pairs + listed
+
+
 def _core_team_quote(text: str) -> str | None:
+    """Return a sentence that names members. Activity and denials are not a roster."""
     redacted = redact_secrets(text)
     for sentence in re.split(r"(?<=[.!?])\s+|\n+", redacted):
-        cleaned = sentence.strip()
-        if cleaned and _CORE_TEAM.search(cleaned) and cleaned in redacted:
+        cleaned = sentence.strip(" \t#")
+        if not cleaned or cleaned not in redacted or not _CORE_TEAM.search(cleaned):
+            continue
+        if re.search(r"\bnot\b|\w+n't\b", cleaned, flags=re.IGNORECASE):
+            continue
+        if re.search(
+            r"\b(?:are|is)\s+(?:on\s+)?the\s+core[\s-]+team\b"
+            r"|\bcore[\s-]+team\s+members\s+are\b"
+            r"|\b(?:includes?|consists\s+of|named)\b",
+            cleaned,
+            flags=re.IGNORECASE,
+        ) is None:
+            continue
+        if _people_names(cleaned):
             return cleaned
     return None
 
@@ -231,7 +370,7 @@ def stated_employee_count_answer(results: Sequence[HybridSearchResult]) -> Answe
         redacted = redact_secrets(result.chunk.chunk_text)
         for sentence in re.split(r"(?<=[.!?])\s+|\n+", redacted):
             cleaned = sentence.strip()
-            if not cleaned or not _EXPLICIT_EMPLOYEE_COUNT.search(cleaned) or cleaned not in redacted:
+            if not cleaned or cleaned not in redacted or not _company_employee_count(cleaned):
                 continue
             citation = _citation(result, cleaned)
             if citation is None:
@@ -246,21 +385,8 @@ def stated_employee_count_answer(results: Sequence[HybridSearchResult]) -> Answe
 
 
 def employee_count_answer(results: Sequence[HybridSearchResult]) -> AnswerResponse:
-    """Refuse to turn a core-team sentence into a headcount."""
-    for result in _company_results(results):
-        quote = _core_team_quote(result.chunk.chunk_text)
-        citation = _citation(result, quote or "")
-        if quote and citation is not None:
-            return AnswerResponse(
-                status="answered",
-                answer=(
-                    f"{_COUNT_UNCERTAINTY}\n\n"
-                    "The evidence does identify this, which is not a headcount:\n\n"
-                    f"{quote}"
-                ),
-                confidence=0.6,
-                citations=[citation],
-            )
+    """State that no headcount was found. Collaborator names are not a count."""
+    del results
     return AnswerResponse(
         status="no_relevant_information",
         answer=_COUNT_UNCERTAINTY,
@@ -329,9 +455,356 @@ def synced_channels_answer(channels: Sequence[SyncedDiscordChannel]) -> AnswerRe
     )
 
 
+_NOT_RESPONSIVE = (
+    "The retrieved evidence does not address this question. "
+    "What it does not say is unknown."
+)
+_NOT_CURRENT_RECOMMENDATION = (
+    "The cited text is not a current recommendation. "
+    "It reads as an older note or brainstorm, not a decision about who to hire now."
+)
+_REQUESTED_DOCS = (
+    ("deployment guide", ("deployment guide", "deploy guide")),
+    ("runbook", ("runbook", "runbooks")),
+    ("playbook", ("playbook", "playbooks")),
+    ("employee handbook", ("employee handbook",)),
+)
+_PLAN_QUALIFICATION = (
+    "The retrieved evidence does not explicitly state that this was approved, decided, or completed. "
+    "What follows is cited text, and it is not a final decision."
+)
+_STATUS_TOKEN = re.compile(
+    r"\bstatus\s*[:=]\s*[^\n.]*|\b(?:no_relevant_information|nothing matched)\b",
+    re.IGNORECASE,
+)
+
+
+def _cited_chunks(response: AnswerResponse, chunks: Sequence[SearchChunk]) -> list[SearchChunk]:
+    by_id = {chunk.id: chunk for chunk in chunks}
+    return [by_id[citation.chunk_id] for citation in response.citations if citation.chunk_id in by_id]
+
+
+def _requested_documents(question: str) -> list[tuple[str, tuple[str, ...]]]:
+    text = question.casefold()
+    return [item for item in _REQUESTED_DOCS if any(alias in text for alias in item[1])]
+
+
+def _norm_phrase(text: str) -> str:
+    """Fold hyphens, underscores, and file extensions into words."""
+    folded = text.casefold()
+    folded = re.sub(r"\.[a-z0-9]{1,8}\b", " ", folded)
+    return f" {re.sub(r'[^a-z0-9]+', ' ', folded).strip()} "
+
+
+def _identity_has(identity: str, alias: str) -> bool:
+    norm = _norm_phrase(identity)
+    phrase = _norm_phrase(alias).strip()
+    return f" {phrase} " in norm or f" {phrase}s " in norm
+
+
+def _chunk_identity_text(chunk: SearchChunk) -> str:
+    """Identity comes from source metadata, not a passing mention in the body."""
+    metadata = chunk.metadata or {}
+    return " ".join(
+        (
+            chunk.source_file,
+            str(metadata.get("title") or ""),
+            str(metadata.get("url") or ""),
+            str(metadata.get("section") or ""),
+            str(metadata.get("kb_section") or ""),
+        )
+    )
+
+
+def _is_howto(question: str) -> bool:
+    """A procedure question. A comparison that happens to start with ``how`` is not one."""
+    if re.search(
+        r"\b(?:differ(?:s|ence|ent)?|compar(?:e|ison|ing|ed)|versus|vs\.?|between)\b",
+        question,
+        flags=re.IGNORECASE,
+    ):
+        return False
+    return re.search(r"\bhow\s+(?:do|can|should|to)\b", question, flags=re.IGNORECASE) is not None
+
+
+def _asks_outcome(question: str) -> bool:
+    return re.search(
+        r"\b(?:decision|decisions|decided|approved|complete|completed|final|finalized|done|hire|hired)\b",
+        question,
+        flags=re.IGNORECASE,
+    ) is not None
+
+
+def _is_document_lookup(question: str) -> bool:
+    """A page lookup, not a comparison or explanation of the ideas."""
+    if re.search(
+        r"\b(?:differ(?:s|ence|ent)?|compar(?:e|ison|ing|ed)|versus|vs\.?|between|rather)\b",
+        question,
+        flags=re.IGNORECASE,
+    ):
+        return False
+    return re.search(
+        r"\b(?:where|find|link|url|locate|which\s+(?:page|document))\b",
+        question,
+        flags=re.IGNORECASE,
+    ) is not None
+
+
+def _without_orphan_citation_sentences(answer: str, citation_count: int) -> str:
+    """Drop a sentence whose inline marker does not name a returned citation."""
+    kept: list[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+", answer.strip()):
+        numbers = [int(value) for value in re.findall(r"\[(\d+)\]", sentence)]
+        numbers.extend(int(value) for value in re.findall(r"【(\d+)】", sentence))
+        if any(number < 1 or number > citation_count for number in numbers):
+            continue
+        kept.append(sentence)
+    return " ".join(kept).strip()
+
+
+def _abstain(answer: str) -> AnswerResponse:
+    return AnswerResponse(status="no_relevant_information", answer=answer, confidence=0.0, citations=[])
+
+
+def _chunk_label(chunk: SearchChunk) -> str:
+    metadata = chunk.metadata or {}
+    title = str(metadata.get("title") or "").strip()
+    url = str(metadata.get("url") or "").strip()
+    if title and url:
+        return f"{title} ({url})"
+    return title or url or chunk.source_file
+
+
+def _excerpts(response: AnswerResponse) -> str:
+    return "\n".join(f"- {citation.quote}" for citation in response.citations)
+
+
+def _with_note(response: AnswerResponse, note: str) -> AnswerResponse:
+    return response.model_copy(
+        update={
+            "answer": f"{note}\n\n{_excerpts(response)}",
+            "confidence": min(response.confidence, 0.4),
+        }
+    )
+
+
+def _identity_gap(question: str, cited: Sequence[SearchChunk]) -> str | None:
+    """A page lookup whose metadata is a different document. Comparisons are not lookups."""
+    if not _is_document_lookup(question):
+        return None
+    for label, aliases in _requested_documents(question):
+        if any(
+            any(_identity_has(_chunk_identity_text(chunk), alias) for alias in aliases) for chunk in cited
+        ):
+            return None
+        if not cited:
+            return None
+        closest = _chunk_label(cited[0])
+        return (
+            f"No retrieved page is identified as the {label}. "
+            f"The closest cited page is {closest}. "
+            "That page is not established as the requested document."
+        )
+    return None
+
+
+def _page_is_identified(question: str, cited: Sequence[SearchChunk]) -> bool:
+    if not _is_document_lookup(question):
+        return False
+    for _label, aliases in _requested_documents(question):
+        if any(
+            any(_identity_has(_chunk_identity_text(chunk), alias) for alias in aliases) for chunk in cited
+        ):
+            return True
+    return False
+
+
+def _split_sentences(answer: str) -> list[str]:
+    return [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", answer.strip()) if sentence.strip()]
+
+
+def _is_comparison(question: str) -> bool:
+    return re.search(
+        r"\b(?:differ(?:s|ence|ent)?|compar(?:e|ison|ing|ed)|versus|vs\.?|between)\b",
+        question,
+        flags=re.IGNORECASE,
+    ) is not None
+
+
+def _rendered(response: AnswerResponse, text: str) -> AnswerResponse | None:
+    """Ship only an answer that still says something."""
+    cleaned = text.strip()
+    if not meaningful_text(cleaned):
+        return None
+    if cleaned == response.answer.strip():
+        return response
+    return response.model_copy(update={"answer": cleaned, "confidence": min(response.confidence, 0.4)})
+
+
+def qualify_grounded_answer(
+    question: str,
+    response: AnswerResponse,
+    chunks: Sequence[SearchChunk],
+) -> AnswerResponse:
+    """Keep supported, responsive synthesis. Do not ship numbering or an off-topic quote.
+
+    Entailment allows a paraphrase. It does not treat quote containment, a
+    shared verb, or an -ed spelling as proof. A page lookup that is not the
+    requested document keeps the closest-page qualification. A comparison the
+    evidence supports is kept as that comparison.
+    """
+    if response.status != "answered" or not response.citations:
+        return response
+    visible = _without_orphan_citation_sentences(response.answer, len(response.citations))
+    response = response.model_copy(update={"answer": visible})
+    cited = _cited_chunks(response, chunks)
+    quoted = "\n".join(citation.quote for citation in response.citations)
+    identity = " ".join(_chunk_identity_text(chunk) for chunk in cited)
+    if _is_howto(question) and not answers_question(question, quoted, require_all=True):
+        return _abstain(_NOT_RESPONSIVE)
+    topical = [citation for citation in response.citations if touches_question(question, citation.quote)]
+    relevant = [citation for citation in topical if answers_question(question, citation.quote)]
+    kept: list[str] = []
+    unsupported_decision = False
+    for sentence in _split_sentences(visible):
+        if not meaningful_text(sentence):
+            continue
+        verdict = next(
+            (
+                assess_claim(sentence, citation.quote, identity)
+                for citation in relevant
+                if assess_claim(sentence, citation.quote, identity) == "supported"
+            ),
+            "unknown",
+        )
+        if verdict == "supported":
+            kept.append(sentence)
+            continue
+        if claim_status(sentence) == "decided":
+            unsupported_decision = True
+            continue
+        partial = supported_steps(sentence, quoted)
+        if partial and meaningful_text(partial) and answers_question(question, partial):
+            kept.append(partial)
+    disclaimer = _identity_gap(question, cited)
+    topical_text = "\n".join(f"- {citation.quote}" for citation in topical)
+    relevant_text = "\n".join(f"- {citation.quote}" for citation in relevant)
+    cited_text = _excerpts(response)
+    if disclaimer:
+        body = cited_text if meaningful_text(cited_text) else ""
+        text = disclaimer if not body else f"{disclaimer}\n\n{body}"
+        rendered = _rendered(response, text)
+        return rendered if rendered is not None else _abstain(_NOT_RESPONSIVE)
+    if kept and kept == _split_sentences(visible) and meaningful_text(visible):
+        if relevant and len(relevant) != len(response.citations):
+            return response.model_copy(update={"citations": relevant})
+        return response
+    if kept:
+        rendered = _rendered(
+            response.model_copy(update={"citations": relevant or response.citations}),
+            " ".join(kept),
+        )
+        if rendered is not None:
+            return rendered
+    if (
+        asks_recommendation(question)
+        and touches_question(question, quoted)
+        and is_not_current_recommendation(quoted)
+        and meaningful_text(topical_text)
+    ):
+        rendered = _rendered(
+            response.model_copy(update={"citations": topical}),
+            f"{_NOT_CURRENT_RECOMMENDATION}\n\n{topical_text}",
+        )
+        if rendered is not None:
+            return rendered
+    if (
+        unsupported_decision
+        and touches_question(question, quoted)
+        and claim_status(quoted) != "decided"
+        and meaningful_text(topical_text)
+    ):
+        rendered = _rendered(
+            response.model_copy(update={"citations": topical}),
+            f"{_PLAN_QUALIFICATION}\n\n{topical_text}",
+        )
+        if rendered is not None:
+            return rendered
+    if (
+        not kept
+        and _asks_outcome(question)
+        and touches_question(question, quoted)
+        and meaningful_text(topical_text)
+    ):
+        if claim_status(quoted) == "decided":
+            rendered = _rendered(response.model_copy(update={"citations": topical}), topical_text)
+        else:
+            rendered = _rendered(
+                response.model_copy(update={"citations": topical}),
+                f"{_PLAN_QUALIFICATION}\n\n{topical_text}",
+            )
+        if rendered is not None:
+            return rendered
+    if _is_comparison(question) and relevant_text and answers_question(question, relevant_text):
+        rendered = _rendered(response.model_copy(update={"citations": relevant}), relevant_text)
+        if rendered is not None:
+            return rendered
+    if _page_is_identified(question, cited) and meaningful_text(relevant_text):
+        rendered = _rendered(response.model_copy(update={"citations": relevant}), relevant_text)
+        if rendered is not None:
+            return rendered
+    if _is_howto(question) and relevant_text and answers_question(question, relevant_text, require_all=True):
+        rendered = _rendered(response.model_copy(update={"citations": relevant}), relevant_text)
+        if rendered is not None:
+            return rendered
+    return _abstain(_NOT_RESPONSIVE)
+
+
+def supported_outcome_answer(
+    question: str,
+    results: Sequence[HybridSearchResult],
+) -> AnswerResponse | None:
+    """When the model abstains, still show on-topic outcome evidence.
+
+    A recorded decision is quoted as that decision. A plan is quoted with an
+    explicit note that it is not final. Off-topic chunks are not dumped.
+    """
+    if not _asks_outcome(question):
+        return None
+    citations: list[Citation] = []
+    for result in results:
+        if not touches_question(question, result.chunk.chunk_text):
+            continue
+        quote = verbatim_excerpt(result.chunk.chunk_text)
+        citation = _citation(result, quote)
+        if citation is not None:
+            citations.append(citation)
+    if not citations:
+        return None
+    decided = [citation.quote for citation in citations if claim_status(citation.quote) == "decided"]
+    if decided:
+        answer = "\n".join(f"- {quote}" for quote in decided)
+    elif asks_recommendation(question) and is_not_current_recommendation("\n".join(c.quote for c in citations)):
+        answer = _NOT_CURRENT_RECOMMENDATION + "\n\n" + "\n".join(f"- {c.quote}" for c in citations)
+    else:
+        answer = _PLAN_QUALIFICATION + "\n\n" + "\n".join(f"- {citation.quote}" for citation in citations)
+    if not meaningful_text(answer):
+        return None
+    return AnswerResponse(status="answered", answer=answer, confidence=0.4, citations=citations)
+
+
+def _plain_answer(answer: str) -> str:
+    """Drop an internal status dump, including ``status : nothing matched``."""
+    if _STATUS_TOKEN.search(answer) is None:
+        return answer
+    cleaned = _STATUS_TOKEN.sub(" ", answer)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" \n\t-:;,.")
+    return cleaned or _NOT_RESPONSIVE
+
+
 def scrub_response(response: AnswerResponse) -> AnswerResponse:
-    """Remove credential material from answer text and citation quotes."""
-    answer = redact_secrets(response.answer)
+    """Remove credential material and internal status codes from visible text."""
+    answer = _plain_answer(redact_secrets(response.answer))
     citations = []
     for citation in response.citations:
         quote = redact_secrets(citation.quote).strip()

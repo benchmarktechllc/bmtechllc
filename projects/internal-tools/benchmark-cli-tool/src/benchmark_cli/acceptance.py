@@ -135,32 +135,44 @@ def _check(question: str, payload: dict[str, object], *, home: str | None) -> li
 
 
 def _outcome(question: str, payload: dict[str, object], failures: list[str]) -> dict[str, object]:
+    """Proof requires the answer's claim, not merely status == answered."""
     status = str(payload.get("status") or "")
+    answer = str(payload.get("answer") or "")
+    citations = payload.get("citations")
+    has_citations = isinstance(citations, list) and bool(citations)
     if failures:
-        kind = "failed"
-        proves = False
-        expectation = "must_answer"
-    elif asks_for_portal_link(question):
-        kind = "answered"
-        proves = True
-        expectation = "must_answer"
-    elif asks_for_synced_channels(question):
-        kind = "answered"
-        proves = True
-        expectation = "must_answer"
-    elif asks_for_employee_count(question):
-        kind = "unknown" if status != "answered" else "answered"
-        proves = status == "answered"
-        expectation = "unknown_ok"
-    elif asks_for_core_team(question):
-        kind = "unknown" if status != "answered" else "answered"
-        proves = status == "answered"
-        expectation = "unknown_ok"
-    else:
-        kind = "answered" if status == "answered" else "unknown"
-        proves = status == "answered"
-        expectation = "must_answer"
-    return {"outcome": kind, "proves_fact": proves, "expectation": expectation}
+        return {"outcome": "failed", "proves_fact": False, "expectation": "must_answer"}
+    if asks_for_portal_link(question):
+        proves = status == "answered" and "https://" in answer and has_citations
+        return {"outcome": "answered" if proves else "unknown", "proves_fact": proves, "expectation": "must_answer"}
+    if asks_for_synced_channels(question):
+        proves = status == "answered" and "#" in answer and has_citations
+        return {"outcome": "answered" if proves else "unknown", "proves_fact": proves, "expectation": "must_answer"}
+    if asks_for_employee_count(question):
+        proves = (
+            status == "answered"
+            and _DIGIT_EMPLOYEE_COUNT.search(answer) is not None
+            and _COUNT_UNCERTAINTY not in answer.casefold()
+            and has_citations
+        )
+        return {
+            "outcome": "answered" if proves else "unknown",
+            "proves_fact": proves,
+            "expectation": "unknown_ok",
+        }
+    if asks_for_core_team(question):
+        proves = (
+            status == "answered"
+            and _NO_CORE_TEAM not in answer.casefold()
+            and "not an employee" in answer.casefold()
+            and has_citations
+        )
+        return {
+            "outcome": "answered" if proves else "unknown",
+            "proves_fact": proves,
+            "expectation": "unknown_ok",
+        }
+    return {"outcome": "unknown", "proves_fact": False, "expectation": "not_classified"}
 
 
 def run_acceptance() -> dict[str, object]:

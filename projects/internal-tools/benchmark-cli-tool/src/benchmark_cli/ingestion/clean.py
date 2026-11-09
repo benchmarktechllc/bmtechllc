@@ -12,7 +12,6 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-_BOT_NAME = re.compile(r"(?:bot|webhook|github|ci|jenkins|dependabot)$", re.IGNORECASE)
 _URL_ONLY = re.compile(r"^https?://\S+$", re.IGNORECASE)
 _TIMESTAMP_GUTTER = re.compile(
     r"(?:^|\s)(?:\[?\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\]?\s*(?:-->)?|\(\d{1,2}:\d{2}\))(?:\s|$)"
@@ -33,14 +32,24 @@ _SECRET_PATTERNS = (
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    # Discord bot and MFA tokens are three dot-separated segments, or an mfa. prefix.
+    re.compile(r"\b[\w-]{24,}\.[\w-]{6}\.[\w-]{27,}\b"),
+    re.compile(r"\bmfa\.[\w-]{20,}\b"),
 )
-_NON_AUTHORITATIVE = re.compile(
-    r"no relevant information was found in the company document library"
-    r"|there is no information available regarding"
-    r"|retrieved evidence does not contain any specific link"
-    r"|i couldn't answer that just now"
-    r"|new documentation published",
-    re.IGNORECASE,
+# Whole-message templates only. A longer human sentence that merely contains
+# one of these phrases is historical evidence and must be kept.
+_EXACT_BOT_MESSAGES = frozenset(
+    {
+        "no relevant information was found in the company document library",
+        "no relevant information was found in the company document library.",
+        "i couldn't answer that just now",
+        "i couldn't answer that just now.",
+        "retrieved evidence does not contain any specific link",
+        "retrieved evidence does not contain any specific link.",
+        "new documentation published",
+        "new documentation published.",
+        "📚 new documentation published",
+    }
 )
 _SECTION_PATTERN = re.compile(r"^\s*(?:\d+[.)]\s*)?([^:]{2,100}):(?:\s|$)")
 _NUMBERED_HEADING_PATTERN = re.compile(r"^\s*\d+(?:\.\d+)*\.?\s+(.{2,100})\s*$")
@@ -141,11 +150,19 @@ def redact_secrets(text: str) -> str:
     return redacted
 
 
+def message_is_exact_bot_template(text: str) -> bool:
+    """Return whether the whole message is a known bot reply, not a longer note."""
+    return " ".join(text.split()).casefold() in _EXACT_BOT_MESSAGES
+
+
 def discord_message_is_authoritative(text: str, author_name: str = "") -> bool:
-    """Drop bot abstentions and notification templates so they cannot become evidence."""
-    if _BOT_NAME.search(author_name or ""):
-        return False
-    return _NON_AUTHORITATIVE.search(text) is None
+    """Keep stored messages. Display names and template text are not bot identity.
+
+    Live ingestion skips accounts only when Discord marks ``bot``, ``webhook_id``,
+    or ``application_id``. Reconcile must not delete rows from a name or a phrase.
+    """
+    del text, author_name
+    return True
 
 
 def normalize_text(text: str) -> str:
@@ -227,7 +244,6 @@ def discord_units_from_messages(
             or author.get("system")
             or message.get("webhook_id")
             or message.get("application_id")
-            or _BOT_NAME.search(author_name)
         ):
             continue
         kind = str(message.get("type", message.get("Type", "Default")))
@@ -238,8 +254,6 @@ def discord_units_from_messages(
         )
         content = normalize_text(content)
         if len(content) < 3 or _URL_ONLY.fullmatch(content):
-            continue
-        if not discord_message_is_authoritative(content, author_name):
             continue
         reference = message.get("message_reference", message.get("reference", message.get("replyTo")))
         reply_to: str | None
@@ -296,9 +310,7 @@ def parse_discord(path: Path) -> Iterator[RawUnit]:
             continue
         speaker = match.group("speaker").strip()
         content = normalize_text(match.group("text"))
-        if _BOT_NAME.search(speaker) or len(content) < 3 or _URL_ONLY.fullmatch(content):
-            continue
-        if not discord_message_is_authoritative(content, speaker):
+        if len(content) < 3 or _URL_ONLY.fullmatch(content):
             continue
         timestamp = _parse_datetime(match.group("time"))
         if timestamp is not None and timestamp.tzinfo is None and export_timezone is not None:

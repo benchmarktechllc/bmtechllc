@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "benchmark-cli-tool"
-version = "0.1.2"
+version = "0.1.8"
 description = "Document ingestion, hybrid retrieval, and retrieval evaluation"
 requires-python = ">=3.11"
 dependencies = [

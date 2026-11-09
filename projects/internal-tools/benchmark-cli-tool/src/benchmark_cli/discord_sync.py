@@ -20,12 +20,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .config import DISCORD_API_BASE_URL, DISCORD_INGEST_BOT_TOKEN, DISCORD_INGEST_CHANNEL_IDS
-from .ingestion.clean import (
-    RawUnit,
-    discord_message_is_authoritative,
-    discord_units_from_messages,
-    normalize_text,
-)
+from .ingestion.clean import RawUnit, discord_units_from_messages, normalize_text
 from .ingestion.pipeline import ingest_units
 from .storage.postgres import (
     DiscordSourceMessage,
@@ -159,7 +154,7 @@ def _stored_units(messages: Sequence[DiscordSourceMessage]) -> list[RawUnit]:
     units: list[RawUnit] = []
     for message in messages:
         text = normalize_text(message.message_text)
-        if not text or not discord_message_is_authoritative(text, message.author_name):
+        if not text:
             continue
         units.append(
             RawUnit(
@@ -192,17 +187,13 @@ class DiscordReconcilePlan:
 
 
 def plan_discord_reconcile(messages: Sequence[DiscordSourceMessage]) -> DiscordReconcilePlan:
-    """Redact secrets and drop bot abstentions already stored from earlier syncs."""
+    """Redact secrets in stored messages. Do not delete rows from names or phrases."""
     rewritten: list[DiscordSourceMessage] = []
-    deleted: list[str] = []
     for message in messages:
         cleaned = normalize_text(message.message_text)
-        if not cleaned or not discord_message_is_authoritative(cleaned, message.author_name):
-            deleted.append(message.message_id)
-            continue
-        if cleaned != message.message_text:
+        if cleaned and cleaned != message.message_text:
             rewritten.append(replace_message(message, cleaned))
-    return DiscordReconcilePlan(tuple(rewritten), tuple(deleted))
+    return DiscordReconcilePlan(tuple(rewritten), ())
 
 
 def replace_message(message: DiscordSourceMessage, text: str) -> DiscordSourceMessage:
