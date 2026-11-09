@@ -13,6 +13,15 @@ from .storage.postgres import SearchChunk, SearchFilters, fts_search, vector_sea
 
 CANDIDATE_LIMIT = 40
 RRF_K = 60
+RETRIEVAL_SOURCES = (
+    "discord",
+    "kb_page",
+    "trello",
+    "transcript",
+    "policy_doc",
+    "user_contributed",
+)
+PER_SOURCE_LIMIT = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +81,43 @@ def rrf_fuse(
     )
 
 
+def source_type_of(result: HybridSearchResult) -> str:
+    """Indexed source family for one hit. Missing metadata is its own bucket."""
+    return str((result.chunk.metadata or {}).get("source_type") or "other")
+
+
+def apply_source_quota(
+    ranked: Sequence[HybridSearchResult],
+    *,
+    per_source: int = PER_SOURCE_LIMIT,
+    limit: int = 16,
+) -> list[HybridSearchResult]:
+    """Keep the top hits from each source so one source cannot fill the context."""
+    if per_source < 1 or limit < 1:
+        return []
+    chosen: list[HybridSearchResult] = []
+    overflow: list[HybridSearchResult] = []
+    counts: dict[str, int] = {}
+    seen: set[int] = set()
+    for result in ranked:
+        if result.chunk.id in seen:
+            continue
+        seen.add(result.chunk.id)
+        source = source_type_of(result)
+        if counts.get(source, 0) < per_source:
+            chosen.append(result)
+            counts[source] = counts.get(source, 0) + 1
+        else:
+            overflow.append(result)
+        if len(chosen) >= limit:
+            return chosen
+    for result in overflow:
+        if len(chosen) >= limit:
+            break
+        chosen.append(result)
+    return chosen
+
+
 def search_docs(
     query: str,
     top_k: int = 5,
@@ -80,6 +126,7 @@ def search_docs(
     source: str | None = None,
     date: str | None = None,
     include_synthetic: bool = False,
+    source_type: str | None = None,
 ) -> list[HybridSearchResult]:
     """Run filtered 20-per-arm keyword/vector retrieval and return RRF top results."""
     if not query.strip():
@@ -99,6 +146,7 @@ def search_docs(
             source=filters.source,
             date=filters.date,
             include_synthetic=filters.include_synthetic,
+            source_type=source_type,
         )
         fts_future = executor.submit(
             fts_search,
@@ -108,6 +156,7 @@ def search_docs(
             source=filters.source,
             date=filters.date,
             include_synthetic=filters.include_synthetic,
+            source_type=source_type,
         )
         vector_candidates = vector_future.result()
         fts_candidates = fts_future.result()
@@ -139,16 +188,21 @@ def retrieve_evidence(
         raise ValueError("min_cosine_similarity must be between 0 and 1.")
     if min_keyword_overlap < 0:
         raise ValueError("min_keyword_overlap must not be negative.")
-    results = tuple(
-        search_docs(
-            query,
-            top_k,
-            speaker=speaker,
-            source=source,
-            date=date,
-            include_synthetic=include_synthetic,
+    pooled: list[HybridSearchResult] = []
+    per_source = max(PER_SOURCE_LIMIT, 1)
+    for source_type in (*RETRIEVAL_SOURCES, None):
+        pooled.extend(
+            search_docs(
+                query,
+                per_source,
+                speaker=speaker,
+                source=source,
+                date=date,
+                include_synthetic=include_synthetic,
+                source_type=source_type,
+            )
         )
-    )
+    results = tuple(apply_source_quota(pooled, per_source=per_source, limit=max(top_k, per_source * 4)))
     top_cosine = max(
         (result.vector_score for result in results if result.vector_score is not None), default=None
     )

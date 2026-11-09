@@ -128,6 +128,7 @@ class SearchFilters:
     source: str | None = None
     date: str | None = None
     include_synthetic: bool = False
+    source_type: str | None = None
 
     def __post_init__(self) -> None:
         for field_name, value in (("speaker", self.speaker), ("source", self.source)):
@@ -905,6 +906,9 @@ def _filters_where_clause(filters: SearchFilters) -> tuple[str, list[str]]:
     if filters.source is not None:
         clauses.append("source_file = %s")
         parameters.append(filters.source)
+    if filters.source_type is not None:
+        clauses.append("metadata ->> 'source_type' = %s")
+        parameters.append(filters.source_type)
     if filters.date is not None:
         clauses.append(
             """(
@@ -931,12 +935,19 @@ def vector_search(
     source: str | None = None,
     date: str | None = None,
     include_synthetic: bool = False,
+    source_type: str | None = None,
 ) -> list[SearchChunk]:
     """Return vector-ranked candidates independently of keyword retrieval."""
     if limit < 1:
         return []
     filter_clause, filter_parameters = _filters_where_clause(
-        SearchFilters(speaker, source, date, include_synthetic=include_synthetic)
+        SearchFilters(
+            speaker,
+            source,
+            date,
+            include_synthetic=include_synthetic,
+            source_type=source_type,
+        )
     )
     statement = """
         SELECT id, source_file, chunk_index, chunk_text, metadata,
@@ -964,12 +975,19 @@ def fts_search(
     source: str | None = None,
     date: str | None = None,
     include_synthetic: bool = False,
+    source_type: str | None = None,
 ) -> list[SearchChunk]:
     """Return PostgreSQL full-text-ranked candidates independently of vectors."""
     if not query.strip() or limit < 1:
         return []
     filter_clause, filter_parameters = _filters_where_clause(
-        SearchFilters(speaker, source, date, include_synthetic=include_synthetic)
+        SearchFilters(
+            speaker,
+            source,
+            date,
+            include_synthetic=include_synthetic,
+            source_type=source_type,
+        )
     )
     statement = """
         WITH query AS (

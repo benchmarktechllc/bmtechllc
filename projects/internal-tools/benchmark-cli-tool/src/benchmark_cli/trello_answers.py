@@ -713,7 +713,7 @@ _WHO_OWNS = re.compile(
     re.IGNORECASE,
 )
 _BOARD_OVERVIEW = re.compile(
-    r"\bwhat(?:'s| is)\s+on\s+(?:the\s+)?(?:trello\s+)?board\b",
+    r"\bwhat(?:'s| is)\s+on\s+(?:the\s+)?(?:trello\s+)?board\b|\bsummarize the board\b",
     re.IGNORECASE,
 )
 _URGENT = re.compile(r"\b(?:most\s+urgent|urgent\s+tickets?|highest\s+severity)\b", re.IGNORECASE)
@@ -738,8 +738,25 @@ _DOING_WORD = re.compile(
 )
 
 
+_CURRENT_WORK = re.compile(
+    r"\b(?:currently working|working on|everyone working)\b|\bworking\b",
+    re.IGNORECASE,
+)
+
+
+def asks_for_current_work(question: str) -> bool:
+    """Tickets being worked on now. A named card's assignee stays on that path."""
+    if _WHO_OWNS.search(question) or _PROCEDURE.search(question) or _HISTORY.search(question):
+        return False
+    if _CURRENT_WORK.search(question) is None:
+        return False
+    return re.search(r"\b(?:tickets?|cards?|trello|everyone)\b", question, re.IGNORECASE) is not None
+
+
 def board_question(question: str, thread_question: str | None = None) -> bool:
     """Whether this question, or a Trello thread follow-up, should use the card index."""
+    if asks_for_current_work(question) or re.search(r"\bblocked\b", question, re.IGNORECASE):
+        return True
     if _WHO_OWNS.search(question) and _PROCEDURE.search(question) is None and _HISTORY.search(question) is None:
         return True
     if _blocked_board_question(question):
@@ -1214,6 +1231,32 @@ def _urgent_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerRespon
     )
 
 
+def _current_work_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
+    """Doing is the list of tickets currently being worked on."""
+    if not asks_for_current_work(question):
+        return None
+    return trello_list_answer("doing", rows, fit_to_discord=False)
+
+
+def _blocked_work_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
+    if re.search(r"\bblocked\b", question, re.IGNORECASE) is None:
+        return None
+    usable = [
+        card
+        for card in _usable_cards(rows)
+        if "blocked" in card.title.casefold()
+        or any("block" in label.casefold() for label in _labels_of(card))
+    ]
+    if not usable:
+        return AnswerResponse(
+            status="no_relevant_information",
+            answer="No indexed Trello card is tagged blocked.",
+            confidence=0.0,
+            citations=[],
+        )
+    return trello_list_answer(OPEN_LISTS, usable, fit_to_discord=False)
+
+
 def _state_count(question: str, response: AnswerResponse, rows: Sequence[TrelloCardRow]) -> AnswerResponse:
     """Say the list size in words when the question asks how many."""
     if response.status != "answered" or re.search(r"\bhow many\b", question, re.IGNORECASE) is None:
@@ -1259,6 +1302,8 @@ def answer_board_question(
         or _topic_answer(question, rows)
         or _overview_answer(question, rows)
         or _urgent_answer(question, rows)
+        or _current_work_answer(question, rows)
+        or _blocked_work_answer(question, rows)
     )
     if deterministic is None:
         requested = resolve_board_list(question, known)

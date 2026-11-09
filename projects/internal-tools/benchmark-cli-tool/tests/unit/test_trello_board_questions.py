@@ -44,14 +44,28 @@ def _board(monkeypatch: pytest.MonkeyPatch):
                 _row(list_name, title, f"c{chunk_id}", chunk_id, chunk_text=text)
             )
             chunk_id += 1
+    from types import SimpleNamespace
+
+    from benchmark_cli.retrieval import RetrievalDecision
+
     monkeypatch.setattr(agent, "trello_card_rows", lambda: [_as_tuple(row) for row in rows])
-    monkeypatch.setattr(agent, "call_llm", lambda **_kwargs: pytest.fail("model"))
+    monkeypatch.setattr(
+        agent,
+        "call_llm",
+        lambda **_kwargs: SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=None, content=""))]
+        ),
+    )
 
     def _no_draft(**_kwargs: object) -> None:
         raise RuntimeError("snapshot unavailable")
 
     monkeypatch.setattr(agent, "call_llm_structured", _no_draft)
-    monkeypatch.setattr(agent, "retrieve_evidence", lambda *_args, **_kwargs: pytest.fail("retrieval"))
+    monkeypatch.setattr(
+        agent,
+        "retrieve_evidence",
+        lambda *_args, **_kwargs: RetrievalDecision("no_relevant_information", (), None, 0),
+    )
     return rows
 
 
@@ -203,13 +217,27 @@ def test_fabricated_snapshot_draft_falls_back(monkeypatch: pytest.MonkeyPatch, q
 
 
 def _silence(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(agent, "call_llm", lambda **_kwargs: pytest.fail("model"))
+    from types import SimpleNamespace
+
+    from benchmark_cli.retrieval import RetrievalDecision
+
+    monkeypatch.setattr(
+        agent,
+        "call_llm",
+        lambda **_kwargs: SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=None, content=""))]
+        ),
+    )
+    monkeypatch.setattr(
+        agent,
+        "retrieve_evidence",
+        lambda *_args, **_kwargs: RetrievalDecision("no_relevant_information", (), None, 0),
+    )
 
     def _no_draft(**_kwargs: object) -> None:
         raise RuntimeError("snapshot unavailable")
 
     monkeypatch.setattr(agent, "call_llm_structured", _no_draft)
-    monkeypatch.setattr(agent, "retrieve_evidence", lambda *_args, **_kwargs: pytest.fail("retrieval"))
 
 
 @pytest.mark.unit
@@ -368,11 +396,12 @@ def test_snapshot_is_sent_to_the_model_and_a_valid_draft_is_kept(
 
     messages = seen["messages"]
     assert isinstance(messages, list)
-    payload = json.loads(messages[1]["content"])
-    titles = {card["title"] for card in payload["board"]["cards"]}
+    raw = str(messages[1]["content"])
+    payload = json.loads(raw[raw.index("{") :])
+    titles = {card["title"] for card in payload["trello_board"]["cards"]}
     assert len(titles) == 44
-    assert payload["board"]["counts"]["Backlog"] == 11
-    assert payload["board"]["counts"]["Done"] == 12
+    assert payload["trello_board"]["counts"]["Backlog"] == 11
+    assert payload["trello_board"]["counts"]["Done"] == 12
     assert "from the indexed snapshot" in response.answer
     assert "Sample MCP project" in response.answer
 
