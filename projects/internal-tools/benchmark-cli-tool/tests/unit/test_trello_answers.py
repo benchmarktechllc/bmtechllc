@@ -101,9 +101,11 @@ _ROWS = (
 def quiet_agent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(agent, "log_agent_diagnostic", lambda **_kwargs: None)
     monkeypatch.setattr(agent, "call_llm", lambda **_kwargs: pytest.fail("model should not run"))
-    monkeypatch.setattr(
-        agent, "call_llm_structured", lambda **_kwargs: pytest.fail("model should not run")
-    )
+
+    def _no_snapshot(**_kwargs: object) -> None:
+        raise RuntimeError("snapshot unavailable")
+
+    monkeypatch.setattr(agent, "call_llm_structured", _no_snapshot)
     monkeypatch.setattr(
         agent, "retrieve_evidence", lambda *_args, **_kwargs: pytest.fail("retrieval should not run")
     )

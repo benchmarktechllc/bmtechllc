@@ -62,6 +62,8 @@ from .trello_answers import (
     indexed_list_request,
     project_status_answer,
     requested_trello_list,
+    snapshot_messages,
+    snapshot_payload,
     trello_board_link_answer,
 )
 
@@ -422,7 +424,29 @@ def _trello_response(question: str, thread_question: str | None = None) -> Answe
     if bare_list_name(question) and indexed_list_request(bare_list_name(question) or "", catalog) is None:
         if requested_trello_list(question) is None:
             return None
-    return answer_board_question(question, catalog, thread_question=thread_question)
+    draft = _snapshot_draft(question, catalog, thread_question)
+    return answer_board_question(question, catalog, thread_question=thread_question, draft=draft)
+
+
+def _snapshot_draft(
+    question: str,
+    rows: tuple[object, ...],
+    thread_question: str | None,
+) -> AnswerResponse | None:
+    """Ask the model to answer from the full card snapshot. Failure falls back."""
+    catalog = cards_from_rows(rows)
+    if not snapshot_payload(catalog)["cards"]:
+        return None
+    try:
+        return call_llm_structured(
+            tier="cheap",
+            messages=snapshot_messages(question, catalog, thread_question),
+            response_schema=AnswerResponse,
+            component="trello_snapshot",
+        )
+    except Exception:
+        logger.debug("Trello snapshot draft was not usable; using the indexed board.")
+        return None
 
 
 def _model_question(question: str, thread_question: str | None) -> str:
