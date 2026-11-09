@@ -478,10 +478,13 @@ _PLAN_QUALIFICATION = (
     "The retrieved evidence does not explicitly state that this was approved, decided, or completed. "
     "What follows is cited text, and it is not a final decision."
 )
+# Internal answer-status dumps only. ``status: draft`` in a procedure must stay.
 _STATUS_TOKEN = re.compile(
-    r"\bstatus\s*[:=]\s*[^\n.]*|\b(?:no_relevant_information|nothing matched)\b",
+    r"\bstatus\s*[:=]\s*(?:no_relevant_information|nothing matched|answered)\b"
+    r"|\b(?:no_relevant_information|nothing matched)\b",
     re.IGNORECASE,
 )
+_RENDERED_STEPS = re.compile(r"(?m)^\s*\d+[.)]\s+\S")
 
 
 def _cited_chunks(response: AnswerResponse, chunks: Sequence[SearchChunk]) -> list[SearchChunk]:
@@ -764,40 +767,65 @@ def _table_fields(line: str) -> list[str] | None:
     return [f"{name}: {value}".rstrip()]
 
 
+def _blockquote_text(line: str) -> str:
+    """Drop ``>`` and ``[!NOTE]`` markers from one line of a callout."""
+    text = re.sub(r"^>\s*", "", line.strip())
+    return re.sub(r"^\[!NOTE\]\s*", "", text, flags=re.IGNORECASE).strip()
+
+
 def _render_procedure(text: str) -> str | None:
-    """Numbered steps from the full page, with tables folded into the step."""
-    groups: list[list[str]] = []
-    current: list[str] | None = None
+    """Numbered steps from the full page.
+
+    A blank line ends the step paragraph. A ``> [!NOTE]`` callout becomes its
+    own ``Note:`` line. Tables under a step are folded into that step.
+    """
+    groups: list[dict[str, list[str]]] = []
+    current: dict[str, list[str]] | None = None
+    paragraph_open = False
+
+    def close() -> None:
+        nonlocal current
+        if current is not None:
+            groups.append(current)
+        current = None
+
     for raw in text.splitlines():
         stripped = raw.strip()
         if _STEP_LINE.match(stripped):
-            if current:
-                groups.append(current)
-            current = [stripped]
+            close()
+            current = {"prose": [stripped], "fields": [], "notes": []}
+            paragraph_open = True
             continue
-        if current is None or not stripped:
+        if current is None:
             continue
-        current.append(stripped)
-    if current:
-        groups.append(current)
+        if not stripped:
+            paragraph_open = False
+            continue
+        if stripped.startswith(">"):
+            note = _blockquote_text(stripped)
+            if note:
+                current["notes"].append(note)
+            continue
+        if not paragraph_open:
+            continue
+        extracted = _table_fields(stripped)
+        if extracted is None:
+            current["prose"].append(stripped)
+        else:
+            current["fields"].extend(extracted)
+    close()
     if len(groups) < 2:
         return None
     rendered: list[str] = []
-    for lines in groups:
-        prose: list[str] = []
-        fields: list[str] = []
-        for line in lines:
-            extracted = _table_fields(line)
-            if extracted is None:
-                prose.append(line)
-            else:
-                fields.extend(extracted)
-        step = " ".join(prose).strip()
-        if fields:
-            step = f"{step.rstrip()} {'; '.join(fields)}".strip()
+    for group in groups:
+        step = " ".join(group["prose"]).strip()
+        if group["fields"]:
+            step = f"{step.rstrip()} {'; '.join(group['fields'])}".strip()
         if not step or _CLIPPED_STEP.search(re.sub(r"^\d+[.)]\s+", "", step)):
             return None
         rendered.append(step)
+        if group["notes"]:
+            rendered.append("Note: " + " ".join(group["notes"]))
     return "\n".join(rendered)
 
 
@@ -1091,7 +1119,13 @@ def supported_outcome_answer(
 
 
 def _plain_answer(answer: str) -> str:
-    """Drop an internal status dump, including ``status : nothing matched``."""
+    """Drop an internal status dump, including ``status : nothing matched``.
+
+    Rendered steps and excerpts are left alone. ``status: draft`` is page
+    content, not an answer-status code.
+    """
+    if _RENDERED_STEPS.search(answer):
+        return answer
     if _STATUS_TOKEN.search(answer) is None:
         return answer
     cleaned = _STATUS_TOKEN.sub(" ", answer)

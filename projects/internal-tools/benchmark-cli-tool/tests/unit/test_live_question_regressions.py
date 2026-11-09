@@ -701,7 +701,11 @@ Guide or Projects.
 It shows the exact file path.
 5. Save the sample draft.
 6. Ask a teammate to read the sample page.
-7. Publish the sample page.
+7. New pages are created as `status: draft`, internal, untagged. Add tags before review.
+
+> [!NOTE]
+> Raw HTML is rejected.
+> Keep the sample body in Markdown.
 """
 
 
@@ -753,6 +757,12 @@ def test_add_page_procedure_keeps_examples_and_table_fields(
         body = line.split(".", 1)[-1].strip()
         assert not body.endswith((":", "e.g.", "e.g"))
     assert "exact file path." in response.answer
+    assert "`status: draft`, internal, untagged" in response.answer
+    assert "` ." not in response.answer
+    assert response.answer.count("`") % 2 == 0
+    assert "[!NOTE]" not in response.answer
+    assert " > " not in response.answer
+    assert "Note: Raw HTML is rejected." in response.answer
 
 
 @pytest.mark.unit
@@ -778,28 +788,16 @@ def test_project_status_reports_the_matching_card_list_and_link(
 
 
 @pytest.mark.unit
-def test_supported_project_answer_is_kept_and_fallback_uses_doing_cards(
+def test_working_on_projects_lists_doing_as_active_and_backlog_as_planned(
     monkeypatch: pytest.MonkeyPatch, quiet_model: None
 ) -> None:
-    bot = (
-        "The Discord bot and RAG card is in progress. "
-        "Phase 2 portfolio projects are listed beside it."
-    )
-    kiosk = "MVP definition and setting a timeline for the smart kiosk and cli-tool projects is on the Doing list."
-    note = _chunk(
-        81,
-        "portal/projects/sample-portfolio.md",
-        f"{bot} {kiosk}",
-        {"source_type": "kb_page", "title": "Sample portfolio"},
-        digest="e" * 64,
-    )
     doing_bot = _row(
         "Doing",
-        "Discord bot and RAG integration",
+        "Discord bot hooked into RAG",
         "bot",
         82,
         chunk_text=(
-            "Card: Discord bot and RAG integration\n"
+            "Card: Discord bot hooked into RAG\n"
             "List: Doing\n"
             "URL: https://trello.com/c/bot\n"
             "\n"
@@ -808,79 +806,39 @@ def test_supported_project_answer_is_kept_and_fallback_uses_doing_cards(
     )
     doing_kiosk = _row(
         "Doing",
-        "MVP definition and setting a timeline for the smart kiosk and cli-tool projects",
+        "MVP definition for the smart kiosk and cli-tool projects",
         "mvp2",
         83,
     )
-    monkeypatch.setattr(
-        agent, "trello_card_rows", lambda: [_as_tuple(doing_bot), _as_tuple(doing_kiosk)]
-    )
-    monkeypatch.setattr(
-        agent,
-        "retrieve_evidence",
-        lambda *_a, **_k: RetrievalDecision(
-            "accepted",
-            (HybridSearchResult(note, 0.2, vector_score=0.8, fts_score=1.0),),
-            0.8,
-            1,
-        ),
-    )
-    kept = f"{bot} {kiosk}"
+    planned = _row("Backlog", "Phase 2 portfolio projects", "phase", 84)
+    chore = _row("Backlog", "Order sticky notes", "notes", 85)
     monkeypatch.setattr(
         agent,
-        "call_llm_structured",
-        lambda **_k: AnswerResponse(
-            status="answered",
-            answer=kept,
-            confidence=0.9,
-            citations=[_citation(note, note.chunk_text[:80])],
-        ),
+        "trello_card_rows",
+        lambda: [_as_tuple(card) for card in (doing_bot, doing_kiosk, planned, chore)],
     )
+    monkeypatch.setattr(agent, "call_llm", lambda **_k: pytest.fail("model"))
+    monkeypatch.setattr(agent, "retrieve_evidence", lambda *_a, **_k: pytest.fail("retrieval"))
 
-    supported = agent.run_agent("What projects is BMTech working on?")
+    response = agent.run_agent("What projects is BMTech working on?")
 
-    assert supported.status == "answered"
-    assert supported.answer == kept
-    assert "Discord bot and RAG" in supported.answer
-    assert "smart kiosk and cli-tool" in supported.answer
-    assert "- Card:" not in supported.answer
-
-    card_note = _chunk(
-        84,
-        "trello/tIvVZqio/bot.md",
-        doing_bot.chunk_text,
-        {"source_type": "trello", "title": doing_bot.title, "column": "Doing"},
-        digest="f" * 64,
-    )
-    monkeypatch.setattr(
-        agent,
-        "retrieve_evidence",
-        lambda *_a, **_k: RetrievalDecision(
-            "accepted",
-            (HybridSearchResult(card_note, 0.2, vector_score=0.8, fts_score=1.0),),
-            0.8,
-            1,
-        ),
-    )
-    monkeypatch.setattr(
-        agent,
-        "call_llm_structured",
-        lambda **_k: AnswerResponse(
-            status="answered",
-            answer="The retrieved evidence does not address this question.",
-            confidence=0.2,
-            citations=[_citation(card_note, "Card: Discord bot and RAG integration")],
-        ),
-    )
-    fallback = agent.run_agent("What projects is BMTech working on?")
-
-    assert fallback.status == "answered"
-    assert "Discord bot and RAG" in fallback.answer
-    assert "smart kiosk and cli-tool" in fallback.answer
-    assert "Doing" in fallback.answer
-    assert "https://trello.com/c/bot" in fallback.answer
-    assert "- Card:" not in fallback.answer
-    assert not fallback.answer.strip().startswith("Card:")
+    assert response.status == "answered"
+    active_at = response.answer.index("Active work:")
+    planned_at = response.answer.index("Backlog (planned), not active:")
+    assert active_at < planned_at
+    assert "Discord bot hooked into RAG" in response.answer
+    assert "smart kiosk and cli-tool" in response.answer
+    assert "Doing (active)" in response.answer
+    assert "Phase 2 portfolio projects" in response.answer
+    assert "Backlog (planned)" in response.answer
+    assert "not active" in response.answer.casefold()
+    assert "sticky" not in response.answer.casefold()
+    assert "current" not in response.answer.casefold()
+    assert "- Card:" not in response.answer
+    cited = {citation.quote for citation in response.citations}
+    assert "Card: Discord bot hooked into RAG" in cited
+    assert "Card: Phase 2 portfolio projects" in cited
+    assert "Card: Order sticky notes" not in cited
 
 
 @pytest.mark.unit

@@ -499,6 +499,9 @@ def run_agent(
     project_status = _project_status_response(question)
     if project_status is not None:
         return _finish(project_status, outcome="project_status", synthesis_attempts=0)
+    active_projects = _active_project_fallback(question, ())
+    if active_projects is not None:
+        return _finish(active_projects, outcome="active_projects", synthesis_attempts=0)
     decision: RetrievalDecision | None
     try:
         decision = retrieve_evidence(

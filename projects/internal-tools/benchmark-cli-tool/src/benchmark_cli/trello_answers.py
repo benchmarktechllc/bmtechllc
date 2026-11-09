@@ -479,7 +479,10 @@ def trello_board_link_answer(rows: Sequence[TrelloCardRow]) -> AnswerResponse:
 
 _CARD_HEADER = re.compile(r"^(?:Card|Board|List|URL|Labels|Due):")
 _PROJECT_STATUS = re.compile(r"\bstatus\b", re.IGNORECASE)
-_ACTIVE_PROJECTS = re.compile(r"\b(?:working|work(?:ing)?\s+on)\b", re.IGNORECASE)
+_ACTIVE_PROJECTS = re.compile(
+    r"\b(?:working|work(?:ing)?\s+on|current)\b",
+    re.IGNORECASE,
+)
 _PROJECT_WORD = re.compile(r"\bprojects?\b", re.IGNORECASE)
 _STATUS_SKIP = frozenset(
     {
@@ -599,24 +602,41 @@ def _project_chunk_line(chunk: SearchChunk) -> tuple[str, str] | None:
     return shown, sentences[0]
 
 
+def _is_project_card(card: TrelloCardRow) -> bool:
+    return "project" in f"{card.title} {_card_description(card)}".casefold()
+
+
+def _linked_card(card: TrelloCardRow, label: str) -> str:
+    title = " ".join(redact_secrets(card.title).split()) or "Untitled card"
+    item = f"[{title}]({card.url})" if card.url.startswith("https://") else title
+    description = _card_description(card)
+    if description:
+        return f"- {item} — {label}: {description}"
+    return f"- {item} — {label}"
+
+
 def active_projects_answer(
     rows: Sequence[TrelloCardRow], chunks: Sequence[SearchChunk]
 ) -> AnswerResponse | None:
-    """Doing cards plus cited project notes. Card-header lines are not the answer."""
+    """Doing cards are active work. Project cards in Backlog are planned, not active."""
+    usable = _usable_cards(rows)
+    doing = [card for card in usable if _list_matches(card.list_name, "doing")]
+    planned = [
+        card
+        for card in usable
+        if _list_matches(card.list_name, "backlog") and _is_project_card(card)
+    ]
     lines: list[str] = []
     citations: list[Citation] = []
-    doing = [card for card in _usable_cards(rows) if _list_matches(card.list_name, "doing")]
     if doing:
-        lines.append("Active work on the Doing list:")
+        lines.append("Active work:")
         for card in doing:
-            title = " ".join(redact_secrets(card.title).split()) or "Untitled card"
-            where = _list_label(card)
-            item = f"[{title}]({card.url})" if card.url.startswith("https://") else title
-            description = _card_description(card)
-            if description:
-                lines.append(f"- {item} — {where}: {description}")
-            else:
-                lines.append(f"- {item} — {where}")
+            lines.append(_linked_card(card, "Doing (active)"))
+            citations.append(_citation(card))
+    if planned:
+        lines.append("Backlog (planned), not active:")
+        for card in planned:
+            lines.append(_linked_card(card, "Backlog (planned)"))
             citations.append(_citation(card))
     for chunk in chunks:
         rendered = _project_chunk_line(chunk)
@@ -632,12 +652,14 @@ def active_projects_answer(
                 quote=quote,
             )
         )
-    if not lines or not citations:
+    if not doing and not planned:
+        return None
+    if not citations:
         return None
     answer = "\n".join(lines)
     if re.search(r"(?m)^- Card:", answer):
         return None
-    return AnswerResponse(status="answered", answer=answer, confidence=0.6, citations=citations)
+    return AnswerResponse(status="answered", answer=answer, confidence=0.8, citations=citations)
 
 
 def answer_is_bare_cards(answer: str) -> bool:
