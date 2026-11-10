@@ -281,11 +281,227 @@ def certificate_link_answer(
     )
 
 
+_NAMED_PRODUCTS = ("fireflies", "fathom", "anthropic")
+_RAG_TOOL = re.compile(r"\brag\s+tool\b", re.IGNORECASE)
+_RAG_NAME = re.compile(r"benchmark-cli-tool|\brag cli\b", re.IGNORECASE)
+_RAG_DOES = re.compile(
+    r"\b(?:is|are|searches|search|answers|answer|retriev\w*|indexes|indexed|cites|cited)\b",
+    re.IGNORECASE,
+)
+_RAG_JOB = re.compile(r"\bingest(?:ion)? jobs?\b", re.IGNORECASE)
+_HOW_PORTAL = re.compile(
+    r"\bhow\b.+\b(?:(?:kb|knowledge\s+base)\s+portal|portal)\b"
+    r"|\b(?:(?:kb|knowledge\s+base)\s+portal|portal)\b.+\bhow\b",
+    re.IGNORECASE,
+)
+_PORTAL_EXPLAIN = re.compile(
+    r"\b(?:markdown|forms?|submit(?:ted|s)?|pull request|\bpr\b|tokens?|auth\w*|architecture|browser)\b",
+    re.IGNORECASE,
+)
+_SENTENCE_END = re.compile(r"[.!?…](?:[\"')\]]+)?$")
+_COUNT_LINE = re.compile(
+    r"^(?:[A-Za-z][A-Za-z0-9 /-]{0,40}\s+\d+)(?:\s*,\s*[A-Za-z][A-Za-z0-9 /-]{0,40}\s+\d+)*$"
+)
+_BULLET_LINE = re.compile(r"^(?:[-*]|\d+\.)\s+\S")
+
+
+def named_products(question: str) -> tuple[str, ...]:
+    """Products the question names. A synonym is not one of these."""
+    folded = question.casefold()
+    return tuple(name for name in _NAMED_PRODUCTS if re.search(rf"\b{name}\b", folded))
+
+
+def evidence_names_products(question: str, texts: Sequence[str]) -> bool:
+    """Cited evidence has to contain the product the question asked about."""
+    names = named_products(question)
+    if not names:
+        return True
+    blob = "\n".join(texts).casefold()
+    return all(name in blob for name in names)
+
+
+def asks_how_portal_works(question: str) -> bool:
+    """A how-it-works question, not a request for the portal home URL."""
+    return _HOW_PORTAL.search(question) is not None
+
+
+def link_only_answer(answer: str) -> bool:
+    """True when the reply is a URL and a few words, with no explanation."""
+    if "http" not in answer.casefold() or _PORTAL_EXPLAIN.search(answer):
+        return False
+    words = re.findall(r"[a-z0-9']+", re.sub(r"https?://\S+", " ", answer.casefold()))
+    return len(words) <= 14
+
+
+def _sentences(text: str) -> list[str]:
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", text)
+        if sentence.strip()
+    ]
+
+
+def line_is_structural(line: str) -> bool:
+    """A list row, a count line, or a heading. These are complete on their own."""
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if _BULLET_LINE.match(stripped) or _COUNT_LINE.match(stripped) or stripped.endswith(":"):
+        return True
+    return stripped.startswith("#") or stripped.startswith("http")
+
+
+def ends_mid_sentence(text: str) -> bool:
+    """True when the last visible line stops before a sentence boundary."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    last = lines[-1].strip()
+    if line_is_structural(last) or _SENTENCE_END.search(last):
+        return False
+    if re.search(r"https://\S+$", last):
+        return False
+    return re.search(r"[.!?]\s+(?:Board|List|Trello cards)\b", last) is None
+
+
+def close_answer(text: str) -> str:
+    """Drop a trailing fragment so the reply does not stop mid-sentence."""
+    current = text.rstrip()
+    while current and ends_mid_sentence(current):
+        lines = current.splitlines()
+        last = lines[-1]
+        complete = re.findall(r".+?[.!?…](?:[\"')\]]+)?", last)
+        if complete:
+            lines[-1] = " ".join(sentence.strip() for sentence in complete).strip()
+            current = "\n".join(lines).rstrip()
+            continue
+        lines = lines[:-1]
+        while lines and not lines[-1].strip():
+            lines.pop()
+        current = "\n".join(lines).rstrip()
+    return current
+
+
+def asks_for_rag_tool(question: str) -> bool:
+    return _RAG_TOOL.search(question) is not None
+
+
+def answer_defines_rag_tool(answer: str) -> bool:
+    """A definition says what the CLI is or does. A job list does not."""
+    if not _RAG_NAME.search(answer) or not _RAG_DOES.search(answer):
+        return False
+    if _RAG_JOB.search(answer) and not re.search(r"\b(?:is|are)\b", answer, re.IGNORECASE):
+        return False
+    return True
+
+
+def evidence_explains_portal(chunks: Sequence[SearchChunk]) -> bool:
+    return any(_PORTAL_EXPLAIN.search(chunk.chunk_text) for chunk in chunks)
+
+
+def rag_tool_definition(question: str, chunks: Sequence[SearchChunk]) -> AnswerResponse | None:
+    """A short definition of the RAG CLI, not a list of ingest jobs."""
+    if not asks_for_rag_tool(question):
+        return None
+    chosen: list[tuple[SearchChunk, str]] = []
+    for chunk in chunks:
+        if not chunk.content_sha256:
+            continue
+        sentences = [sentence for sentence in _sentences(chunk.chunk_text) if sentence in chunk.chunk_text]
+        for index, sentence in enumerate(sentences):
+            if not _RAG_NAME.search(sentence):
+                continue
+            if _RAG_JOB.search(sentence) and not _RAG_DOES.search(sentence):
+                continue
+            if not _RAG_DOES.search(sentence):
+                continue
+            parts = [sentence]
+            if index + 1 < len(sentences):
+                follow = sentences[index + 1]
+                if _RAG_DOES.search(follow) and not _RAG_JOB.search(follow):
+                    parts.append(follow)
+            quote = " ".join(parts)
+            if quote not in chunk.chunk_text:
+                quote = sentence
+            chosen.append((chunk, quote))
+    if not chosen:
+        return None
+    unique: list[tuple[SearchChunk, str]] = []
+    seen: set[str] = set()
+    for chunk, sentence in chosen:
+        key = sentence.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((chunk, sentence))
+        if len(unique) == 2:
+            break
+    answer = " ".join(sentence for _chunk, sentence in unique)
+    return AnswerResponse(
+        status="answered",
+        answer=answer,
+        confidence=0.75,
+        citations=[
+            Citation(
+                source_file=chunk.source_file,
+                chunk_id=chunk.id,
+                content_sha256=chunk.content_sha256 or "",
+                quote=sentence,
+            )
+            for chunk, sentence in unique
+        ],
+    )
+
+
+def portal_how_answer(question: str, chunks: Sequence[SearchChunk]) -> AnswerResponse | None:
+    """How the portal works, from the sentences that describe the mechanism."""
+    if not asks_how_portal_works(question):
+        return None
+    chosen: list[tuple[SearchChunk, str]] = []
+    for chunk in chunks:
+        if not chunk.content_sha256:
+            continue
+        for sentence in _sentences(chunk.chunk_text):
+            if sentence not in chunk.chunk_text or not _PORTAL_EXPLAIN.search(sentence):
+                continue
+            chosen.append((chunk, sentence))
+    if not chosen:
+        return None
+    unique: list[tuple[SearchChunk, str]] = []
+    seen: set[str] = set()
+    for chunk, sentence in chosen:
+        key = sentence.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((chunk, sentence))
+        if len(unique) == 4:
+            break
+    return AnswerResponse(
+        status="answered",
+        answer=" ".join(sentence for _chunk, sentence in unique),
+        confidence=0.75,
+        citations=[
+            Citation(
+                source_file=chunk.source_file,
+                chunk_id=chunk.id,
+                content_sha256=chunk.content_sha256 or "",
+                quote=sentence,
+            )
+            for chunk, sentence in unique
+        ],
+    )
+
+
 def synonym_evidence_answer(
     question: str, chunks: Sequence[SearchChunk]
 ) -> AnswerResponse | None:
     """Quote a chunk that uses the indexed name for a paraphrase such as RAG tool."""
+    if asks_for_rag_tool(question) or asks_how_portal_works(question):
+        return None
     for chunk in chunks:
+        if named_products(question) and not evidence_names_products(question, [chunk.chunk_text]):
+            continue
         if not chunk.content_sha256 or not chunk_matches_synonym(question, chunk.chunk_text):
             continue
         quote = ""
@@ -1258,7 +1474,7 @@ def _plain_answer(answer: str) -> str:
 
 def scrub_response(response: AnswerResponse) -> AnswerResponse:
     """Remove credential material and internal status codes from visible text."""
-    answer = _plain_answer(redact_secrets(response.answer))
+    answer = close_answer(_plain_answer(redact_secrets(response.answer)))
     citations = []
     for citation in response.citations:
         quote = redact_secrets(citation.quote).strip()

@@ -65,7 +65,11 @@ def call_llm(
     """Call a configured model and record its token/latency/cost telemetry."""
     if not messages:
         raise ValueError("messages must not be empty.")
-    request: dict[str, Any] = {"model": get_model_config(tier).model, "messages": messages}
+    request: dict[str, Any] = {
+        "model": get_model_config(tier).model,
+        "messages": messages,
+        "max_tokens": 2000,
+    }
     if tools is not None:
         request["tools"] = tools
     started_at = perf_counter()
@@ -93,6 +97,7 @@ def call_llm_structured(
             model=get_model_config(tier).model,
             messages=list(messages),
             response_format=response_schema,
+            max_tokens=2000,
         )
     except Exception as exc:
         quota = _quota_error(exc)

@@ -13,6 +13,7 @@ import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
+from .grounding import close_answer, ends_mid_sentence
 from .ingestion.clean import redact_secrets
 from .models import AnswerResponse, Citation
 from .storage.postgres import SearchChunk
@@ -1335,7 +1336,9 @@ def _sev_definition(rows: Sequence[TrelloCardRow], level: int) -> str:
     for card in _usable_cards(rows):
         for line in card.chunk_text.splitlines():
             if level_name.search(line) and explains.search(line):
-                return line.strip()
+                closed = close_answer(line.strip())
+                if closed and not ends_mid_sentence(closed):
+                    return closed
     return ""
 
 

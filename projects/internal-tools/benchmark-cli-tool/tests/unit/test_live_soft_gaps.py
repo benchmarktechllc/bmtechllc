@@ -105,9 +105,15 @@ def test_rag_tool_and_fireflies_synonyms_reach_discord_and_kb(monkeypatch: pytes
     assert tool.status == "accepted"
     assert chunk_matches_synonym("what's the RAG tool?", tool.results[0].chunk.chunk_text)
     assert "benchmark-cli-tool" in tool.results[0].chunk.chunk_text
-    assert meeting.status == "accepted"
-    assert "meeting notetaker" in meeting.results[0].chunk.chunk_text
-    assert meeting.results[0].chunk.metadata["source_type"] == "discord"
+    assert meeting.status == "no_relevant_information"
+    assert not chunk_matches_synonym(
+        "what did we decide about Fireflies?",
+        "The team decided to adopt the meeting notetaker.",
+    )
+    assert chunk_matches_synonym(
+        "what did we decide about Fireflies?",
+        "The team decided to keep Fireflies.",
+    )
 
 
 @pytest.mark.unit

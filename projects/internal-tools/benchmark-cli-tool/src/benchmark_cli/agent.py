@@ -14,21 +14,31 @@ from .contributions import UNKNOWN_INVITE
 from .grounding import (
     ANSWER_PATH_REVISION,
     SyncedDiscordChannel,
+    answer_defines_rag_tool,
     asks_for_certificate_link,
     asks_for_core_team,
     asks_for_credentials,
     asks_for_employee_count,
     asks_for_portal_link,
+    asks_for_rag_tool,
     asks_for_synced_channels,
+    asks_how_portal_works,
     certificate_link_answer,
     certificate_url_is_specific,
     channel_provenance_quote,
+    close_answer,
     core_team_answer,
     credential_refusal,
     employee_count_answer,
+    ends_mid_sentence,
+    evidence_explains_portal,
+    evidence_names_products,
+    link_only_answer,
     output_is_rejected,
+    portal_how_answer,
     portal_link_answer,
     quote_covers_question,
+    rag_tool_definition,
     retrieval_log_fields,
     scrub_response,
     stated_employee_count_answer,
@@ -560,7 +570,7 @@ def _sev_meaning_explained(answer: str) -> bool:
 def _part_covered(part: str, answer: str) -> bool:
     folded = answer.casefold()
     if asks_for_synced_channels(part):
-        return "channel" in folded or "#" in answer
+        return "#" in answer
     if asks_for_sev_meaning(part):
         return "urgent" in folded or "severity" in folded
     if re.search(r"\bsev\s*\d", part, re.IGNORECASE):
@@ -576,34 +586,55 @@ def _part_covered(part: str, answer: str) -> bool:
     return hits >= min(2, len(terms))
 
 
+def _deterministic_part(
+    part: str, snapshot: tuple[object, ...] | None
+) -> AnswerResponse | None:
+    """The same handler a standalone question would use for this part."""
+    if asks_for_synced_channels(part):
+        try:
+            channels = _synced_channels()
+        except RuntimeError:
+            channels = ()
+        if channels:
+            return synced_channels_answer(channels)
+        return None
+    if snapshot is None:
+        return None
+    listed = answer_board_question(part, snapshot)
+    if listed is not None and listed.status == "answered":
+        return listed
+    return None
+
+
 def _complete_multipart(
     question: str,
     response: AnswerResponse,
     snapshot: tuple[object, ...] | None,
 ) -> AnswerResponse:
-    """Add a deterministic part the model skipped, and name any part still unknown."""
+    """Answer each part the way that part is answered on its own."""
     parts = split_subquestions(question)
     if len(parts) < 2:
         return response
-    answer = response.answer if response.status == "answered" else ""
-    citations = list(response.citations) if response.status == "answered" else []
+    answer = ""
+    citations: list[Citation] = []
     missing: list[str] = []
+    model_answer = response.answer if response.status == "answered" else ""
+    used_model = False
     for part in parts:
-        if answer and _part_covered(part, answer):
-            continue
-        extra: AnswerResponse | None = None
-        if asks_for_synced_channels(part):
-            try:
-                channels = _synced_channels()
-            except RuntimeError:
-                channels = ()
-            if channels:
-                extra = synced_channels_answer(channels)
-        elif snapshot:
-            extra = answer_board_question(part, snapshot)
+        extra = _deterministic_part(part, snapshot)
         if extra is not None and extra.status == "answered":
             answer = f"{answer}\n\n{extra.answer}".strip()
             citations.extend(extra.citations)
+            continue
+        if (
+            model_answer
+            and not used_model
+            and _part_covered(part, model_answer)
+            and "i don't know" not in model_answer.casefold()
+        ):
+            answer = f"{answer}\n\n{model_answer}".strip()
+            citations.extend(response.citations)
+            used_model = True
             continue
         missing.append(part)
     if missing:
@@ -799,6 +830,23 @@ def _validated_answer(
         return None
     if question and _certificate_url_rejected(question, repaired.answer, evidence):
         return None
+    if question and not evidence_names_products(
+        question,
+        [
+            *(citation.quote for citation in repaired.citations),
+            *(
+                evidence[citation.chunk_id].chunk_text
+                for citation in repaired.citations
+                if citation.chunk_id in evidence
+            ),
+        ],
+    ):
+        return None
+    closed = close_answer(repaired.answer)
+    if not closed.strip() or ends_mid_sentence(closed):
+        return None
+    if closed != repaired.answer:
+        repaired = repaired.model_copy(update={"answer": closed})
     context = "\n".join(chunk.chunk_text for chunk in evidence.values()).casefold()
     for name in re.findall(
         r"\b(?:hir(?:e|ed|ing)|assigned to|according to)\s+([A-Z][a-z]+(?: [A-Z][a-z]+)?)",
@@ -835,6 +883,12 @@ def _deterministic_fallback(
     active = _active_project_fallback(question, chunks)
     if active is not None and active.status == "answered":
         return active
+    defined = rag_tool_definition(question, chunks)
+    if defined is not None:
+        return defined
+    explained = portal_how_answer(question, chunks)
+    if explained is not None:
+        return explained
     return synonym_evidence_answer(question, chunks)
 
 
@@ -978,7 +1032,17 @@ def run_agent(
         messages = []
     def _checked(response: AnswerResponse | None) -> AnswerResponse | None:
         validated = _validated_answer(response, evidence, snapshot, question=question)
-        if validated is None or validated.status != "answered" or snapshot is None:
+        if validated is None or validated.status != "answered":
+            return validated
+        if asks_for_rag_tool(question) and not answer_defines_rag_tool(validated.answer):
+            return None
+        if (
+            asks_how_portal_works(question)
+            and link_only_answer(validated.answer)
+            and evidence_explains_portal(tuple(evidence.values()))
+        ):
+            return None
+        if snapshot is None:
             return validated
         if asks_for_board_overview(question) and not overview_covers_every_list(validated.answer, snapshot):
             return None

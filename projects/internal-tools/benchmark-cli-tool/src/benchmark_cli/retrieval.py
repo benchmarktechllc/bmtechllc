@@ -48,31 +48,46 @@ _KEYWORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9'-]*")
 _STOPWORDS = frozenset({"a", "an", "and", "are", "as", "at", "by", "for", "from", "how", "in", "is", "of", "on", "or", "the", "to", "what", "when", "which", "who", "with"})
 _QUESTION_WORD = re.compile(r"\b(?:what|what's|which|who|how|why|when|where)\b", re.IGNORECASE)
 _SUBQUESTION_SPLIT = re.compile(r"\s*(?:\?|;|\band\b|&)\s*", re.IGNORECASE)
-# Phrases people use for a project or system that the indexed text names differently.
-_QUERY_EXPANSIONS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
+# Search phrases widen retrieval. Ground phrases are the only ones that can
+# prove a paraphrase. A named product such as Fireflies grounds only on its
+# own name, never on "meeting transcript".
+_QUERY_EXPANSIONS: tuple[tuple[re.Pattern[str], tuple[str, ...], tuple[str, ...]], ...] = (
     (
         re.compile(r"\brag\s+tool\b", re.IGNORECASE),
         ("benchmark-cli-tool", "retrieval-only RAG CLI", "RAG CLI", "cli-tool"),
+        ("benchmark-cli-tool", "retrieval-only RAG CLI", "RAG CLI"),
     ),
     (
         re.compile(r"\b(?:kb|knowledge\s+base)\s+portal\b", re.IGNORECASE),
+        ("knowledge base portal", "Discord bot", "knowledge base"),
         ("knowledge base portal", "Discord bot", "knowledge base"),
     ),
     (
         re.compile(r"\bfireflies\b", re.IGNORECASE),
         ("Fireflies", "meeting notetaker", "notetaker", "meeting transcript"),
+        ("Fireflies",),
     ),
 )
+_HOW_CUES = ("markdown", "pull request", "token", "form", "auth", "architecture", "browser")
+
+
+def _matching_phrases(question: str, *, ground: bool) -> list[str]:
+    phrases: list[str] = []
+    for pattern, search, grounding in _QUERY_EXPANSIONS:
+        if pattern.search(question) is None:
+            continue
+        phrases.extend(grounding if ground else search)
+    return phrases
 
 
 def synonym_phrases_for(question: str) -> list[str]:
-    """Phrases the indexed docs use for a paraphrased name in the question."""
-    phrases: list[str] = []
-    for pattern, extras in _QUERY_EXPANSIONS:
-        if pattern.search(question) is None:
-            continue
-        phrases.extend(extras)
-    return phrases
+    """Phrases that can ground a paraphrase. Named products use their own name."""
+    return _matching_phrases(question, ground=True)
+
+
+def search_phrases_for(question: str) -> list[str]:
+    """Extra searches. These do not by themselves prove the answer."""
+    return _matching_phrases(question, ground=False)
 
 
 def chunk_matches_synonym(question: str, text: str) -> bool:
@@ -87,12 +102,9 @@ def expand_queries(question: str) -> list[str]:
     if not text:
         return []
     queries = [text]
-    for pattern, extras in _QUERY_EXPANSIONS:
-        if pattern.search(text) is None:
-            continue
-        for extra in extras:
-            queries.append(extra)
-            queries.append(f"{text} {extra}")
+    for extra in search_phrases_for(text):
+        queries.append(extra)
+        queries.append(f"{text} {extra}")
     seen: set[str] = set()
     unique: list[str] = []
     for query in queries:
@@ -250,19 +262,26 @@ def _promote_synonym_matches(
     then never reach the synonym check.
     """
     phrases = []
+    how = re.search(r"\bhow\b", query, re.IGNORECASE) is not None
     for part in split_subquestions(query) or [query]:
         phrases.extend(synonym_phrases_for(part))
-    if not phrases:
-        return pooled
     folded = [phrase.casefold() for phrase in phrases]
+
+    def explains(result: HybridSearchResult) -> bool:
+        if not how:
+            return False
+        text = result.chunk.chunk_text.casefold()
+        return any(cue in text for cue in _HOW_CUES)
 
     def matches(result: HybridSearchResult) -> bool:
         text = result.chunk.chunk_text.casefold()
         return any(phrase in text for phrase in folded)
 
-    return [result for result in pooled if matches(result)] + [
-        result for result in pooled if not matches(result)
-    ]
+    return (
+        [result for result in pooled if explains(result)]
+        + [result for result in pooled if matches(result) and not explains(result)]
+        + [result for result in pooled if not matches(result) and not explains(result)]
+    )
 
 
 def retrieve_evidence(

@@ -155,7 +155,12 @@ def truncate_discord(text: str, *, limit: int = DISCORD_MESSAGE_LIMIT) -> str:
         return text
     if limit <= len(_TRUNCATION_MARKER):
         return _TRUNCATION_MARKER[:limit]
-    return text[: limit - len(_TRUNCATION_MARKER)].rstrip() + _TRUNCATION_MARKER
+    room = limit - len(_TRUNCATION_MARKER)
+    clipped = text[:room].rstrip()
+    cut = max(clipped.rfind("."), clipped.rfind("!"), clipped.rfind("?"))
+    if cut >= 40:
+        clipped = clipped[: cut + 1].rstrip()
+    return clipped + _TRUNCATION_MARKER
 
 
 def _format_citation(index: int, citation: Citation) -> str:
