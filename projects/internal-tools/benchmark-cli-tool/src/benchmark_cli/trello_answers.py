@@ -1260,6 +1260,102 @@ def _urgent_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerRespon
     )
 
 
+def asks_for_done_vs_open(question: str) -> bool:
+    """A comparison of finished tickets and the ones still open."""
+    folded = question.casefold()
+    return (
+        re.search(r"\b(?:done|completed|closed)\b", folded) is not None
+        and re.search(r"\bopen\b", folded) is not None
+        and re.search(r"\b(?:vs|versus|compared|against|and)\b", folded) is not None
+    )
+
+
+def done_vs_open_is_complete(answer: str, rows: Sequence[TrelloCardRow]) -> bool:
+    """Both the Done count and the non-Done total have to be stated."""
+    usable = _usable_cards(rows)
+    done = sum(1 for card in usable if _normalize(card.list_name) == "done")
+    opened = len(usable) - done
+    folded = answer.casefold()
+    return str(done) in answer and str(opened) in answer and "open" in folded and "done" in folded
+
+
+def _done_vs_open_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
+    if not asks_for_done_vs_open(question):
+        return None
+    usable = _usable_cards(rows)
+    if not usable:
+        return None
+    done = [card for card in usable if _normalize(card.list_name) == "done"]
+    opened = [card for card in usable if _normalize(card.list_name) != "done"]
+    counts: dict[str, int] = {}
+    for card in opened:
+        label = _list_label(card)
+        counts[label] = counts.get(label, 0) + 1
+    breakdown = ", ".join(f"{name} {count}" for name, count in counts.items()) or "none"
+    lines = [
+        f"Done has {len(done)} cards.",
+        f"Open has {len(opened)} cards ({breakdown}).",
+        "",
+    ]
+    lines.extend(_render_groups(opened))
+    if done:
+        lines.append("")
+        lines.extend(_render_groups(done))
+    shown = opened + done
+    return AnswerResponse(
+        status="answered",
+        answer="\n".join(lines),
+        confidence=0.8,
+        citations=[_citation(card) for card in shown],
+    )
+
+
+def _sev_definition(rows: Sequence[TrelloCardRow], level: int) -> str:
+    """A line from the board that defines this severity, when one is indexed."""
+    level_name = re.compile(rf"\bsev(?:erity)?\s*{level}\b", re.IGNORECASE)
+    explains = re.compile(r"\b(?:means?|severity|urgent|priority)\b", re.IGNORECASE)
+    for card in _usable_cards(rows):
+        for line in card.chunk_text.splitlines():
+            if level_name.search(line) and explains.search(line):
+                return line.strip()
+    return ""
+
+
+def _sev_meaning_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
+    """Explain a Sev list instead of only dumping its cards."""
+    match = re.search(
+        r"\bsev(?:erity)?\s*(?P<level>[1-9])\b.{0,40}\bmeans?\b"
+        r"|\bmeans?\b.{0,40}\bsev(?:erity)?\s*(?P<level2>[1-9])\b",
+        question,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    level = int(match.group("level") or match.group("level2"))
+    usable = _usable_cards(rows)
+    on_list = [card for card in usable if _sev_number(card.list_name) == level]
+    definition = _sev_definition(rows, level)
+    lines = [
+        (
+            f"Sev {level} is a severity list. A lower number is more urgent, "
+            "so Sev 1 outranks Sev 2, and Sev 2 outranks Sev 3."
+        )
+    ]
+    if definition:
+        lines.append(definition)
+    if on_list:
+        lines.extend(["", f"Trello cards in Sev {level}:"])
+        lines.extend(_bullet(card) for card in on_list)
+    elif not definition:
+        return None
+    return AnswerResponse(
+        status="answered",
+        answer="\n".join(lines),
+        confidence=0.8,
+        citations=[_citation(card) for card in on_list[:1]] or [_citation(card) for card in usable[:1]],
+    )
+
+
 def _current_work_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
     """Doing is the list of tickets currently being worked on."""
     if not asks_for_current_work(question):
@@ -1324,7 +1420,9 @@ def answer_board_question(
         if requested_trello_list(question) is None:
             return None
     deterministic = (
-        _who_answer(question, rows)
+        _done_vs_open_answer(question, rows)
+        or _sev_meaning_answer(question, rows)
+        or _who_answer(question, rows)
         or _card_focus_answer(question, rows)
         or _assignee_answer(question, rows)
         or _due_answer(question, rows)

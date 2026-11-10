@@ -186,8 +186,98 @@ def asks_for_synced_channels(question: str) -> bool:
         return False
     return (
         re.search(r"\bchannels?\b", text) is not None
-        and re.search(r"\b(?:sync\w*|ingest\w*|index\w*)\b", text) is not None
-        and re.search(r"\b(?:which|what|list)\b", text) is not None
+        and re.search(
+            r"\b(?:sync\w*|ingest\w*|index\w*|reads?|reading|listens?|listening|monitors?)\b",
+            text,
+        )
+        is not None
+        and re.search(r"\b(?:which|what|list|does)\b", text) is not None
+    )
+
+
+def asks_for_certificate_link(question: str) -> bool:
+    """A request for the URL of a certificate, not a how-to about certificates."""
+    text = question.casefold()
+    if re.search(r"\bhow\s+(?:do|can|should|to)\b", text):
+        return False
+    return (
+        re.search(r"\b(?:link|url)\b", text) is not None
+        and re.search(r"\bcertificates?\b", text) is not None
+    )
+
+
+def certificate_url_is_specific(url: str, chunks: Sequence[SearchChunk]) -> bool:
+    """The URL's own chunk has to call it a certificate."""
+    for chunk in chunks:
+        if url in chunk.chunk_text and re.search(r"\bcertificates?\b", chunk.chunk_text, re.IGNORECASE):
+            return True
+    return False
+
+
+def certificate_link_answer(
+    question: str, chunks: Sequence[SearchChunk]
+) -> AnswerResponse | None:
+    """Cite a certificate URL only when that chunk is about the certificate.
+
+    A related course can be mentioned. It is not presented as the certificate.
+    """
+    if not asks_for_certificate_link(question):
+        return None
+    for chunk in chunks:
+        if not chunk.content_sha256 or not re.search(r"\bcertificates?\b", chunk.chunk_text, re.IGNORECASE):
+            continue
+        urls = re.findall(r"https://[^\s)>\]]+", chunk.chunk_text)
+        if not urls:
+            continue
+        url = urls[0]
+        quote = next(
+            (
+                sentence.strip()
+                for sentence in re.split(r"(?<=[.!?])\s+|\n+", chunk.chunk_text)
+                if url in sentence and sentence.strip() in chunk.chunk_text
+            ),
+            "",
+        )
+        if not quote:
+            continue
+        return AnswerResponse(
+            status="answered",
+            answer=f"The certificate link is {url}.",
+            confidence=0.8,
+            citations=[
+                Citation(
+                    source_file=chunk.source_file,
+                    chunk_id=chunk.id,
+                    content_sha256=chunk.content_sha256,
+                    quote=quote,
+                )
+            ],
+        )
+    for chunk in chunks:
+        if not chunk.content_sha256:
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", chunk.chunk_text):
+            cleaned = sentence.strip()
+            if not cleaned or cleaned not in chunk.chunk_text or not re.search(r"\bcourse\b", cleaned, re.IGNORECASE):
+                continue
+            return AnswerResponse(
+                status="answered",
+                answer=f"No certificate link is known. A related course is mentioned: {cleaned}",
+                confidence=0.6,
+                citations=[
+                    Citation(
+                        source_file=chunk.source_file,
+                        chunk_id=chunk.id,
+                        content_sha256=chunk.content_sha256,
+                        quote=cleaned,
+                    )
+                ],
+            )
+    return AnswerResponse(
+        status="no_relevant_information",
+        answer="No certificate link is known.",
+        confidence=0.0,
+        citations=[],
     )
 
 

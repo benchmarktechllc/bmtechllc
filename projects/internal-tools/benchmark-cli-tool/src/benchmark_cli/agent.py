@@ -14,11 +14,14 @@ from .contributions import UNKNOWN_INVITE
 from .grounding import (
     ANSWER_PATH_REVISION,
     SyncedDiscordChannel,
+    asks_for_certificate_link,
     asks_for_core_team,
     asks_for_credentials,
     asks_for_employee_count,
     asks_for_portal_link,
     asks_for_synced_channels,
+    certificate_link_answer,
+    certificate_url_is_specific,
     channel_provenance_quote,
     core_team_answer,
     credential_refusal,
@@ -54,6 +57,7 @@ from .trello_answers import (
     answer_matches_snapshot,
     asks_for_active_projects,
     asks_for_board_overview,
+    asks_for_done_vs_open,
     asks_for_project_status,
     asks_for_trello_board_link,
     bare_list_name,
@@ -61,6 +65,7 @@ from .trello_answers import (
     board_question,
     cards_from_rows,
     citations_for_answer,
+    done_vs_open_is_complete,
     indexed_list_request,
     overview_covers_every_list,
     project_status_answer,
@@ -545,10 +550,24 @@ def _model_user_text(question: str, thread_question: str | None) -> str:
     )
 
 
+def _sev_meaning_question(question: str) -> bool:
+    return (
+        re.search(r"\bmeans?\b", question, re.IGNORECASE) is not None
+        and re.search(r"\bsev\s*\d", question, re.IGNORECASE) is not None
+    )
+
+
+def _sev_meaning_explained(answer: str) -> bool:
+    folded = answer.casefold()
+    return "urgent" in folded or "severity" in folded
+
+
 def _part_covered(part: str, answer: str) -> bool:
     folded = answer.casefold()
     if asks_for_synced_channels(part):
         return "channel" in folded or "#" in answer
+    if re.search(r"\bmeans?\b", part, re.IGNORECASE) and re.search(r"\bsev\s*\d", part, re.IGNORECASE):
+        return "urgent" in folded or "severity" in folded
     if re.search(r"\bsev\s*\d", part, re.IGNORECASE):
         return re.search(r"\bsev\s*\d", answer, re.IGNORECASE) is not None
     terms = [
@@ -746,10 +765,24 @@ def _validation_errors(
     return errors
 
 
+def _certificate_url_rejected(
+    question: str, answer: str, evidence: dict[int, SearchChunk]
+) -> bool:
+    """A certificate URL has to come from a chunk that calls it a certificate."""
+    if not asks_for_certificate_link(question):
+        return False
+    urls = re.findall(r"https://[^\s)>\]]+", answer)
+    if not urls:
+        return False
+    return any(not certificate_url_is_specific(url, tuple(evidence.values())) for url in urls)
+
+
 def _validated_answer(
     response: AnswerResponse | None,
     evidence: dict[int, SearchChunk],
     rows: tuple[object, ...] | None,
+    *,
+    question: str = "",
 ) -> AnswerResponse | None:
     """Keep a model answer whose citations, cards, and URLs exist. Do not rewrite it."""
     if response is None:
@@ -769,6 +802,8 @@ def _validated_answer(
         return None
     if _invented_urls(repaired.answer, evidence, rows):
         return None
+    if question and _certificate_url_rejected(question, repaired.answer, evidence):
+        return None
     context = "\n".join(chunk.chunk_text for chunk in evidence.values()).casefold()
     for name in re.findall(
         r"\b(?:hir(?:e|ed|ing)|assigned to|according to)\s+([A-Z][a-z]+(?: [A-Z][a-z]+)?)",
@@ -787,6 +822,9 @@ def _deterministic_fallback(
     chunks: tuple[SearchChunk, ...],
 ) -> AnswerResponse | None:
     """Indexed Trello rules when the model is down or its draft does not validate."""
+    certificate = certificate_link_answer(question, chunks)
+    if certificate is not None:
+        return certificate
     if rows is None:
         return _active_project_fallback(question, chunks)
     if asks_for_trello_board_link(question):
@@ -942,14 +980,14 @@ def run_agent(
             logger.info("The answer model is unavailable; using indexed data.")
         messages = []
     def _checked(response: AnswerResponse | None) -> AnswerResponse | None:
-        validated = _validated_answer(response, evidence, snapshot)
-        if (
-            validated is not None
-            and snapshot
-            and asks_for_board_overview(question)
-            and validated.status == "answered"
-            and not overview_covers_every_list(validated.answer, snapshot)
-        ):
+        validated = _validated_answer(response, evidence, snapshot, question=question)
+        if validated is None or validated.status != "answered" or snapshot is None:
+            return validated
+        if asks_for_board_overview(question) and not overview_covers_every_list(validated.answer, snapshot):
+            return None
+        if asks_for_done_vs_open(question) and not done_vs_open_is_complete(validated.answer, snapshot):
+            return None
+        if _sev_meaning_question(question) and not _sev_meaning_explained(validated.answer):
             return None
         return validated
 

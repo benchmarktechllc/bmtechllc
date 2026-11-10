@@ -52,18 +52,33 @@ _SUBQUESTION_SPLIT = re.compile(r"\s*(?:\?|;|\band\b|&)\s*", re.IGNORECASE)
 _QUERY_EXPANSIONS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
     (
         re.compile(r"\brag\s+tool\b", re.IGNORECASE),
-        ("benchmark-cli-tool", "retrieval-only RAG CLI"),
+        ("benchmark-cli-tool", "retrieval-only RAG CLI", "RAG CLI", "cli-tool"),
     ),
     (
         re.compile(r"\b(?:kb|knowledge\s+base)\s+portal\b", re.IGNORECASE),
-        ("knowledge base portal", "portal", "Discord bot"),
+        ("knowledge base portal", "Discord bot", "knowledge base"),
     ),
     (
         re.compile(r"\bfireflies\b", re.IGNORECASE),
-        ("Fireflies meeting transcript", "meeting transcript"),
+        ("Fireflies", "meeting notetaker", "notetaker", "meeting transcript"),
     ),
 )
-FALLBACK_MIN_COSINE = 0.15
+
+
+def synonym_phrases_for(question: str) -> list[str]:
+    """Phrases the indexed docs use for a paraphrased name in the question."""
+    phrases: list[str] = []
+    for pattern, extras in _QUERY_EXPANSIONS:
+        if pattern.search(question) is None:
+            continue
+        phrases.extend(extras)
+    return phrases
+
+
+def chunk_matches_synonym(question: str, text: str) -> bool:
+    """True when the chunk uses a mapped name for this paraphrase."""
+    folded = text.casefold()
+    return any(phrase.casefold() in folded for phrase in synonym_phrases_for(question))
 
 
 def expand_queries(question: str) -> list[str]:
@@ -268,13 +283,17 @@ def retrieve_evidence(
     overlap = meaningful_keyword_overlap(" ".join(expanded), results)
     lexical = overlap >= min_keyword_overlap
     semantic = top_cosine is not None and top_cosine >= min_cosine_similarity
-    # A paraphrase can share the expanded words and still sit under the strict
-    # cosine bar. Keep those hits so the model can accept or reject them.
-    weak_semantic = top_cosine is None or top_cosine >= min(min_cosine_similarity, FALLBACK_MIN_COSINE)
-    accepted = bool(results) and lexical and (semantic or weak_semantic)
+    strict = bool(results) and lexical and semantic
+    # Only a mapped synonym (RAG CLI, Fireflies, Discord bot, ...) may pass
+    # below the strict cosine bar. A shared brand word is not enough.
+    synonym_hits = tuple(
+        result for result in results if chunk_matches_synonym(query, result.chunk.chunk_text)
+    )
+    accepted = strict or bool(synonym_hits)
+    kept = results if strict else synonym_hits
     return RetrievalDecision(
         status="accepted" if accepted else "no_relevant_information",
-        results=results if accepted else (),
+        results=kept if accepted else (),
         top_cosine_similarity=top_cosine,
         keyword_overlap=overlap,
     )
