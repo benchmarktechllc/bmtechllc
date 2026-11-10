@@ -639,7 +639,9 @@ class AskClient(discord.Client):
                 logger.exception("Failed to send the error reply for message %s.", message.id)
             return
         view = None
-        if response.status == "no_relevant_information" and MODEL_UNAVAILABLE_REPLY not in response.answer:
+        if MODEL_UNAVAILABLE_REPLY not in response.answer and (
+            response.status == "no_relevant_information" or UNKNOWN_INVITE in response.answer
+        ):
             view = AddAnswerView()
         try:
             await deliver_channel_messages(message, parts, view=view)

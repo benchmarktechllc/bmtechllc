@@ -46,6 +46,59 @@ class RetrievalDecision:
 
 _KEYWORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9'-]*")
 _STOPWORDS = frozenset({"a", "an", "and", "are", "as", "at", "by", "for", "from", "how", "in", "is", "of", "on", "or", "the", "to", "what", "when", "which", "who", "with"})
+_QUESTION_WORD = re.compile(r"\b(?:what|what's|which|who|how|why|when|where)\b", re.IGNORECASE)
+_SUBQUESTION_SPLIT = re.compile(r"\s*(?:\?|;|\band\b|&)\s*", re.IGNORECASE)
+# Phrases people use for a project or system that the indexed text names differently.
+_QUERY_EXPANSIONS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
+    (
+        re.compile(r"\brag\s+tool\b", re.IGNORECASE),
+        ("benchmark-cli-tool", "retrieval-only RAG CLI"),
+    ),
+    (
+        re.compile(r"\b(?:kb|knowledge\s+base)\s+portal\b", re.IGNORECASE),
+        ("knowledge base portal", "portal", "Discord bot"),
+    ),
+    (
+        re.compile(r"\bfireflies\b", re.IGNORECASE),
+        ("Fireflies meeting transcript", "meeting transcript"),
+    ),
+)
+FALLBACK_MIN_COSINE = 0.15
+
+
+def expand_queries(question: str) -> list[str]:
+    """Original question plus synonym searches for paraphrases of known systems."""
+    text = " ".join(question.split())
+    if not text:
+        return []
+    queries = [text]
+    for pattern, extras in _QUERY_EXPANSIONS:
+        if pattern.search(text) is None:
+            continue
+        for extra in extras:
+            queries.append(extra)
+            queries.append(f"{text} {extra}")
+    seen: set[str] = set()
+    unique: list[str] = []
+    for query in queries:
+        key = query.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(query)
+    return unique
+
+
+def split_subquestions(question: str) -> list[str]:
+    """Split a question that asks two things. A single clause stays intact."""
+    text = " ".join(question.split())
+    pieces = [piece.strip(" ?.") for piece in _SUBQUESTION_SPLIT.split(text) if piece.strip(" ?.")]
+    if len(pieces) < 2:
+        return [text] if text else []
+    questionish = [piece for piece in pieces if _QUESTION_WORD.search(piece)]
+    if len(questionish) >= 2:
+        return questionish
+    return [text]
 
 
 def meaningful_keyword_overlap(query: str, candidates: Sequence[HybridSearchResult]) -> int:
@@ -190,29 +243,35 @@ def retrieve_evidence(
         raise ValueError("min_keyword_overlap must not be negative.")
     pooled: list[HybridSearchResult] = []
     per_source = max(PER_SOURCE_LIMIT, 1)
-    for source_type in (*RETRIEVAL_SOURCES, None):
-        pooled.extend(
-            search_docs(
-                query,
-                per_source,
-                speaker=speaker,
-                source=source,
-                date=date,
-                include_synthetic=include_synthetic,
-                source_type=source_type,
+    expanded = []
+    for part in split_subquestions(query) or [query]:
+        expanded.extend(expand_queries(part))
+    if query.strip() and query.strip() not in expanded:
+        expanded.insert(0, query.strip())
+    for expanded_query in expanded:
+        for source_type in (*RETRIEVAL_SOURCES, None):
+            pooled.extend(
+                search_docs(
+                    expanded_query,
+                    per_source,
+                    speaker=speaker,
+                    source=source,
+                    date=date,
+                    include_synthetic=include_synthetic,
+                    source_type=source_type,
+                )
             )
-        )
     results = tuple(apply_source_quota(pooled, per_source=per_source, limit=max(top_k, per_source * 4)))
     top_cosine = max(
         (result.vector_score for result in results if result.vector_score is not None), default=None
     )
-    overlap = meaningful_keyword_overlap(query, results)
-    accepted = (
-        bool(results)
-        and top_cosine is not None
-        and top_cosine >= min_cosine_similarity
-        and overlap >= min_keyword_overlap
-    )
+    overlap = meaningful_keyword_overlap(" ".join(expanded), results)
+    lexical = overlap >= min_keyword_overlap
+    semantic = top_cosine is not None and top_cosine >= min_cosine_similarity
+    # A paraphrase can share the expanded words and still sit under the strict
+    # cosine bar. Keep those hits so the model can accept or reject them.
+    weak_semantic = top_cosine is None or top_cosine >= min(min_cosine_similarity, FALLBACK_MIN_COSINE)
+    accepted = bool(results) and lexical and (semantic or weak_semantic)
     return RetrievalDecision(
         status="accepted" if accepted else "no_relevant_information",
         results=results if accepted else (),

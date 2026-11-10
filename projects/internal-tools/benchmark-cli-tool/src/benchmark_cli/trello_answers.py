@@ -716,6 +716,11 @@ _BOARD_OVERVIEW = re.compile(
     r"\bwhat(?:'s| is)\s+on\s+(?:the\s+)?(?:trello\s+)?board\b|\bsummarize the board\b",
     re.IGNORECASE,
 )
+
+
+def asks_for_board_overview(question: str) -> bool:
+    """A summary of the whole board, not one list."""
+    return _BOARD_OVERVIEW.search(question) is not None
 _URGENT = re.compile(r"\b(?:most\s+urgent|urgent\s+tickets?|highest\s+severity)\b", re.IGNORECASE)
 _KB_FAMILY = re.compile(
     r"\b(?:knowledge\s+base|kb|docs|doc\s+site|documentation|portal)\b",
@@ -1182,16 +1187,40 @@ def _topic_hit(topic: str, card: TrelloCardRow) -> bool:
     return bool(terms) and all(term in blob.casefold() for term in terms)
 
 
+def overview_list_counts(rows: Sequence[TrelloCardRow]) -> dict[str, int]:
+    """Count of indexed cards in every list, including Sev lists and Done."""
+    counts: dict[str, int] = {}
+    for card in _usable_cards(rows):
+        label = _list_label(card)
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def overview_covers_every_list(answer: str, rows: Sequence[TrelloCardRow]) -> bool:
+    """A board summary has to name every list and its count, including Sev lists."""
+    counts = overview_list_counts(rows)
+    if not counts:
+        return True
+    for label, count in counts.items():
+        escaped = re.escape(label)
+        named = re.search(rf"\b{escaped}\b", answer, re.IGNORECASE) is not None
+        counted = re.search(
+            rf"\b{escaped}\b[^,\n.]{{0,24}}?\b{count}\b|\b{count}\b[^,\n.]{{0,24}}?\b{escaped}\b",
+            answer,
+            re.IGNORECASE,
+        )
+        if not named or counted is None:
+            return False
+    return True
+
+
 def _overview_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
     if _BOARD_OVERVIEW.search(question) is None:
         return None
     usable = _usable_cards(rows)
     if not usable:
         return None
-    counts: dict[str, int] = {}
-    for card in usable:
-        label = _list_label(card)
-        counts[label] = counts.get(label, 0) + 1
+    counts = overview_list_counts(rows)
     summary = ", ".join(f"{name} {count}" for name, count in counts.items())
     open_cards = [card for card in usable if _normalize(card.list_name) != "done"]
     lines = [summary, ""]
