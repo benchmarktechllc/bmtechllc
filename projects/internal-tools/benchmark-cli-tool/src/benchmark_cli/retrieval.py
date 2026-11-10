@@ -240,6 +240,31 @@ def search_docs(
     ]
 
 
+def _promote_synonym_matches(
+    query: str, pooled: list[HybridSearchResult]
+) -> list[HybridSearchResult]:
+    """Keep chunks that use a mapped name ahead of the source quota.
+
+    The original wording can fill every source slot with unrelated hits.
+    The chunks that actually say ``benchmark-cli-tool`` or ``RAG CLI`` would
+    then never reach the synonym check.
+    """
+    phrases = []
+    for part in split_subquestions(query) or [query]:
+        phrases.extend(synonym_phrases_for(part))
+    if not phrases:
+        return pooled
+    folded = [phrase.casefold() for phrase in phrases]
+
+    def matches(result: HybridSearchResult) -> bool:
+        text = result.chunk.chunk_text.casefold()
+        return any(phrase in text for phrase in folded)
+
+    return [result for result in pooled if matches(result)] + [
+        result for result in pooled if not matches(result)
+    ]
+
+
 def retrieve_evidence(
     query: str,
     top_k: int = 5,
@@ -276,6 +301,7 @@ def retrieve_evidence(
                     source_type=source_type,
                 )
             )
+    pooled = _promote_synonym_matches(query, pooled)
     results = tuple(apply_source_quota(pooled, per_source=per_source, limit=max(top_k, per_source * 4)))
     top_cosine = max(
         (result.vector_score for result in results if result.vector_score is not None), default=None

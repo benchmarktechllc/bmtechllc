@@ -33,6 +33,7 @@ from .grounding import (
     scrub_response,
     stated_employee_count_answer,
     synced_channels_answer,
+    synonym_evidence_answer,
 )
 from .ingestion.clean import redact_secrets
 from .llm import ModelQuotaError, _quota_error, call_llm, call_llm_structured
@@ -59,6 +60,7 @@ from .trello_answers import (
     asks_for_board_overview,
     asks_for_done_vs_open,
     asks_for_project_status,
+    asks_for_sev_meaning,
     asks_for_trello_board_link,
     bare_list_name,
     board_link_from_chunk_rows,
@@ -550,13 +552,6 @@ def _model_user_text(question: str, thread_question: str | None) -> str:
     )
 
 
-def _sev_meaning_question(question: str) -> bool:
-    return (
-        re.search(r"\bmeans?\b", question, re.IGNORECASE) is not None
-        and re.search(r"\bsev\s*\d", question, re.IGNORECASE) is not None
-    )
-
-
 def _sev_meaning_explained(answer: str) -> bool:
     folded = answer.casefold()
     return "urgent" in folded or "severity" in folded
@@ -566,7 +561,7 @@ def _part_covered(part: str, answer: str) -> bool:
     folded = answer.casefold()
     if asks_for_synced_channels(part):
         return "channel" in folded or "#" in answer
-    if re.search(r"\bmeans?\b", part, re.IGNORECASE) and re.search(r"\bsev\s*\d", part, re.IGNORECASE):
+    if asks_for_sev_meaning(part):
         return "urgent" in folded or "severity" in folded
     if re.search(r"\bsev\s*\d", part, re.IGNORECASE):
         return re.search(r"\bsev\s*\d", answer, re.IGNORECASE) is not None
@@ -825,20 +820,22 @@ def _deterministic_fallback(
     certificate = certificate_link_answer(question, chunks)
     if certificate is not None:
         return certificate
-    if rows is None:
-        return _active_project_fallback(question, chunks)
-    if asks_for_trello_board_link(question):
-        linked = _board_link_response(rows)
-        if linked is not None and linked.status == "answered":
-            return linked
-    listed = answer_board_question(question, rows, thread_question=thread_question)
-    if listed is not None:
-        return listed
-    if rows:
-        status = project_status_answer(question, rows)
-        if status is not None:
-            return status
-    return _active_project_fallback(question, chunks)
+    if rows is not None:
+        if asks_for_trello_board_link(question):
+            linked = _board_link_response(rows)
+            if linked is not None and linked.status == "answered":
+                return linked
+        listed = answer_board_question(question, rows, thread_question=thread_question)
+        if listed is not None:
+            return listed
+        if rows:
+            status = project_status_answer(question, rows)
+            if status is not None:
+                return status
+    active = _active_project_fallback(question, chunks)
+    if active is not None and active.status == "answered":
+        return active
+    return synonym_evidence_answer(question, chunks)
 
 
 def run_agent(
@@ -987,7 +984,7 @@ def run_agent(
             return None
         if asks_for_done_vs_open(question) and not done_vs_open_is_complete(validated.answer, snapshot):
             return None
-        if _sev_meaning_question(question) and not _sev_meaning_explained(validated.answer):
+        if asks_for_sev_meaning(question) and not _sev_meaning_explained(validated.answer):
             return None
         return validated
 
@@ -1026,16 +1023,19 @@ def run_agent(
             logger.info("The answer service is rate limited; using indexed data when it can answer.")
             return _quota_reply()
     checked_retry = _checked(retry)
-    if checked_retry is not None and (
-        checked_retry.status == "no_relevant_information"
-        or not answer_is_bare_cards(checked_retry.answer)
+    if (
+        checked_retry is not None
+        and checked_retry.status == "answered"
+        and not answer_is_bare_cards(checked_retry.answer)
     ):
-        if checked_retry.status == "answered":
-            return _deliver_parts(checked_retry, outcome="answered_after_citation_retry", synthesis_attempts=2)
-        return _deliver_parts(checked_retry, outcome="model_abstained", synthesis_attempts=2)
+        return _deliver_parts(checked_retry, outcome="answered_after_citation_retry", synthesis_attempts=2)
+    # A board, list, or synonym chunk can answer after the model abstains.
+    # Do not drop that evidence just because retrieval or the draft failed.
     fallback = _deterministic_fallback(question, thread_question, snapshot, tuple(evidence.values()))
     if fallback is not None:
         return _deliver_parts(fallback, outcome="deterministic_fallback", synthesis_attempts=2)
+    if checked_retry is not None and checked_retry.status == "no_relevant_information":
+        return _deliver_parts(checked_retry, outcome="model_abstained", synthesis_attempts=2)
     if checked is not None and checked.status == "no_relevant_information":
         return _deliver_parts(checked, outcome="model_abstained", synthesis_attempts=1)
     return _deliver_parts(_no_information(), outcome="validation_failed", synthesis_attempts=2)

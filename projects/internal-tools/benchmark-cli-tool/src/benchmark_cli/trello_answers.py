@@ -713,7 +713,18 @@ _WHO_OWNS = re.compile(
     re.IGNORECASE,
 )
 _BOARD_OVERVIEW = re.compile(
-    r"\bwhat(?:'s| is)\s+on\s+(?:the\s+)?(?:trello\s+)?board\b|\bsummarize the board\b",
+    r"\bwhat(?:'s| is)\s+on\s+(?:the\s+)?(?:trello\s+)?board\b"
+    r"|\bsummar\w*\s+(?:the\s+)?(?:trello\s+)?board\b"
+    r"|\b(?:summary|overview)\s+of\s+(?:the\s+)?(?:trello\s+)?board\b"
+    r"|\bboard\s+(?:summary|overview)\b",
+    re.IGNORECASE,
+)
+_SEV_MEANING = re.compile(
+    r"\b(?:what\s+does|what\s+is|what's|explain|define|meaning\s+of)\s+"
+    r"(?:a\s+)?sev(?:erity)?\s*(?P<level>[1-9])\b"
+    r"|\bsev(?:erity)?\s*(?P<level2>[1-9])\b\s*(?:mean(?:ing|s)?|definition)\b"
+    r"|\b(?:mean(?:ing|s)?|definition|explain|define)\b.{0,40}\bsev(?:erity)?\s*(?P<level3>[1-9])\b"
+    r"|\bsev(?:erity)?\s*(?P<level4>[1-9])\b.{0,40}\b(?:mean(?:ing|s)?|definition|explain|define)\b",
     re.IGNORECASE,
 )
 
@@ -766,6 +777,13 @@ def board_question(question: str, thread_question: str | None = None) -> bool:
         return True
     if _blocked_board_question(question):
         return False
+    if asks_for_board_overview(question) or asks_for_sev_meaning(question):
+        return True
+    if (
+        re.search(r"\b(?:board|tickets?|cards?)\b", question, re.IGNORECASE)
+        and _PROCEDURE.search(question) is None
+    ):
+        return True
     if (
         requested_trello_list(question) is not None
         or bare_list_name(question) is not None
@@ -1321,17 +1339,17 @@ def _sev_definition(rows: Sequence[TrelloCardRow], level: int) -> str:
     return ""
 
 
+def asks_for_sev_meaning(question: str) -> bool:
+    """A definition of a severity list, not a request for the cards in it."""
+    return _SEV_MEANING.search(question) is not None
+
+
 def _sev_meaning_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
     """Explain a Sev list instead of only dumping its cards."""
-    match = re.search(
-        r"\bsev(?:erity)?\s*(?P<level>[1-9])\b.{0,40}\bmeans?\b"
-        r"|\bmeans?\b.{0,40}\bsev(?:erity)?\s*(?P<level2>[1-9])\b",
-        question,
-        re.IGNORECASE,
-    )
+    match = _SEV_MEANING.search(question)
     if match is None:
         return None
-    level = int(match.group("level") or match.group("level2"))
+    level = int(next(group for group in match.groups() if group))
     usable = _usable_cards(rows)
     on_list = [card for card in usable if _sev_number(card.list_name) == level]
     definition = _sev_definition(rows, level)

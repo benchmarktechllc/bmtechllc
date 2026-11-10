@@ -27,7 +27,7 @@ from .entailment import (
 from .ingestion.clean import redact_secrets
 from .models import AnswerResponse, Citation
 from .portal_urls import portal_home_from_metadata, portal_home_url
-from .retrieval import HybridSearchResult
+from .retrieval import HybridSearchResult, chunk_matches_synonym
 from .storage.postgres import SearchChunk
 
 logger = logging.getLogger(__name__)
@@ -279,6 +279,39 @@ def certificate_link_answer(
         confidence=0.0,
         citations=[],
     )
+
+
+def synonym_evidence_answer(
+    question: str, chunks: Sequence[SearchChunk]
+) -> AnswerResponse | None:
+    """Quote a chunk that uses the indexed name for a paraphrase such as RAG tool."""
+    for chunk in chunks:
+        if not chunk.content_sha256 or not chunk_matches_synonym(question, chunk.chunk_text):
+            continue
+        quote = ""
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", chunk.chunk_text):
+            cleaned = sentence.strip()
+            if cleaned and cleaned in chunk.chunk_text and chunk_matches_synonym(question, cleaned):
+                quote = cleaned
+                break
+        if not quote and chunk_matches_synonym(question, chunk.chunk_text):
+            quote = chunk.chunk_text.strip()
+        if not quote or quote not in chunk.chunk_text:
+            continue
+        return AnswerResponse(
+            status="answered",
+            answer=quote,
+            confidence=0.7,
+            citations=[
+                Citation(
+                    source_file=chunk.source_file,
+                    chunk_id=chunk.id,
+                    content_sha256=chunk.content_sha256,
+                    quote=quote,
+                )
+            ],
+        )
+    return None
 
 
 def credential_refusal() -> AnswerResponse:
