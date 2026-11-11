@@ -29,6 +29,11 @@ _BOARD = {
     "name": "BMTech General Board",
     "shortLink": "tIvVZqio",
     "url": "https://trello.com/b/tIvVZqio/bmtech-general-board",
+    "members": [
+        {"id": "member-1", "fullName": "Sample Person", "username": "sample"},
+        {"id": "member-2", "fullName": "", "username": "sampletwo"},
+        {"id": "member-blank", "fullName": "   ", "username": ""},
+    ],
     "lists": [{"id": "list-1", "name": "Doing"}],
     "cards": [
         {
@@ -40,6 +45,7 @@ _BOARD = {
             "idList": "list-1",
             "labels": [{"name": "Ops", "color": "green"}, {"name": "", "color": "red"}],
             "dateLastActivity": "2026-11-01T00:00:00.000Z",
+            "idMembers": ["member-1", "member-2", "missing-member", "member-blank"],
             "checklists": [
                 {
                     "name": "Steps",
@@ -92,6 +98,9 @@ def test_board_parser_keeps_open_cards_and_redacts_secrets() -> None:
     assert "- [ ] Write docs" in text
     assert "- [x] Review" in text
     assert trello_source_file(board.short_link, card.card_id) == "trello/tIvVZqio/card-1.md"
+    assert card.members == ("Sample Person", "sampletwo")
+    assert "Members: Sample Person, sampletwo" in text
+    assert "missing-member" not in text
 
     chunk = chunk_units(units, target_tokens=400, max_tokens=500, min_tokens=1)[0]
     metadata = metadata_for(chunk, Path("trello/tIvVZqio/card-1.md"), "trello")
@@ -105,6 +114,24 @@ def test_board_parser_keeps_open_cards_and_redacts_secrets() -> None:
     assert payload["due"] == "2026-12-01"
     assert payload["url"] == "https://trello.com/c/abc123"
     assert "Trello card" in embedding_prefix(metadata, "card-1.md")
+
+
+@pytest.mark.unit
+def test_fetch_board_requests_card_members() -> None:
+    seen: dict[str, str] = {}
+
+    class Client(TrelloRestClient):
+        def _request_json(self, path: str, params: dict[str, str] | None = None) -> object:
+            assert path == "/boards/board-1"
+            seen.update(params or {})
+            return _BOARD
+
+    board = Client("key", "token").fetch_board("board-1")
+
+    assert "idMembers" in seen["card_fields"]
+    assert seen["members"] == "all"
+    assert seen["member_fields"] == "fullName,username"
+    assert board.cards[0].members == ("Sample Person", "sampletwo")
 
 
 @pytest.mark.unit
