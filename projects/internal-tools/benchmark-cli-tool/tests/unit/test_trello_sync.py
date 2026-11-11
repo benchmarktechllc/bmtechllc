@@ -17,6 +17,7 @@ from benchmark_cli.models import ChunkMetadata
 from benchmark_cli.storage.postgres import TrelloSourceCard
 from benchmark_cli.trello_sync import (
     TrelloRestClient,
+    card_digest,
     parse_board,
     sync_board,
     trello_source_file,
@@ -266,8 +267,8 @@ def test_sync_indexes_changed_cards_and_removes_missing_ones(monkeypatch: pytest
     )
     monkeypatch.setattr("benchmark_cli.trello_sync.create_indexes", lambda: calls.append("indexes"))
 
-    # Activity matches the stored card, so this snapshot should not reindex it.
-    # A second card with new activity is added below by replacing the board.
+    # Same activity with a stale stored hash must be reindexed. The member line
+    # is new text even when dateLastActivity did not move.
     changed = board.cards[0]
     fresh = type(board)(
         board_id=board.board_id,
@@ -298,17 +299,69 @@ def test_sync_indexes_changed_cards_and_removes_missing_ones(monkeypatch: pytest
     reports = sync_board(client, "tIvVZqio")
     actions = {report.card_id: report.action for report in reports}
 
-    assert actions["card-1"] == "unchanged"
+    assert actions["card-1"] == "indexed"
     assert actions["card-2"] == "indexed"
     assert actions["gone"] == "removed"
-    assert client.comment_calls == ["card-2"]
-    indexed = next(item for item in calls if isinstance(item, dict))
-    assert indexed["source_type"] == "trello"
-    assert indexed["replace_existing"] is True
-    assert indexed["source_filename"] == "trello/tIvVZqio/card-2.md"
+    assert client.comment_calls == ["card-1", "card-2"]
+    indexed = [item for item in calls if isinstance(item, dict)]
+    assert {item["source_filename"] for item in indexed} == {
+        "trello/tIvVZqio/card-1.md",
+        "trello/tIvVZqio/card-2.md",
+    }
+    assert all(item["source_type"] == "trello" and item["replace_existing"] is True for item in indexed)
     assert ("delete", "trello/tIvVZqio/gone.md") in calls
     assert ("forget", "board-1", "gone") in calls
     assert calls[-1] == "indexes"
+
+
+@pytest.mark.unit
+def test_matching_rendered_text_skips_embedding(monkeypatch: pytest.MonkeyPatch) -> None:
+    board = parse_board(_BOARD)
+    card = board.cards[0]
+    digest = card_digest(card, units_for_card(board, card))
+    stored = TrelloSourceCard(
+        board_id=board.board_id,
+        card_id=card.card_id,
+        source_file="trello/tIvVZqio/card-1.md",
+        list_name=card.list_name,
+        card_name=card.name,
+        card_url=card.url,
+        labels=card.labels,
+        due_at=card.due,
+        content_sha256=digest,
+        last_activity_at=card.last_activity,
+    )
+    ingested: list[str] = []
+
+    class Client:
+        def fetch_board(self, board_id: str) -> object:
+            assert board_id == board.board_id
+            return board
+
+        def card_comments(self, card_id: str) -> tuple[object, ...]:
+            assert card_id == card.card_id
+            return ()
+
+    monkeypatch.setattr("benchmark_cli.trello_sync.initialize_database", lambda: None)
+    monkeypatch.setattr(
+        "benchmark_cli.trello_sync.trello_source_cards",
+        lambda board_id: {stored.card_id: stored},
+    )
+    monkeypatch.setattr(
+        "benchmark_cli.trello_sync.ingest_units",
+        lambda units, **kwargs: ingested.append(kwargs["source_filename"]) or {"chunks": 1},
+    )
+    monkeypatch.setattr("benchmark_cli.trello_sync.delete_source", lambda source: None)
+    monkeypatch.setattr("benchmark_cli.trello_sync.delete_trello_source_card", lambda *args: None)
+    monkeypatch.setattr("benchmark_cli.trello_sync.upsert_trello_source_card", lambda row: None)
+    monkeypatch.setattr("benchmark_cli.trello_sync.set_trello_sync_state", lambda *args: None)
+    monkeypatch.setattr("benchmark_cli.trello_sync.create_indexes", lambda: None)
+
+    reports = sync_board(Client(), board.board_id)
+
+    assert reports[0].action == "unchanged"
+    assert reports[0].chunks == 0
+    assert ingested == []
 
 
 @pytest.mark.unit

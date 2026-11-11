@@ -4,8 +4,9 @@ Pulls open lists and cards from the Trello REST API, including descriptions,
 checklists, and comments. Each card becomes one source,
 ``trello/<shortLink>/<cardId>.md``, and is replaced as a unit, the same way a
 Discord channel is replaced. Cards that leave the open board are deleted from
-``document_chunks``. A card whose ``dateLastActivity`` is unchanged since the
-last successful index skips the comment fetch and the embedding call.
+``document_chunks``. A card is reindexed when its rendered text changes, even
+if ``dateLastActivity`` is unchanged. A matching content hash still skips the
+embedding call.
 
 The default board is the BMTech General Board, short link ``tIvVZqio``.
 Override it with ``TRELLO_BOARD_ID`` or ``--board``. ``benchmark-sync-trello``
@@ -333,11 +334,6 @@ def sync_board(
         seen.add(card.card_id)
         source = trello_source_file(board.short_link, card.card_id)
         previous = stored.get(card.card_id)
-        if previous is not None and _same_moment(previous.last_activity_at, card.last_activity):
-            reports.append(
-                CardSyncReport(board.board_id, card.card_id, card.name, source, "unchanged", 0)
-            )
-            continue
         full = replace(card, comments=client.card_comments(card.card_id))
         units = units_for_card(board, full)
         digest = card_digest(full, units)
@@ -520,16 +516,6 @@ def _parse_time(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
-
-
-def _same_moment(left: datetime | None, right: datetime | None) -> bool:
-    if left is None or right is None:
-        return False
-    if left.tzinfo is None:
-        left = left.replace(tzinfo=UTC)
-    if right.tzinfo is None:
-        right = right.replace(tzinfo=UTC)
-    return left.astimezone(UTC) == right.astimezone(UTC)
 
 
 def _retry_after(exc: HTTPError) -> float:
