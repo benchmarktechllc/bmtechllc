@@ -54,3 +54,6 @@ select = ["E4", "E7", "E9", "F", "I", "UP"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/benchmark_cli"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/benchmark_cli/roster.json" = "benchmark_cli/roster.json"

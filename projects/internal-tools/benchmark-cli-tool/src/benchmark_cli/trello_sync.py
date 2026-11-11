@@ -31,6 +31,7 @@ from urllib.request import Request, urlopen
 from .config import TRELLO_API_BASE_URL, TRELLO_API_KEY, TRELLO_BOARD_ID, TRELLO_TOKEN
 from .ingestion.clean import RawUnit, normalize_text
 from .ingestion.pipeline import content_hash, ingest_units
+from .names import render_members
 from .storage.postgres import (
     TrelloSourceCard,
     create_indexes,
@@ -313,7 +314,7 @@ def units_for_card(board: TrelloBoard, card: TrelloCard) -> list[RawUnit]:
     if card.due is not None:
         lines.append(f"Due: {card.due.date().isoformat()}")
     if card.members:
-        lines.append("Members: " + ", ".join(card.members))
+        lines.append("Members: " + render_members(card.members))
     if card.last_activity is not None:
         lines.append(f"Last activity: {card.last_activity.date().isoformat()}")
     if card.checklists:

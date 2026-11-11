@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 from .ingestion.clean import redact_secrets
 from .models import AnswerResponse, Citation
+from .names import member_matches_person, resolve_question, split_members_field
 from .storage.postgres import SearchChunk
 
 MAX_LISTED_CARDS = 25
@@ -784,7 +785,7 @@ def _blocked_board_question(question: str) -> bool:
 def _members_of(card: TrelloCardRow) -> list[str]:
     for line in card.chunk_text.splitlines():
         if line.strip().lower().startswith("members:"):
-            return [part.strip() for part in line.split(":", 1)[1].split(",") if part.strip()]
+            return split_members_field(line.split(":", 1)[1])
     return []
 
 
@@ -1125,7 +1126,18 @@ def _assignee_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResp
     if match is None:
         return None
     who = match.group(1).strip(" ?.")
-    matched = [card for card in usable if any(who.casefold() in name.casefold() for name in _members_of(card))]
+    people = resolve_question(question).people
+    if people:
+        matched = [
+            card
+            for card in usable
+            if any(member_matches_person(name, person) for name in _members_of(card) for person in people)
+        ]
+        who = people[0].canonical
+    else:
+        matched = [
+            card for card in usable if any(who.casefold() in name.casefold() for name in _members_of(card))
+        ]
     if not matched:
         return AnswerResponse(
             status="no_relevant_information",
@@ -1309,6 +1321,9 @@ def answer_board_question(
         requested = resolve_board_list(question, known)
         if requested is not None:
             deterministic = trello_list_answer(requested, rows, fit_to_discord=False)
+    assignee = _assignee_answer(question, rows)
+    if assignee is not None and re.search(r"\b(?:assigned to|assignee)\b", question, re.IGNORECASE):
+        return assignee
     accepted = grounded_draft(draft, rows)
     if accepted is not None and _draft_matches_request(question, accepted, rows):
         return _state_count(question, accepted, rows)

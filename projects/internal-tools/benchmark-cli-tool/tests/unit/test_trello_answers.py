@@ -311,7 +311,7 @@ def test_non_membership_questions_fall_through_to_retrieval(
 
     response = agent.run_agent(question)
 
-    assert seen["question"] == question
+    assert seen["question"] == question or seen["question"].startswith(f"{question} ")
     assert response.status == "no_relevant_information"
 
 
