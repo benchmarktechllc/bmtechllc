@@ -14,6 +14,9 @@ RUN pip install --no-cache-dir -e . \
     && useradd --create-home --uid 10001 bmtech \
     && chown -R bmtech:bmtech /opt/benchmark-cli-tool
 
+# Usage logs must not be written next to the installed package.
+ENV BENCHMARK_LOG_DIR=/opt/benchmark-cli-tool/artifacts
+
 USER bmtech
 
 CMD ["benchmark-discord-ask"]

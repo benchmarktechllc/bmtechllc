@@ -142,10 +142,10 @@ def test_agent_returns_cited_evidence_excerpts_after_two_invalid_syntheses(
 
     response = agent.run_agent("What was discussed about VM?", tier="cheap")
 
-    assert response.status == "answered"
-    assert response.citations[0].quote == "VM performance and best practices were discussed."
-    assert _citations_are_exact(response, {7: chunk})
-    assert diagnostics == [("evidence_excerpt_fallback", 2)]
+    assert response.status == "no_relevant_information"
+    assert "VM performance" not in response.answer
+    assert response.citations == []
+    assert diagnostics[-1][0] == "validation_failed"
 
 
 @pytest.mark.unit

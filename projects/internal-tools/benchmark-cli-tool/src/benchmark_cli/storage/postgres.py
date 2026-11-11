@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,6 +20,9 @@ from ..config import (
 )
 from ..corpus import BOILERPLATE_SQL, SYNTHETIC_CORPUS_SQL
 from ..models import GoldenChunkReference
+
+logger = logging.getLogger(__name__)
+_borrowed = threading.local()
 
 SQL_DIR = Path(__file__).with_name("sql")
 
@@ -128,6 +133,7 @@ class SearchFilters:
     source: str | None = None
     date: str | None = None
     include_synthetic: bool = False
+    source_type: str | None = None
 
     def __post_init__(self) -> None:
         for field_name, value in (("speaker", self.speaker), ("source", self.source)):
@@ -150,9 +156,27 @@ def _dependencies() -> tuple[Any, Any, Any]:
     return psycopg, register_vector, Json
 
 
+def query_was_canceled(exc: BaseException) -> bool:
+    """True for a Postgres statement timeout. The caller keeps other results."""
+    text = f"{type(exc).__name__} {exc}".casefold()
+    return (
+        "querycanceled" in text
+        or "canceling statement" in text
+        or "statement timeout" in text
+    )
+
+
 @contextmanager
 def connection() -> Iterator[Any]:
-    """Yield a configured pgvector connection."""
+    """Yield a configured pgvector connection.
+
+    A retrieval pass borrows one connection. Nested searches reuse it instead
+    of opening another connection per query.
+    """
+    borrowed = getattr(_borrowed, "conn", None)
+    if borrowed is not None:
+        yield borrowed
+        return
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not configured.")
     psycopg, register_vector, _ = _dependencies()
@@ -169,6 +193,42 @@ def connection() -> Iterator[Any]:
             )
             cursor.execute("SELECT set_config('hnsw.ef_search', %s, false)", (str(HNSW_EF_SEARCH),))
         yield conn
+
+
+@contextmanager
+def reuse_connection() -> Iterator[Any]:
+    """Hold one connection for every search in the current retrieval."""
+    if getattr(_borrowed, "conn", None) is not None:
+        yield _borrowed.conn
+        return
+    if not DATABASE_URL:
+        yield None
+        return
+    with connection() as conn:
+        _borrowed.conn = conn
+        try:
+            yield conn
+        finally:
+            _borrowed.conn = None
+
+
+def _fetch_chunks(statement: str, parameters: tuple[object, ...]) -> list[SearchChunk]:
+    """Run one read. A statement timeout returns no rows and resets the connection."""
+    try:
+        with connection() as conn, conn.cursor() as cursor:
+            cursor.execute(statement, parameters)
+            return [SearchChunk(*row) for row in cursor.fetchall()]
+    except Exception as exc:
+        if not query_was_canceled(exc):
+            raise
+        logger.warning("Retrieval query timed out; keeping results from other queries.")
+        borrowed = getattr(_borrowed, "conn", None)
+        if borrowed is not None:
+            try:
+                borrowed.rollback()
+            except Exception:
+                logger.warning("Could not reset the retrieval connection after a timeout.")
+        return []
 
 
 def apply_sql(filename: str) -> None:
@@ -536,6 +596,46 @@ def trello_card_rows() -> list[tuple[str, str, str, str, str, int, str, str, str
     return rows
 
 
+def board_url_chunk_rows(limit: int = 8) -> list[tuple[int, str, str, str]]:
+    """Chunks that mention a Trello board URL, including invite links.
+
+    Each tuple is ``(chunk_id, source_file, content_sha256, chunk_text)``.
+    Card rows only store ``/c/`` links, so a Discord line can still carry
+    ``trello.com/b/<id>/<slug>``.
+    """
+    if limit < 1:
+        return []
+    statement = """
+        SELECT id, source_file, content_sha256, chunk_text
+        FROM document_chunks
+        WHERE chunk_text ILIKE %s
+           OR chunk_text ILIKE %s
+        ORDER BY id
+        LIMIT %s
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, ("%trello.com/b/%", "%trello.com/invite/b/%", limit))
+        fetched = cursor.fetchall()
+    rows: list[tuple[int, str, str, str]] = []
+    for record in fetched:
+        if len(record) != 4:
+            continue
+        chunk_id, source_file, digest, chunk_text = record
+        if isinstance(chunk_id, bool):
+            continue
+        try:
+            parsed_id = int(chunk_id)
+        except (TypeError, ValueError):
+            continue
+        text = str(chunk_text or "")
+        source = str(source_file or "").strip()
+        hashed = str(digest or "").strip().lower()
+        if parsed_id < 1 or not source or not text:
+            continue
+        rows.append((parsed_id, source, hashed, text))
+    return rows
+
+
 def discord_source_messages(channel_id: str) -> list[DiscordSourceMessage]:
     """Return a channel's normalized source messages in chronological order."""
     statement = """
@@ -865,6 +965,9 @@ def _filters_where_clause(filters: SearchFilters) -> tuple[str, list[str]]:
     if filters.source is not None:
         clauses.append("source_file = %s")
         parameters.append(filters.source)
+    if filters.source_type is not None:
+        clauses.append("metadata ->> 'source_type' = %s")
+        parameters.append(filters.source_type)
     if filters.date is not None:
         clauses.append(
             """(
@@ -891,12 +994,19 @@ def vector_search(
     source: str | None = None,
     date: str | None = None,
     include_synthetic: bool = False,
+    source_type: str | None = None,
 ) -> list[SearchChunk]:
     """Return vector-ranked candidates independently of keyword retrieval."""
     if limit < 1:
         return []
     filter_clause, filter_parameters = _filters_where_clause(
-        SearchFilters(speaker, source, date, include_synthetic=include_synthetic)
+        SearchFilters(
+            speaker,
+            source,
+            date,
+            include_synthetic=include_synthetic,
+            source_type=source_type,
+        )
     )
     statement = """
         SELECT id, source_file, chunk_index, chunk_text, metadata,
@@ -908,12 +1018,10 @@ def vector_search(
         ORDER BY embedding <=> %s::vector
         LIMIT %s
     """
-    with connection() as conn, conn.cursor() as cursor:
-        cursor.execute(
-            statement,
-            (list(query_vector), *filter_parameters, list(query_vector), limit),
-        )
-        return [SearchChunk(*row) for row in cursor.fetchall()]
+    return _fetch_chunks(
+        statement,
+        (list(query_vector), *filter_parameters, list(query_vector), limit),
+    )
 
 
 def fts_search(
@@ -924,12 +1032,19 @@ def fts_search(
     source: str | None = None,
     date: str | None = None,
     include_synthetic: bool = False,
+    source_type: str | None = None,
 ) -> list[SearchChunk]:
     """Return PostgreSQL full-text-ranked candidates independently of vectors."""
     if not query.strip() or limit < 1:
         return []
     filter_clause, filter_parameters = _filters_where_clause(
-        SearchFilters(speaker, source, date, include_synthetic=include_synthetic)
+        SearchFilters(
+            speaker,
+            source,
+            date,
+            include_synthetic=include_synthetic,
+            source_type=source_type,
+        )
     )
     statement = """
         WITH query AS (
@@ -949,9 +1064,7 @@ def fts_search(
         LIMIT %s
     """
 
-    with connection() as conn, conn.cursor() as cursor:
-        cursor.execute(statement, (query, *filter_parameters, limit))
-        return [SearchChunk(*row) for row in cursor.fetchall()]
+    return _fetch_chunks(statement, (query, *filter_parameters, limit))
 
 
 def select_context_window(

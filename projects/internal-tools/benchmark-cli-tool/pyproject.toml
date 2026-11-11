@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "benchmark-cli-tool"
-version = "0.1.8"
+version = "0.1.9"
 description = "Document ingestion, hybrid retrieval, and retrieval evaluation"
 requires-python = ">=3.11"
 dependencies = [
@@ -31,12 +31,13 @@ benchmark-sync-trello = "benchmark_cli.trello_sync:main"
 benchmark-sync-fathom = "benchmark_cli.fathom_sync:main"
 benchmark-sync-fireflies = "benchmark_cli.fireflies_sync:main"
 benchmark-discord-ask = "benchmark_cli.discord_ask:main"
+benchmark-remove-contribution = "benchmark_cli.contributions:main"
 benchmark-acceptance = "benchmark_cli.acceptance:main"
 
 [tool.pytest.ini_options]
 addopts = "-m 'not integration_live'"
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = [".", "src"]
 markers = [
   "unit: deterministic isolated tests",
   "integration: tests requiring a local PostgreSQL service",
