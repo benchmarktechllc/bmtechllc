@@ -1198,6 +1198,103 @@ def _topic_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerRespons
     return trello_list_answer(OPEN_LISTS, usable, fit_to_discord=False)
 
 
+_PLATE = re.compile(
+    r"\b(?:on (?:our|the) plate|what(?:'s| is) left|what(?:'s| is) the deal with|anything about)\b",
+    re.IGNORECASE,
+)
+_PLATE_SKIP = frozenset(
+    {
+        "anything",
+        "about",
+        "there",
+        "what",
+        "whats",
+        "left",
+        "deal",
+        "with",
+        "our",
+        "plate",
+        "the",
+        "for",
+        "project",
+        "projects",
+        "work",
+        "still",
+        "remaining",
+        "else",
+    }
+)
+
+
+def plate_terms(question: str) -> list[str] | None:
+    """Content words for 'on our plate', 'what's left', or 'the deal with'."""
+    if _PLATE.search(question) is None:
+        return None
+    terms: list[str] = []
+    for token in re.findall(r"[a-z0-9]+", question.casefold()):
+        if len(token) < 3 or token in _PLATE_SKIP or token in terms:
+            continue
+        terms.append(token)
+    return terms
+
+
+def topic_with_notes(
+    question: str,
+    rows: Sequence[TrelloCardRow],
+    chunks: Sequence[SearchChunk] = (),
+) -> AnswerResponse | None:
+    """Cards and notes about a project or topic, not a vendor decision."""
+    terms = plate_terms(question)
+    if not terms:
+        return None
+    open_only = re.search(r"\b(?:plate|left)\b", question, re.IGNORECASE) is not None
+    cards = []
+    for card in _usable_cards(rows):
+        if open_only and _normalize(card.list_name) == "done":
+            continue
+        blob = f"{card.title} {card.chunk_text}".casefold()
+        if all(term in blob for term in terms):
+            cards.append(card)
+    notes: list[tuple[SearchChunk, str]] = []
+    for chunk in chunks:
+        if str((chunk.metadata or {}).get("source_type") or "") == "trello" or not chunk.content_sha256:
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", chunk.chunk_text):
+            cleaned = sentence.strip()
+            folded = cleaned.casefold()
+            if not cleaned or cleaned not in chunk.chunk_text:
+                continue
+            if all(term in folded for term in terms):
+                notes.append((chunk, cleaned))
+                break
+    if not cards and not notes:
+        return None
+    lines: list[str] = []
+    if cards:
+        lines.append("Open Trello cards:" if open_only else "Trello cards:")
+        lines.extend(_bullet(card) for card in cards)
+    if notes:
+        if lines:
+            lines.append("")
+        lines.extend(sentence for _chunk, sentence in notes[:2])
+    citations = [_citation(card) for card in cards]
+    citations.extend(
+        Citation(
+            source_file=chunk.source_file,
+            chunk_id=chunk.id,
+            content_sha256=chunk.content_sha256 or "",
+            quote=sentence,
+        )
+        for chunk, sentence in notes[:2]
+    )
+    return AnswerResponse(
+        status="answered",
+        answer="\n".join(lines),
+        confidence=0.75,
+        citations=citations,
+    )
+
+
 def _topic_hit(topic: str, card: TrelloCardRow) -> bool:
     blob = f"{card.title} {_card_description(card)}"
     if _KB_FAMILY.search(topic):

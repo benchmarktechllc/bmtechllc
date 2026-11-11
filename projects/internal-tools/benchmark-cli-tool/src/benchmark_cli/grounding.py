@@ -258,7 +258,7 @@ def certificate_link_answer(
             continue
         for sentence in re.split(r"(?<=[.!?])\s+|\n+", chunk.chunk_text):
             cleaned = sentence.strip()
-            if not cleaned or cleaned not in chunk.chunk_text or not re.search(r"\bcourse\b", cleaned, re.IGNORECASE):
+            if not cleaned or cleaned not in chunk.chunk_text or not _related_course(cleaned):
                 continue
             return AnswerResponse(
                 status="answered",
@@ -281,7 +281,16 @@ def certificate_link_answer(
     )
 
 
+_RELATED_COURSE = re.compile(
+    r"\b(?:courses?|lessons?|trainings?|workshops?)\b|\bin\s+\d+\s*min\b",
+    re.IGNORECASE,
+)
 _NAMED_PRODUCTS = ("fireflies", "fathom", "anthropic")
+_DEFINITION_SOURCES = frozenset({"kb_page", "discord", "policy_doc", "user_contributed"})
+_MODEL_CHOICE = re.compile(
+    r"\b(?:what|which)\s+models?\b|\bshould\s+we\s+use\b",
+    re.IGNORECASE,
+)
 _RAG_TOOL = re.compile(r"\brag\s+tool\b", re.IGNORECASE)
 _RAG_NAME = re.compile(r"benchmark-cli-tool|\brag cli\b", re.IGNORECASE)
 _RAG_DOES = re.compile(
@@ -305,8 +314,23 @@ _COUNT_LINE = re.compile(
 _BULLET_LINE = re.compile(r"^(?:[-*]|\d+\.)\s+\S")
 
 
+def _related_course(sentence: str) -> bool:
+    """A course title such as ``Agentic AI in 38 min``, not only the word course."""
+    return _RELATED_COURSE.search(sentence) is not None
+
+
+def related_course_quote(chunks: Sequence[SearchChunk]) -> str:
+    """A sentence that names a related course, when the evidence has one."""
+    for chunk in chunks:
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", chunk.chunk_text):
+            cleaned = sentence.strip()
+            if cleaned and cleaned in chunk.chunk_text and _related_course(cleaned):
+                return cleaned
+    return ""
+
+
 def named_products(question: str) -> tuple[str, ...]:
-    """Products the question names. A synonym is not one of these."""
+    """Vendor or product decisions. Project words such as kiosk are not products."""
     folded = question.casefold()
     return tuple(name for name in _NAMED_PRODUCTS if re.search(rf"\b{name}\b", folded))
 
@@ -395,6 +419,37 @@ def answer_defines_rag_tool(answer: str) -> bool:
     return True
 
 
+def _usable_rag_definition(sentence: str) -> bool:
+    """A sentence that says what the CLI is. An ingest-job line is not one."""
+    folded = sentence.casefold()
+    names_tool = _RAG_NAME.search(sentence) is not None or "retrieval-only" in folded
+    if not names_tool:
+        return False
+    ingest = re.search(r"\bingest", folded) is not None
+    describes = "retrieval-only" in folded or "rag cli" in folded or _RAG_DOES.search(sentence) is not None
+    if ingest and "retrieval-only" not in folded and "rag cli" not in folded:
+        return False
+    return describes
+
+
+def rag_answer_quotes_definition(answer: str, chunks: Sequence[SearchChunk]) -> bool:
+    """Keep a reply only when it uses a definition, not an ingest-job list."""
+    folded = answer.casefold()
+    definitions = [
+        sentence
+        for chunk in chunks
+        for sentence in _sentences(chunk.chunk_text)
+        if sentence in chunk.chunk_text and _usable_rag_definition(sentence)
+    ]
+    if not definitions:
+        return False
+    if "ingest" in folded and "retrieval-only" not in folded and "rag cli" not in folded:
+        return False
+    return any(sentence.casefold() in folded for sentence in definitions) or (
+        "retrieval-only" in folded and "rag cli" in folded
+    )
+
+
 def evidence_explains_portal(chunks: Sequence[SearchChunk]) -> bool:
     return any(_PORTAL_EXPLAIN.search(chunk.chunk_text) for chunk in chunks)
 
@@ -409,23 +464,43 @@ def rag_tool_definition(question: str, chunks: Sequence[SearchChunk]) -> AnswerR
             continue
         sentences = [sentence for sentence in _sentences(chunk.chunk_text) if sentence in chunk.chunk_text]
         for index, sentence in enumerate(sentences):
-            if not _RAG_NAME.search(sentence):
-                continue
-            if _RAG_JOB.search(sentence) and not _RAG_DOES.search(sentence):
-                continue
-            if not _RAG_DOES.search(sentence):
+            if not _usable_rag_definition(sentence):
                 continue
             parts = [sentence]
             if index + 1 < len(sentences):
                 follow = sentences[index + 1]
-                if _RAG_DOES.search(follow) and not _RAG_JOB.search(follow):
+                if _RAG_DOES.search(follow) and "ingest" not in follow.casefold():
                     parts.append(follow)
             quote = " ".join(parts)
             if quote not in chunk.chunk_text:
                 quote = sentence
             chosen.append((chunk, quote))
+    chosen.sort(
+        key=lambda item: (
+            "ingest" in item[1].casefold(),
+            "retrieval-only" not in item[1].casefold() and "rag cli" not in item[1].casefold(),
+        )
+    )
     if not chosen:
-        return None
+        mentioned = any(
+            _RAG_NAME.search(chunk.chunk_text)
+            and (
+                _RAG_JOB.search(chunk.chunk_text)
+                or str((chunk.metadata or {}).get("source_type") or "") == "trello"
+            )
+            for chunk in chunks
+        )
+        if not mentioned:
+            return None
+        return AnswerResponse(
+            status="no_relevant_information",
+            answer=(
+                "Indexed cards mention this name on ingest jobs, "
+                "but they do not define the RAG tool."
+            ),
+            confidence=0.0,
+            citations=[],
+        )
     unique: list[tuple[SearchChunk, str]] = []
     seen: set[str] = set()
     for chunk, sentence in chosen:
@@ -491,6 +566,50 @@ def portal_how_answer(question: str, chunks: Sequence[SearchChunk]) -> AnswerRes
             for chunk, sentence in unique
         ],
     )
+
+
+def model_recommendation_answer(
+    question: str, chunks: Sequence[SearchChunk]
+) -> AnswerResponse | None:
+    """Quote a note that recommends a model. Project topics stay on their own path."""
+    if named_products(question) or _MODEL_CHOICE.search(question) is None:
+        return None
+    skip = {
+        "what", "which", "model", "models", "should", "use", "for", "the", "our",
+        "work", "high", "when", "with", "does", "need", "needs",
+    }
+    terms = [
+        token
+        for token in re.findall(r"[a-z0-9]+", question.casefold())
+        if len(token) >= 4 and token not in skip
+    ]
+    if "reasoning" not in terms and "reasoning" in question.casefold():
+        terms.append("reasoning")
+    for chunk in chunks:
+        if str((chunk.metadata or {}).get("source_type") or "") == "trello" or not chunk.content_sha256:
+            continue
+        for sentence in _sentences(chunk.chunk_text):
+            folded = sentence.casefold()
+            if sentence not in chunk.chunk_text:
+                continue
+            if terms and sum(term in folded for term in terms) < min(2, len(terms)):
+                continue
+            if not re.search(r"\b(?:opus|model|reasoning)\b", folded):
+                continue
+            return AnswerResponse(
+                status="answered",
+                answer=sentence,
+                confidence=0.7,
+                citations=[
+                    Citation(
+                        source_file=chunk.source_file,
+                        chunk_id=chunk.id,
+                        content_sha256=chunk.content_sha256,
+                        quote=sentence,
+                    )
+                ],
+            )
+    return None
 
 
 def synonym_evidence_answer(

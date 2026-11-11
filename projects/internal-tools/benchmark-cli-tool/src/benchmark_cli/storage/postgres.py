@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,6 +20,9 @@ from ..config import (
 )
 from ..corpus import BOILERPLATE_SQL, SYNTHETIC_CORPUS_SQL
 from ..models import GoldenChunkReference
+
+logger = logging.getLogger(__name__)
+_borrowed = threading.local()
 
 SQL_DIR = Path(__file__).with_name("sql")
 
@@ -151,9 +156,27 @@ def _dependencies() -> tuple[Any, Any, Any]:
     return psycopg, register_vector, Json
 
 
+def query_was_canceled(exc: BaseException) -> bool:
+    """True for a Postgres statement timeout. The caller keeps other results."""
+    text = f"{type(exc).__name__} {exc}".casefold()
+    return (
+        "querycanceled" in text
+        or "canceling statement" in text
+        or "statement timeout" in text
+    )
+
+
 @contextmanager
 def connection() -> Iterator[Any]:
-    """Yield a configured pgvector connection."""
+    """Yield a configured pgvector connection.
+
+    A retrieval pass borrows one connection. Nested searches reuse it instead
+    of opening another connection per query.
+    """
+    borrowed = getattr(_borrowed, "conn", None)
+    if borrowed is not None:
+        yield borrowed
+        return
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not configured.")
     psycopg, register_vector, _ = _dependencies()
@@ -170,6 +193,42 @@ def connection() -> Iterator[Any]:
             )
             cursor.execute("SELECT set_config('hnsw.ef_search', %s, false)", (str(HNSW_EF_SEARCH),))
         yield conn
+
+
+@contextmanager
+def reuse_connection() -> Iterator[Any]:
+    """Hold one connection for every search in the current retrieval."""
+    if getattr(_borrowed, "conn", None) is not None:
+        yield _borrowed.conn
+        return
+    if not DATABASE_URL:
+        yield None
+        return
+    with connection() as conn:
+        _borrowed.conn = conn
+        try:
+            yield conn
+        finally:
+            _borrowed.conn = None
+
+
+def _fetch_chunks(statement: str, parameters: tuple[object, ...]) -> list[SearchChunk]:
+    """Run one read. A statement timeout returns no rows and resets the connection."""
+    try:
+        with connection() as conn, conn.cursor() as cursor:
+            cursor.execute(statement, parameters)
+            return [SearchChunk(*row) for row in cursor.fetchall()]
+    except Exception as exc:
+        if not query_was_canceled(exc):
+            raise
+        logger.warning("Retrieval query timed out; keeping results from other queries.")
+        borrowed = getattr(_borrowed, "conn", None)
+        if borrowed is not None:
+            try:
+                borrowed.rollback()
+            except Exception:
+                logger.warning("Could not reset the retrieval connection after a timeout.")
+        return []
 
 
 def apply_sql(filename: str) -> None:
@@ -959,12 +1018,10 @@ def vector_search(
         ORDER BY embedding <=> %s::vector
         LIMIT %s
     """
-    with connection() as conn, conn.cursor() as cursor:
-        cursor.execute(
-            statement,
-            (list(query_vector), *filter_parameters, list(query_vector), limit),
-        )
-        return [SearchChunk(*row) for row in cursor.fetchall()]
+    return _fetch_chunks(
+        statement,
+        (list(query_vector), *filter_parameters, list(query_vector), limit),
+    )
 
 
 def fts_search(
@@ -1007,9 +1064,7 @@ def fts_search(
         LIMIT %s
     """
 
-    with connection() as conn, conn.cursor() as cursor:
-        cursor.execute(statement, (query, *filter_parameters, limit))
-        return [SearchChunk(*row) for row in cursor.fetchall()]
+    return _fetch_chunks(statement, (query, *filter_parameters, limit))
 
 
 def select_context_window(

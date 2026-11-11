@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from time import perf_counter
 
 from .config import MIN_COSINE_SIMILARITY, MIN_KEYWORD_OVERLAP
 from .providers.openai import embed_texts
-from .storage.postgres import SearchChunk, SearchFilters, fts_search, vector_search
+from .storage.postgres import (
+    SearchChunk,
+    SearchFilters,
+    fts_search,
+    query_was_canceled,
+    reuse_connection,
+    vector_search,
+)
+
+logger = logging.getLogger(__name__)
 
 CANDIDATE_LIMIT = 40
 RRF_K = 60
@@ -22,6 +32,9 @@ RETRIEVAL_SOURCES = (
     "user_contributed",
 )
 PER_SOURCE_LIMIT = 4
+RETRIEVAL_BUDGET_SECONDS = 8.0
+MAX_EXTRA_SEARCHES = 2
+WEAK_MIN_COSINE = 0.15
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,9 +230,10 @@ def search_docs(
         speaker=speaker, source=source, date=date, include_synthetic=include_synthetic
     )
     query_embedding = embed_texts([query])[0]
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="hybrid-search") as executor:
-        vector_future = executor.submit(
-            vector_search,
+    # One connection, one query at a time. Parallel searches each opened a
+    # connection and tripped the free-tier statement timeout.
+    vector_candidates = _safe_search(
+        lambda: vector_search(
             query_embedding,
             CANDIDATE_LIMIT,
             speaker=filters.speaker,
@@ -228,8 +242,9 @@ def search_docs(
             include_synthetic=filters.include_synthetic,
             source_type=source_type,
         )
-        fts_future = executor.submit(
-            fts_search,
+    )
+    fts_candidates = _safe_search(
+        lambda: fts_search(
             query,
             CANDIDATE_LIMIT,
             speaker=filters.speaker,
@@ -238,8 +253,7 @@ def search_docs(
             include_synthetic=filters.include_synthetic,
             source_type=source_type,
         )
-        vector_candidates = vector_future.result()
-        fts_candidates = fts_future.result()
+    )
     vector_scores = {chunk.id: chunk.score for chunk in vector_candidates}
     fts_scores = {chunk.id: chunk.score for chunk in fts_candidates}
     return [
@@ -284,6 +298,38 @@ def _promote_synonym_matches(
     )
 
 
+def _safe_search(call: object) -> list[SearchChunk]:
+    """Run one arm. A timeout contributes nothing and does not abort retrieval."""
+    try:
+        found = call()  # type: ignore[operator]
+    except Exception as exc:
+        if query_was_canceled(exc):
+            logger.warning("Retrieval query timed out; keeping results from other queries.")
+            return []
+        raise
+    return list(found)
+
+
+def _limited_extra_queries(query: str) -> list[str]:
+    """A few specific synonym searches. Skip phrases already in the question."""
+    if re.search(r"\b(?:link|url)\b", query, re.IGNORECASE) and re.search(
+        r"\bportal\b", query, re.IGNORECASE
+    ):
+        return []
+    folded = query.casefold()
+    extras = [phrase for phrase in search_phrases_for(query) if phrase.casefold() not in folded]
+    extras.sort(key=len, reverse=True)
+    chosen: list[str] = []
+    for phrase in extras:
+        key = phrase.casefold()
+        if any(key in kept.casefold() or kept.casefold() in key for kept in chosen):
+            continue
+        chosen.append(phrase)
+        if len(chosen) >= MAX_EXTRA_SEARCHES:
+            break
+    return chosen
+
+
 def retrieve_evidence(
     query: str,
     top_k: int = 5,
@@ -294,48 +340,62 @@ def retrieve_evidence(
     include_synthetic: bool = False,
     min_cosine_similarity: float = MIN_COSINE_SIMILARITY,
     min_keyword_overlap: int = MIN_KEYWORD_OVERLAP,
+    budget_seconds: float = RETRIEVAL_BUDGET_SECONDS,
 ) -> RetrievalDecision:
     """Accept grounded evidence only when semantic and lexical checks both pass."""
     if not 0.0 <= min_cosine_similarity <= 1.0:
         raise ValueError("min_cosine_similarity must be between 0 and 1.")
     if min_keyword_overlap < 0:
         raise ValueError("min_keyword_overlap must not be negative.")
+    if budget_seconds < 0:
+        raise ValueError("budget_seconds must not be negative.")
     pooled: list[HybridSearchResult] = []
     per_source = max(PER_SOURCE_LIMIT, 1)
-    expanded = []
-    for part in split_subquestions(query) or [query]:
-        expanded.extend(expand_queries(part))
-    if query.strip() and query.strip() not in expanded:
-        expanded.insert(0, query.strip())
-    for expanded_query in expanded:
-        for source_type in (*RETRIEVAL_SOURCES, None):
-            pooled.extend(
-                search_docs(
-                    expanded_query,
-                    per_source,
-                    speaker=speaker,
-                    source=source,
-                    date=date,
-                    include_synthetic=include_synthetic,
-                    source_type=source_type,
+    started = perf_counter()
+    searches = [query.strip()] if query.strip() else []
+    searches.extend(_limited_extra_queries(query))
+    with reuse_connection():
+        for index, expanded_query in enumerate(searches):
+            if index and perf_counter() - started > budget_seconds:
+                logger.info("Retrieval time budget reached; using results gathered so far.")
+                break
+            try:
+                pooled.extend(
+                    search_docs(
+                        expanded_query,
+                        per_source * 3 if index == 0 else per_source,
+                        speaker=speaker,
+                        source=source,
+                        date=date,
+                        include_synthetic=include_synthetic,
+                    )
                 )
-            )
+            except Exception as exc:
+                if not query_was_canceled(exc):
+                    raise
+                logger.warning("Retrieval query timed out; keeping results from other queries.")
     pooled = _promote_synonym_matches(query, pooled)
     results = tuple(apply_source_quota(pooled, per_source=per_source, limit=max(top_k, per_source * 4)))
     top_cosine = max(
         (result.vector_score for result in results if result.vector_score is not None), default=None
     )
-    overlap = meaningful_keyword_overlap(" ".join(expanded), results)
+    overlap = meaningful_keyword_overlap(" ".join(searches), results)
     lexical = overlap >= min_keyword_overlap
     semantic = top_cosine is not None and top_cosine >= min_cosine_similarity
     strict = bool(results) and lexical and semantic
-    # Only a mapped synonym (RAG CLI, Fireflies, Discord bot, ...) may pass
-    # below the strict cosine bar. A shared brand word is not enough.
+    # Two content words at a modest cosine keep a project or topic note.
+    # A single shared brand word does not. Named products are checked later.
+    weak = (
+        bool(results)
+        and overlap >= max(min_keyword_overlap, 2)
+        and top_cosine is not None
+        and top_cosine >= min(min_cosine_similarity, WEAK_MIN_COSINE)
+    )
     synonym_hits = tuple(
         result for result in results if chunk_matches_synonym(query, result.chunk.chunk_text)
     )
-    accepted = strict or bool(synonym_hits)
-    kept = results if strict else synonym_hits
+    accepted = strict or weak or bool(synonym_hits)
+    kept = results if strict or weak else synonym_hits
     return RetrievalDecision(
         status="accepted" if accepted else "no_relevant_information",
         results=kept if accepted else (),

@@ -14,7 +14,6 @@ from .contributions import UNKNOWN_INVITE
 from .grounding import (
     ANSWER_PATH_REVISION,
     SyncedDiscordChannel,
-    answer_defines_rag_tool,
     asks_for_certificate_link,
     asks_for_core_team,
     asks_for_credentials,
@@ -34,11 +33,14 @@ from .grounding import (
     evidence_explains_portal,
     evidence_names_products,
     link_only_answer,
+    model_recommendation_answer,
     output_is_rejected,
     portal_how_answer,
     portal_link_answer,
     quote_covers_question,
+    rag_answer_quotes_definition,
     rag_tool_definition,
+    related_course_quote,
     retrieval_log_fields,
     scrub_response,
     stated_employee_count_answer,
@@ -57,6 +59,7 @@ from .storage.postgres import (
     SearchChunk,
     board_url_chunk_rows,
     fts_search,
+    query_was_canceled,
     read_doc,
     synced_discord_channel_rows,
     trello_card_rows,
@@ -84,6 +87,7 @@ from .trello_answers import (
     requested_trello_list,
     snapshot_messages,
     snapshot_payload,
+    topic_with_notes,
     trello_board_link_answer,
 )
 
@@ -869,6 +873,9 @@ def _deterministic_fallback(
     if certificate is not None:
         return certificate
     if rows is not None:
+        topical = topic_with_notes(question, rows, chunks)
+        if topical is not None:
+            return topical
         if asks_for_trello_board_link(question):
             linked = _board_link_response(rows)
             if linked is not None and linked.status == "answered":
@@ -889,6 +896,9 @@ def _deterministic_fallback(
     explained = portal_how_answer(question, chunks)
     if explained is not None:
         return explained
+    recommended = model_recommendation_answer(question, chunks)
+    if recommended is not None:
+        return recommended
     return synonym_evidence_answer(question, chunks)
 
 
@@ -919,7 +929,9 @@ def run_agent(
             source=source,
             date=date,
         )
-    except RuntimeError:
+    except Exception as exc:
+        if not isinstance(exc, RuntimeError) and not query_was_canceled(exc):
+            raise
         logger.warning("Retrieval is unavailable for this question.")
         decision = None
     parts = split_subquestions(question)
@@ -1034,8 +1046,14 @@ def run_agent(
         validated = _validated_answer(response, evidence, snapshot, question=question)
         if validated is None or validated.status != "answered":
             return validated
-        if asks_for_rag_tool(question) and not answer_defines_rag_tool(validated.answer):
+        if asks_for_rag_tool(question) and not rag_answer_quotes_definition(
+            validated.answer, tuple(evidence.values())
+        ):
             return None
+        if asks_for_certificate_link(question):
+            course = related_course_quote(tuple(evidence.values()))
+            if course and course.casefold() not in validated.answer.casefold():
+                return None
         if (
             asks_how_portal_works(question)
             and link_only_answer(validated.answer)
