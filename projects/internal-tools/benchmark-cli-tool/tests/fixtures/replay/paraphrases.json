@@ -144,6 +144,39 @@
       "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.2, "keyword_overlap": 0},
       "model_calls": [null],
       "expect": {"status": "answered", "titles": ["Ship the portal", "Kiosk MVP", "Review the lobby copy", "Unassigned sample"], "absent": ["Old portal import", "Retired kiosk notes"]}
+    },
+    {
+      "id": "saved-headcount-paraphrase",
+      "question": "How many people does BMTech have?",
+      "thread_question": null,
+      "plan": {"searches": ["How many people does BMTech have?"], "person": null},
+      "retrieval": {
+        "status": "accepted",
+        "top_cosine_similarity": 0.81,
+        "keyword_overlap": 2,
+        "results": [
+          {
+            "id": 1346,
+            "source_file": "user_contributed/7/9.md",
+            "chunk_index": 0,
+            "chunk_text": "Question: How many employees does BMTech currently have?\nAccording to Ada Example on 2026-11-12:\nWe have 3 people",
+            "metadata": {
+              "source_type": "user_contributed",
+              "question": "How many employees does BMTech currently have?",
+              "author_name": "Ada Example",
+              "contributed_at": "2026-11-12",
+              "date": "2026-11-12"
+            },
+            "score": 0.81,
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "rrf_score": 0.2,
+            "vector_score": 0.81,
+            "fts_score": 1.0
+          }
+        ]
+      },
+      "model_calls": [null],
+      "expect": {"status": "answered", "titles": ["According to", "3", "Ada Example"], "absent": ["does not state a current employee count"]}
     }
   ]
 }

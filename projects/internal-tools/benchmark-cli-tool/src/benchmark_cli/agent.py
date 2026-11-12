@@ -10,6 +10,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from typing import Any
 
+from .contributions import contribution_answer
 from .grounding import (
     ANSWER_PATH_REVISION,
     SyncedDiscordChannel,
@@ -770,7 +771,9 @@ def _citations_named_in_body(
     kept = []
     for citation in response.citations:
         card = by_id.get(citation.chunk_id)
-        if card is None or card.title.casefold() in folded:
+        if citation.source_file.startswith("user_contributed/"):
+            kept.append(citation)
+        elif card is None or card.title.casefold() in folded:
             kept.append(citation)
     if not kept:
         return None
@@ -947,6 +950,21 @@ def run_agent(
     except RuntimeError:
         logger.warning("Retrieval is unavailable for this question.")
         decision = None
+    if decision is not None and decision.results:
+        decision = replace(
+            decision,
+            results=tuple(
+                replace(
+                    result,
+                    chunk=replace(result.chunk, chunk_text=redact_secrets(result.chunk.chunk_text)),
+                )
+                for result in decision.results
+            ),
+        )
+    contributed = contribution_answer(question, () if decision is None else decision.results)
+    if contributed is not None:
+        _log_retrieval("user_contributed", decision)
+        return _finish(contributed, outcome="user_contributed", synthesis_attempts=0)
     if asks_for_synced_channels(question):
         try:
             channels = _synced_channels()
@@ -962,17 +980,6 @@ def run_agent(
                 outcome="discord_channels",
                 synthesis_attempts=0,
             )
-    if decision is not None and decision.results:
-        decision = replace(
-            decision,
-            results=tuple(
-                replace(
-                    result,
-                    chunk=replace(result.chunk, chunk_text=redact_secrets(result.chunk.chunk_text)),
-                )
-                for result in decision.results
-            ),
-        )
     if asks_for_employee_count(question):
         decision = _with_phrase(decision, "employees")
         results = decision.results

@@ -124,6 +124,100 @@ def is_contribution_reply(
     return UNKNOWN_INVITE in referenced_text
 
 
+def normalize_question(text: str) -> str:
+    """Case, whitespace, and punctuation do not change which question was saved."""
+    return " ".join(re.sub(r"[^\w\s]", " ", text.casefold()).split())
+
+
+def _is_contribution(result: object) -> bool:
+    chunk = getattr(result, "chunk", None)
+    if chunk is None:
+        return False
+    metadata = chunk.metadata or {}
+    return metadata.get("source_type") == "user_contributed" or str(chunk.source_file).startswith(
+        _SOURCE_PREFIX
+    )
+
+
+def _stored_question(result: object) -> str:
+    chunk = result.chunk
+    metadata = chunk.metadata or {}
+    stored = str(metadata.get("question") or "")
+    if stored.strip():
+        return stored
+    for line in chunk.chunk_text.splitlines():
+        if line.lower().startswith("question:"):
+            return line.split(":", 1)[1]
+    return ""
+
+
+def _when(result: object) -> str:
+    metadata = result.chunk.metadata or {}
+    return str(metadata.get("contributed_at") or metadata.get("date") or "")
+
+
+def contribution_answer(question: str, results: object) -> object | None:
+    """Answer from a saved contribution before a shortcut can discard it.
+
+    An exact saved question wins. Otherwise the newest top hit above the
+    similarity floor is used. No model call.
+    """
+    from .config import MIN_COSINE_SIMILARITY
+    from .models import AnswerResponse, Citation
+
+    hits = [result for result in results or () if _is_contribution(result)]
+    if not hits:
+        return None
+    asked = normalize_question(question)
+    exact = [hit for hit in hits if normalize_question(_stored_question(hit)) == asked]
+    if exact:
+        chosen = max(exact, key=lambda hit: (_when(hit), hit.chunk.id))
+    else:
+        ranked = [
+            hit
+            for index, hit in enumerate(results or ())
+            if _is_contribution(hit)
+            and index < 3
+            and hit.vector_score is not None
+            and hit.vector_score >= MIN_COSINE_SIMILARITY
+        ]
+        if not ranked:
+            return None
+        chosen = max(ranked, key=lambda hit: (_when(hit), hit.chunk.id))
+    metadata = chosen.chunk.metadata or {}
+    name = str(metadata.get("author_name") or "a teammate")
+    when = str(metadata.get("date") or _when(chosen))[:10]
+    lines = chosen.chunk.chunk_text.splitlines()
+    quote_lines: list[str] = []
+    capture = False
+    for line in lines:
+        if line.startswith("According to "):
+            capture = True
+        if capture and line.strip():
+            quote_lines.append(line)
+    quote = "\n".join(quote_lines).strip()
+    if not quote or quote not in chosen.chunk.chunk_text:
+        quote = chosen.chunk.chunk_text.strip()
+    digest = (chosen.chunk.content_sha256 or "").strip()
+    if not digest:
+        return None
+    body = quote_lines[-1] if len(quote_lines) > 1 else quote
+    answer = f"According to {name} on {when}: {body}"
+    return AnswerResponse(
+        status="answered",
+        answer=answer,
+        confidence=0.8,
+        citations=[
+            Citation(
+                source_file=chosen.chunk.source_file,
+                chunk_id=chosen.chunk.id,
+                content_sha256=digest,
+                quote=quote if quote in chosen.chunk.chunk_text else body,
+            )
+        ],
+    )
+
+
 def remove_contribution(source_file: str) -> None:
     """Delete one stored contribution by its ``user_contributed/`` source path."""
     if not source_file.startswith(_SOURCE_PREFIX):
