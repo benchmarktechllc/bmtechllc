@@ -186,7 +186,7 @@ def asks_for_synced_channels(question: str) -> bool:
         return False
     return (
         re.search(r"\bchannels?\b", text) is not None
-        and re.search(r"\b(?:sync\w*|ingest\w*|index\w*)\b", text) is not None
+        and re.search(r"\b(?:sync\w*|ingest\w*|index\w*|reads?|reading)\b", text) is not None
         and re.search(r"\b(?:which|what|list)\b", text) is not None
     )
 

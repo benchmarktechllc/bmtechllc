@@ -35,9 +35,9 @@ from .llm import ModelQuotaError, _quota_error, call_llm, call_llm_structured
 from .logging import log_agent_diagnostic
 from .models import AnswerResponse, Citation
 from .portal_urls import canonical_portal_base_url
-from .query_understanding import fallback_plan, understand_query
+from .query_understanding import QueryPlan, fallback_plan, understand_query
 from .retrieval import HybridSearchResult, RetrievalDecision, retrieve_evidence
-from .roster import load_people
+from .roster import load_people, mentioned_person
 from .router import classify_query
 from .safety import delimit_evidence
 from .storage.postgres import (
@@ -49,11 +49,14 @@ from .storage.postgres import (
     trello_card_rows,
 )
 from .trello_answers import (
+    _citation,
     active_projects_answer,
     answer_board_question,
+    answer_from_board_forms,
     answer_is_bare_cards,
     answer_matches_snapshot,
     asks_for_active_projects,
+    asks_for_meaning,
     asks_for_project_status,
     asks_for_trello_board_link,
     bare_list_name,
@@ -63,6 +66,8 @@ from .trello_answers import (
     cards_from_rows,
     citations_for_answer,
     indexed_list_request,
+    listed_cards_are_named,
+    meaning_gap,
     person_card_payload,
     person_cards_answer,
     project_status_answer,
@@ -660,10 +665,9 @@ def _validation_errors(
 def _names_all_person_cards(
     answer: str, rows: tuple[object, ...], person: str, question: str
 ) -> bool:
-    """True when every card the question asks for is named."""
-    from .trello_answers import _scoped_person_cards
-
-    cards = _scoped_person_cards(rows, person, question)
+    """True when every card for that person, including Done, is named."""
+    del question
+    cards = cards_for_person(rows, person)
     if not cards:
         return False
     folded = answer.casefold()
@@ -745,7 +749,31 @@ def _validated_answer(
         return None
     if _unsupported_document_link(repaired, evidence, question):
         return None
+    if rows:
+        repaired = _citations_named_in_body(repaired, rows)
+        if repaired is None:
+            return None
     return repaired
+
+
+def _citations_named_in_body(
+    response: AnswerResponse, rows: tuple[object, ...]
+) -> AnswerResponse | None:
+    """Card citations have to name a card the answer body actually lists."""
+    by_id = {
+        card.chunk_id: card
+        for card in rows
+        if getattr(card, "chunk_id", None) and getattr(card, "title", None)
+    }
+    folded = response.answer.casefold()
+    kept = []
+    for citation in response.citations:
+        card = by_id.get(citation.chunk_id)
+        if card is None or card.title.casefold() in folded:
+            kept.append(citation)
+    if not kept:
+        return None
+    return response.model_copy(update={"citations": kept})
 
 
 def _respects_person(
@@ -761,12 +789,81 @@ def _respects_person(
     return response
 
 
+def _roster_answer(question: str, rows: tuple[object, ...]) -> AnswerResponse | None:
+    """Who is on the team, from the roster and the cards those people are on."""
+    if re.search(r"\bwho\b", question, re.IGNORECASE) is None:
+        return None
+    if re.search(r"\bteam\b", question, re.IGNORECASE) is None:
+        return None
+    people = load_people()
+    if not people:
+        return None
+    lines = ["Indexed teammates:"]
+    citations = []
+    seen: set[str] = set()
+    for person in people:
+        lines.append(f"- {person.canonical}")
+        for card in cards_for_person(rows, person.canonical):
+            if card.card_id in seen:
+                continue
+            seen.add(card.card_id)
+            citations.append(_citation(card))
+    if not citations:
+        return None
+    return AnswerResponse(
+        status="answered",
+        answer="\n".join(lines),
+        confidence=0.8,
+        citations=citations,
+    )
+
+
+def _other_clause(
+    question: str,
+    thread_question: str | None,
+    rows: tuple[object, ...] | None,
+    searches: Sequence[str],
+) -> AnswerResponse | None:
+    """The non-channel half of a question joined by ``and``."""
+    pieces = re.split(r"\s+\band\b\s+", question, flags=re.IGNORECASE)
+    if len(pieces) < 2 or not rows:
+        return None
+    for piece in pieces:
+        if asks_for_synced_channels(piece):
+            continue
+        found = answer_from_board_forms(piece, searches, rows, thread_question)
+        if found is not None:
+            return found
+    return None
+
+
+def _join_answers(primary: AnswerResponse, extra: AnswerResponse | None) -> AnswerResponse:
+    if extra is None:
+        return primary
+    text = f"{primary.answer}\n\n{extra.answer}"
+    if primary.status != "answered" and extra.status != "answered":
+        return AnswerResponse(
+            status="no_relevant_information",
+            answer=text,
+            confidence=0.0,
+            citations=[],
+        )
+    citations = [
+        citation
+        for part in (primary, extra)
+        if part.status == "answered"
+        for citation in part.citations
+    ]
+    return AnswerResponse(status="answered", answer=text, confidence=0.8, citations=citations)
+
+
 def _deterministic_fallback(
     question: str,
     thread_question: str | None,
     rows: tuple[object, ...] | None,
     chunks: tuple[SearchChunk, ...],
     person: str | None = None,
+    searches: Sequence[str] = (),
 ) -> AnswerResponse | None:
     """Indexed Trello rules when the model is down or its draft does not validate."""
     if rows is None:
@@ -776,7 +873,7 @@ def _deterministic_fallback(
         if linked is not None and linked.status == "answered":
             return linked
     listed = _respects_person(
-        answer_board_question(question, rows, thread_question=thread_question),
+        answer_from_board_forms(question, searches, rows, thread_question),
         rows,
         person,
     )
@@ -786,6 +883,9 @@ def _deterministic_fallback(
         owned = person_cards_answer(rows, person, question)
         if owned is not None:
             return owned
+    roster = _roster_answer(question, rows)
+    if roster is not None:
+        return roster
     if rows:
         status = _respects_person(project_status_answer(question, rows), rows, person)
         if status is not None:
@@ -822,12 +922,17 @@ def run_agent(
         plan = fallback_plan(_retrieval_question(question, thread_question))
     else:
         plan = understand_query(question, thread_question)
-    searches = list(plan.searches or [" ".join(question.split())])
     raw_question = " ".join(question.split())
-    if searches == [raw_question]:
-        threaded = _retrieval_question(question, thread_question)
-        if threaded != raw_question:
-            searches = [threaded]
+    searches = [item for item in (plan.searches or []) if item and item != raw_question][:2]
+    if plan.person and mentioned_person(question, thread_question, plan.person) is None:
+        plan = QueryPlan(searches=list(plan.searches or []), person=None)
+    threaded = _retrieval_question(question, thread_question)
+    if threaded and threaded != raw_question and threaded not in searches and not searches:
+        searches.insert(0, threaded)
+    if raw_question and raw_question not in searches:
+        searches.append(raw_question)
+    if not searches:
+        searches = [raw_question]
     decision: RetrievalDecision | None
     try:
         decision = retrieve_evidence(
@@ -849,8 +954,10 @@ def run_agent(
             channels = ()
         if channels:
             _log_retrieval("discord_channels", decision)
+            primary = synced_channels_answer(channels)
+            extra = _other_clause(question, thread_question, snapshot, searches)
             return _finish(
-                synced_channels_answer(channels),
+                _join_answers(primary, extra),
                 outcome="discord_channels",
                 synthesis_attempts=0,
             )
@@ -877,7 +984,9 @@ def run_agent(
         _log_retrieval("core_team", decision)
         return _finish(core_team_answer(decision.results), outcome="core_team", synthesis_attempts=0)
     if (decision is None or decision.status != "accepted") and not snapshot:
-        fallback = _deterministic_fallback(question, thread_question, snapshot, (), plan.person)
+        fallback = _deterministic_fallback(
+            question, thread_question, snapshot, (), plan.person, searches
+        )
         if fallback is not None:
             _log_retrieval("deterministic_fallback", decision)
             return _finish(fallback, outcome="deterministic_fallback", synthesis_attempts=0)
@@ -895,6 +1004,7 @@ def run_agent(
             snapshot,
             tuple(evidence.values()) if evidence else (),
             plan.person,
+            searches,
         )
         if fallback is not None:
             return _finish(fallback, outcome="model_quota_fallback", synthesis_attempts=0)
@@ -951,8 +1061,19 @@ def run_agent(
         return _validated_answer(response, evidence, snapshot, plan.person, question)
 
     def _complete(response: AnswerResponse | None) -> AnswerResponse | None:
-        """Use the full person list when a surviving draft omits one of that person's cards."""
+        """Prefer a snapshot answer when the draft omits the cards it was asked for."""
+        if asks_for_meaning(question) and snapshot:
+            covered = False
+            if response is not None:
+                for citation in response.citations:
+                    chunk = evidence.get(citation.chunk_id)
+                    if chunk is not None and quote_covers_question(question, citation.quote, chunk):
+                        covered = True
+            if not covered:
+                return meaning_gap(question, snapshot)
         if response is None or response.status != "answered" or answer_is_bare_cards(response.answer):
+            return None
+        if snapshot and not listed_cards_are_named(question, response.answer, snapshot):
             return None
         if plan.person and snapshot and not _names_all_person_cards(
             response.answer, snapshot, plan.person, question
@@ -999,7 +1120,7 @@ def run_agent(
     if completed_retry is not None:
         return _finish(completed_retry, outcome="answered_after_citation_retry", synthesis_attempts=2)
     fallback = _deterministic_fallback(
-        question, thread_question, snapshot, tuple(evidence.values()), plan.person
+        question, thread_question, snapshot, tuple(evidence.values()), plan.person, searches
     )
     if fallback is not None:
         return _finish(fallback, outcome="deterministic_fallback", synthesis_attempts=2)

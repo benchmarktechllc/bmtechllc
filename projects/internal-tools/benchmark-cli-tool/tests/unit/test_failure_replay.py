@@ -7,6 +7,7 @@ still runs validation, citation repair, and the snapshot fallback.
 from __future__ import annotations
 
 import hashlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -247,3 +248,240 @@ def test_every_chat_tier_uses_the_cheap_model() -> None:
     assert get_model_config(_chat_tier("flagship")).model == get_model_config("cheap").model
     assert get_model_config("embedding").model == EMBEDDING_MODEL
     assert classify_query("Explain the hard multi-step case") == "cheap"
+
+
+def _sev_board():
+    from benchmark_cli.trello_answers import TrelloCardRow
+
+    rows = list(sample_board())
+    card_id = "sev"
+    rows.append(
+        TrelloCardRow(
+            board="Sample Board",
+            list_name="Sev 2",
+            card_id=card_id,
+            title="Sample sev two note",
+            url="https://trello.com/c/sev",
+            chunk_id=7,
+            source_file="trello/tIvVZqio/sev.md",
+            content_sha256=hashlib.sha256(card_id.encode()).hexdigest(),
+            chunk_text="Card: Sample sev two note\nList: Sev 2\nURL: https://trello.com/c/sev",
+        )
+    )
+    return rows
+
+
+@pytest.mark.unit
+def test_board_typo_does_not_route_to_one_person(monkeypatch: pytest.MonkeyPatch) -> None:
+    _quiet(monkeypatch)
+    monkeypatch.setattr(
+        agent,
+        "understand_query",
+        _plan("Dante Paniccia", "what's on the trello board"),
+    )
+    monkeypatch.setattr(
+        agent,
+        "call_llm_structured",
+        lambda **_kwargs: _draft("No relevant information was found.", status="unknown"),
+    )
+
+    response = agent.run_agent("what's on the trelo board")
+
+    assert "Ship the portal" in response.answer
+    assert "Kiosk MVP" in response.answer
+    assert "Dante Paniccia's tickets" not in response.answer
+
+
+@pytest.mark.unit
+def test_named_item_status_does_not_dump_the_done_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    _quiet(monkeypatch)
+    monkeypatch.setattr(agent, "understand_query", _plan(None, "lobby copy status"))
+    monkeypatch.setattr(
+        agent,
+        "call_llm_structured",
+        lambda **_kwargs: _draft("No relevant information was found.", status="unknown"),
+    )
+
+    response = agent.run_agent("is the lobby copy done yet?")
+
+    assert response.status == "answered"
+    assert "Review the lobby copy" in response.answer
+    assert "not done" in response.answer.casefold()
+    assert "Old portal import" not in response.answer
+
+
+@pytest.mark.unit
+def test_completed_list_is_in_the_body_and_citations_match_that_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _quiet(monkeypatch)
+    ship = sample_board()[0]
+    monkeypatch.setattr(agent, "understand_query", _plan(None, "completed board"))
+    answer = "Several tasks have been completed on the board, listed under the Done section."
+    citation = Citation(
+        source_file=ship.source_file,
+        chunk_id=ship.chunk_id,
+        content_sha256=ship.content_sha256,
+        quote="Card: Ship the portal",
+    )
+    monkeypatch.setattr(agent, "call_llm_structured", lambda **_kwargs: _draft(answer, [citation]))
+
+    response = agent.run_agent("What has been completed on the board?")
+
+    assert "Old portal import" in response.answer
+    assert "Retired kiosk notes" in response.answer
+    assert "Ship the portal" not in response.answer
+    cited = {item.quote for item in response.citations}
+    assert "Card: Ship the portal" not in cited
+    assert "Card: Old portal import" in cited
+
+
+@pytest.mark.unit
+def test_raw_question_is_always_searched(monkeypatch: pytest.MonkeyPatch) -> None:
+    _quiet(monkeypatch)
+    note = "Aug 28 notes: the kiosk specifications remain."
+    chunk = SearchChunk(
+        80,
+        "meeting-sample.md",
+        0,
+        note,
+        {"source_type": "transcript", "meeting": "sample", "title": "Aug 28"},
+        0.8,
+        content_sha256=hashlib.sha256(b"kiosk-note").hexdigest(),
+    )
+
+    def retrieve(query: str, **kwargs: object) -> RetrievalDecision:
+        queries = list(kwargs.get("queries") or [query])
+        if any(item.casefold() == "what's left for the kiosk?" for item in queries):
+            return RetrievalDecision(
+                "accepted",
+                (HybridSearchResult(chunk, 0.3, vector_score=0.8, fts_score=1.0),),
+                0.8,
+                2,
+            )
+        return RetrievalDecision("no_relevant_information", (), None, 0)
+
+    def model(**kwargs: object) -> AnswerResponse:
+        blob = json.dumps(kwargs.get("messages"))
+        if "kiosk specifications remain" in blob:
+            return _draft(
+                "The kiosk specifications remain.",
+                [
+                    Citation(
+                        source_file=chunk.source_file,
+                        chunk_id=chunk.id,
+                        content_sha256=chunk.content_sha256 or "",
+                        quote=note,
+                    )
+                ],
+            )
+        return _draft("No relevant information was found.", status="unknown")
+
+    monkeypatch.setattr(agent, "retrieve_evidence", retrieve)
+    monkeypatch.setattr(agent, "understand_query", _plan(None, "kiosk remaining work"))
+    monkeypatch.setattr(agent, "call_llm_structured", model)
+
+    response = agent.run_agent("what's left for the kiosk?")
+
+    assert response.status == "answered"
+    assert "kiosk specifications remain" in response.answer
+
+
+@pytest.mark.unit
+def test_team_question_uses_the_roster(monkeypatch: pytest.MonkeyPatch) -> None:
+    _quiet(monkeypatch)
+    monkeypatch.setattr(agent, "understand_query", _plan(None, "team roster"))
+    monkeypatch.setattr(
+        agent,
+        "call_llm_structured",
+        lambda **_kwargs: _draft("No relevant information was found.", status="unknown"),
+    )
+
+    response = agent.run_agent("who's on the team?")
+
+    assert response.status == "answered"
+    assert "Dante Paniccia" in response.answer
+    assert "Fanuel Mengistu" in response.answer
+    assert "Anwar Hussein" in response.answer
+
+
+@pytest.mark.unit
+def test_compound_channel_and_list_answers_both_halves(monkeypatch: pytest.MonkeyPatch) -> None:
+    _quiet(monkeypatch)
+    monkeypatch.setattr(agent, "trello_card_rows", lambda: _sev_board())
+    monkeypatch.setattr(
+        agent,
+        "synced_discord_channel_rows",
+        lambda: [("sample-portal", 1, "discord-sample.json", "ab" * 32, "Synthetic portal note.")],
+    )
+    monkeypatch.setattr(agent, "understand_query", _plan(None, "channels and sev 2"))
+    monkeypatch.setattr(
+        agent,
+        "call_llm_structured",
+        lambda **_kwargs: _draft("No relevant information was found.", status="unknown"),
+    )
+
+    response = agent.run_agent("which channels does the bot read and what's in Sev 2?")
+
+    assert "sample-portal" in response.answer
+    assert "Sample sev two note" in response.answer
+
+
+@pytest.mark.unit
+def test_sev_definition_is_unknown_and_may_name_the_cards(monkeypatch: pytest.MonkeyPatch) -> None:
+    _quiet(monkeypatch)
+    monkeypatch.setattr(agent, "trello_card_rows", lambda: _sev_board())
+    monkeypatch.setattr(agent, "understand_query", _plan(None, "sev 2 definition"))
+    sev = _sev_board()[-1]
+    monkeypatch.setattr(
+        agent,
+        "call_llm_structured",
+        lambda **_kwargs: _draft(
+            f"Trello cards in Sev 2:\n- [{sev.title}]({sev.url})",
+            [
+                Citation(
+                    source_file=sev.source_file,
+                    chunk_id=sev.chunk_id,
+                    content_sha256=sev.content_sha256,
+                    quote="Card: Sample sev two note",
+                )
+            ],
+        ),
+    )
+
+    response = agent.run_agent("what does Sev 2 mean?")
+
+    assert response.status == "no_relevant_information"
+    assert "no definition" in response.answer.casefold()
+    assert "Sample sev two note" in response.answer
+    assert response.citations == []
+
+
+@pytest.mark.unit
+def test_current_person_work_labels_completed_cards(monkeypatch: pytest.MonkeyPatch) -> None:
+    _quiet(monkeypatch)
+    monkeypatch.setattr(agent, "understand_query", _plan("Fanuel Mengistu", "Fanuel Mengistu"))
+    kiosk = sample_board()[2]
+    monkeypatch.setattr(
+        agent,
+        "call_llm_structured",
+        lambda **_kwargs: _draft(
+            "Fanuel Mengistu is working on [Kiosk MVP](https://trello.com/c/kiosk).",
+            [
+                Citation(
+                    source_file=kiosk.source_file,
+                    chunk_id=kiosk.chunk_id,
+                    content_sha256=kiosk.content_sha256,
+                    quote="Card: Kiosk MVP",
+                )
+            ],
+        ),
+    )
+
+    response = agent.run_agent("What is Fanuel currently working on")
+
+    assert "Kiosk MVP" in response.answer
+    assert "Retired kiosk notes" in response.answer
+    assert "Completed:" in response.answer
+    assert response.answer.index("Kiosk MVP") < response.answer.index("Retired kiosk notes")
+

@@ -98,7 +98,7 @@
       "plan": {"searches": ["Fanuel Mengistu currently working"], "person": "Fanuel Mengistu"},
       "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.19, "keyword_overlap": 0},
       "model": {"status": "answered", "confidence": 0.8, "answer": "Fanuel Mengistu is currently working on [Kiosk MVP](https://trello.com/c/kiosk), which is in Doing."},
-      "expect": {"status": "answered", "titles": ["Kiosk MVP"], "absent": ["Retired kiosk notes", "Ship the portal", "Review the lobby copy"]}
+      "expect": {"status": "answered", "titles": ["Kiosk MVP", "Retired kiosk notes"], "absent": ["Ship the portal", "Review the lobby copy"], "order": ["Kiosk MVP", "Retired kiosk notes"]}
     },
     {
       "id": "fano-current",
@@ -107,7 +107,7 @@
       "plan": {"searches": ["Fanuel Mengistu current work"], "person": "Fanuel Mengistu"},
       "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.16, "keyword_overlap": 0},
       "model": {"status": "answered", "confidence": 0.8, "answer": "Fanuel Mengistu is currently working on [Kiosk MVP](https://trello.com/c/kiosk), which is in Doing."},
-      "expect": {"status": "answered", "titles": ["Kiosk MVP"], "absent": ["Retired kiosk notes", "Ship the portal"]}
+      "expect": {"status": "answered", "titles": ["Kiosk MVP", "Retired kiosk notes"], "absent": ["Ship the portal"], "order": ["Kiosk MVP", "Retired kiosk notes"]}
     },
     {
       "id": "fanuel-current-work",
@@ -116,7 +116,7 @@
       "plan": {"searches": ["Fanuel Mengistu current work"], "person": "Fanuel Mengistu"},
       "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.4, "keyword_overlap": 1},
       "model": {"status": "answered", "confidence": 0.8, "answer": "Fanuel Mengistu is currently working on [Kiosk MVP](https://trello.com/c/kiosk), which is in Doing."},
-      "expect": {"status": "answered", "titles": ["Kiosk MVP"], "absent": ["Retired kiosk notes", "Ship the portal"]}
+      "expect": {"status": "answered", "titles": ["Kiosk MVP", "Retired kiosk notes"], "absent": ["Ship the portal"], "order": ["Kiosk MVP", "Retired kiosk notes"]}
     },
     {
       "id": "no-name-doing",

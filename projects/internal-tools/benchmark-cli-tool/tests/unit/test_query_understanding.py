@@ -134,7 +134,8 @@ def test_paraphrase_replay_matches_the_recorded_plan(quiet: None) -> None:
     for case in payload["cases"]:
         response, trace = replay_case(case, sample_board())
         assert check_expect(response, case) == []
-        assert trace["queries"] == case["plan"]["searches"]
+        assert all(item in trace["queries"] for item in case["plan"]["searches"])
+        assert case["question"].strip() in trace["queries"]
         assert trace["snapshot_present"] is True
         if case["plan"]["person"]:
             blob = json.dumps(trace["prompts"])
@@ -287,8 +288,9 @@ def test_failed_model_does_not_list_someone_elses_doing_cards(monkeypatch: pytes
 
     assert response.status == "answered"
     assert "Kiosk MVP" in response.answer
+    assert "Retired kiosk notes" in response.answer
+    assert "Completed:" in response.answer
     assert "Ship the portal" not in response.answer
-    assert "Retired kiosk notes" not in response.answer
 
 
 @pytest.mark.unit

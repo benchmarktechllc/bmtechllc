@@ -112,3 +112,89 @@ def render_member(trello_name: str) -> str:
 def render_members(names: tuple[str, ...] | list[str]) -> str:
     """Join members with semicolons so commas inside aliases stay intact."""
     return "; ".join(render_member(name) for name in names if str(name).strip())
+
+
+_NOT_A_NAME = frozenset(
+    """
+    the what who how which tickets ticket cards card board trello on for yet
+    done doing project projects is are was were and with from about this that
+    still open completed finished closed working work our your team
+    """.split()
+)
+
+
+def _edit_distance(left: str, right: str) -> int:
+    if abs(len(left) - len(right)) > 2:
+        return 3
+    previous = list(range(len(right) + 1))
+    for index, char in enumerate(left, start=1):
+        current = [index]
+        for other_index, other in enumerate(right, start=1):
+            current.append(
+                min(
+                    current[-1] + 1,
+                    previous[other_index] + 1,
+                    previous[other_index - 1] + (char != other),
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
+def _close_token(token: str, label: str) -> bool:
+    left, right = token.casefold(), label.casefold()
+    if left == right:
+        return True
+    if min(len(left), len(right)) < 3:
+        return False
+    limit = 1 if min(len(left), len(right)) <= 5 else 2
+    return _edit_distance(left, right) <= limit
+
+
+@cache
+def load_terms() -> tuple[str, ...]:
+    """Source names from the roster file, such as Trello."""
+    try:
+        payload = json.loads(_roster_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ()
+    if not isinstance(payload, dict):
+        return ()
+    return tuple(
+        " ".join(str(term).split())
+        for term in payload.get("terms", [])
+        if " ".join(str(term).split())
+    )
+
+
+def mentioned_person(question: str, thread_question: str | None, proposed: str | None) -> str | None:
+    """Canonical person only when the question or thread actually refers to them."""
+    person = person_by_label(proposed)
+    if person is None:
+        return None
+    text = f"{question} {thread_question or ''}"
+    if person_in_text(person, text):
+        return person.canonical
+    for token in re.findall(r"[A-Za-z][A-Za-z']{2,}", text):
+        if token.casefold() in _NOT_A_NAME:
+            continue
+        for label in person.labels():
+            if _close_token(token, label) or any(
+                _close_token(token, part) for part in label.split() if len(part) > 2
+            ):
+                return person.canonical
+    return None
+
+
+def normalize_known_terms(text: str) -> str:
+    """Replace a one-edit typo of a known source name, such as trelo to Trello."""
+
+    def fix(token: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9']+", token):
+            return token
+        for term in load_terms():
+            if _close_token(token, term):
+                return term
+        return token
+
+    return "".join(fix(part) for part in re.split(r"(\W+)", text))

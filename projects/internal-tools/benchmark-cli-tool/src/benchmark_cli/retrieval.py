@@ -165,14 +165,14 @@ def search_docs(
 
 
 def _search_texts(query: str, queries: Sequence[str] | None) -> list[str]:
-    """At most two non-empty search strings. The raw query is the default."""
+    """At most three non-empty search strings. The raw query is always eligible."""
     source = list(queries) if queries else [query]
     texts: list[str] = []
     for item in source:
         text = " ".join(str(item).split())
         if text and text not in texts:
             texts.append(text)
-        if len(texts) == 2:
+        if len(texts) == 3:
             break
     return texts
 

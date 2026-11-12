@@ -837,39 +837,30 @@ def person_card_payload(rows: Sequence[TrelloCardRow], person_name: str | None) 
     return [_card_brief(card) for card in cards_for_person(rows, person_name)]
 
 
-def _current_only(question: str) -> bool:
-    """A question about what is happening now, not the full ticket history."""
-    return re.search(
-        r"\b(?:currently|current|right now|at the moment)\b",
-        question,
-        re.IGNORECASE,
-    ) is not None
-
-
-def _scoped_person_cards(
-    rows: Sequence[TrelloCardRow], person_name: str | None, question: str
-) -> list[TrelloCardRow]:
-    cards = cards_for_person(rows, person_name)
-    if not _current_only(question):
-        return cards
-    active = [card for card in cards if _normalize(card.list_name) != "done"]
-    return active or cards
-
-
 def person_cards_answer(
     rows: Sequence[TrelloCardRow], person_name: str | None, question: str = ""
 ) -> AnswerResponse | None:
     """Every indexed card for one resolved person. Active lists come first.
 
-    A question about what is happening now stays on the active lists. Any other
-    person question includes Done.
+    Done cards are always included and labelled completed. ``question`` is
+    unused; current-work questions still show the completed cards.
     """
+    del question
     person = person_by_label(person_name)
-    cards = _scoped_person_cards(rows, person_name, question)
+    cards = cards_for_person(rows, person_name)
     if person is None or not cards:
         return None
+    active = [card for card in cards if _normalize(card.list_name) != "done"]
+    done = [card for card in cards if _normalize(card.list_name) == "done"]
     lines = [f"{person.canonical}'s tickets:", ""]
-    lines.extend(f"{_bullet(card)} — {_list_label(card)}" for card in cards)
+    if active:
+        lines.append("Active:")
+        lines.extend(f"{_bullet(card)} — {_list_label(card)}" for card in active)
+    if done:
+        if active:
+            lines.append("")
+        lines.append("Completed:")
+        lines.extend(f"{_bullet(card)} — Done" for card in done)
     return AnswerResponse(
         status="answered",
         answer="\n".join(lines),
@@ -1376,6 +1367,111 @@ def _state_count(question: str, response: AnswerResponse, rows: Sequence[TrelloC
     return response.model_copy(update={"answer": f"{sentence}\n\n{response.answer}"})
 
 
+def asks_for_meaning(question: str) -> bool:
+    """A definition, not a request to list the column that happens to share the name."""
+    return (
+        re.search(r"\bwhat does\b.+\bmean\b|\bexplain\b", question, re.IGNORECASE) is not None
+    )
+
+
+def meaning_gap(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
+    """Unknown definition. Card titles may be named; Add answer stays available."""
+    if not asks_for_meaning(question):
+        return None
+    known = _indexed_list_names(rows)
+    requested = resolve_board_list(question, known)
+    text = "No definition for that term is in the company evidence."
+    if requested and requested != OPEN_LISTS:
+        matched = [
+            card for card in _usable_cards(rows) if _list_matches(card.list_name, requested)
+        ]
+        if matched:
+            text += "\n\nCards currently in that list:\n" + "\n".join(
+                _bullet(card) for card in matched
+            )
+    return AnswerResponse(
+        status="no_relevant_information",
+        answer=text,
+        confidence=0.0,
+        citations=[],
+    )
+
+
+_CATALOG_TERMS = frozenset(
+    {"done", "doing", "yet", "board", "completed", "finished", "closed", "still", "already"}
+)
+
+
+def specific_card_status(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
+    """Status of one named card. A whole-list catalog stays on the list path."""
+    known = {_normalize(name) for name in _indexed_list_names(rows)}
+    terms = [
+        term
+        for term in _project_terms(question)
+        if term not in _CATALOG_TERMS and term not in known
+    ]
+    if not terms:
+        return None
+    matched = [
+        card
+        for card in _usable_cards(rows)
+        if all(_title_has_term(card.title, term) for term in terms)
+    ]
+    if not matched or len(matched) > 3:
+        return None
+    lines = []
+    for card in matched:
+        where = _list_label(card)
+        state = "done" if _normalize(card.list_name) == "done" else f"on {where}, not done"
+        lines.append(f"{_bullet(card)} is {state}.")
+    return AnswerResponse(
+        status="answered",
+        answer="\n".join(lines),
+        confidence=0.8,
+        citations=[_citation(card) for card in matched],
+    )
+
+
+def listed_cards_are_named(question: str, answer: str, rows: Sequence[TrelloCardRow]) -> bool:
+    """A list answer has to name the cards in the body, not only in the citations."""
+    if asks_for_meaning(question) or specific_card_status(question, rows) is not None:
+        return True
+    known = _indexed_list_names(rows)
+    requested = resolve_board_list(question, known)
+    if requested is None:
+        return True
+    usable = _usable_cards(rows)
+    if requested == OPEN_LISTS:
+        matched = [card for card in usable if _normalize(card.list_name) != "done"]
+    else:
+        matched = [card for card in usable if _list_matches(card.list_name, requested)]
+    if not matched:
+        return True
+    folded = answer.casefold()
+    return all(card.title.casefold() in folded for card in matched)
+
+
+def answer_from_board_forms(
+    question: str,
+    searches: Sequence[str],
+    rows: Sequence[TrelloCardRow],
+    thread_question: str | None = None,
+) -> AnswerResponse | None:
+    """Board rules on the question, a normalized typo, and any rewritten search."""
+    from .roster import normalize_known_terms
+
+    forms: list[str] = []
+    for text in (question, normalize_known_terms(question), *searches):
+        cleaned = " ".join((text or "").split())
+        if cleaned and cleaned not in forms:
+            forms.append(cleaned)
+    for form in forms:
+        found = answer_board_question(form, rows, thread_question=thread_question)
+        if found is not None:
+            return found
+    return None
+
+
 def answer_board_question(
     question: str,
     rows: Sequence[TrelloCardRow],
@@ -1391,6 +1487,11 @@ def answer_board_question(
     if bare and not any(_list_matches(name, bare) for name in known):
         if requested_trello_list(question) is None:
             return None
+    if asks_for_meaning(question):
+        return meaning_gap(question, rows)
+    specific = specific_card_status(question, rows)
+    if specific is not None:
+        return specific
     deterministic = (
         _who_answer(question, rows)
         or _card_focus_answer(question, rows)

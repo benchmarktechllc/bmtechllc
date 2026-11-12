@@ -451,10 +451,15 @@ def test_sync_schema_and_workflow_are_wired() -> None:
     assert 'benchmark-sync-fathom = "benchmark_cli.fathom_sync:main"' in pyproject
 
     repo = next(
-        parent
-        for parent in Path(__file__).resolve().parents
-        if (parent / ".github" / "workflows").is_dir()
+        (
+            parent
+            for parent in Path(__file__).resolve().parents
+            if (parent / ".github" / "workflows").is_dir()
+        ),
+        None,
     )
+    if repo is None:
+        pytest.skip("workflow files are not shipped in this package image")
     workflow = (repo / ".github" / "workflows" / "fathom-ingestion.yml").read_text(encoding="utf-8")
     assert "environment: discord-ingestion" in workflow
     assert 'cron: "17 5 * * *"' in workflow
