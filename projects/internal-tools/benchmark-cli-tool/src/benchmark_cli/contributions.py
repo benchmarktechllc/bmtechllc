@@ -129,6 +129,12 @@ def normalize_question(text: str) -> str:
     return " ".join(re.sub(r"[^\w\s]", " ", text.casefold()).split())
 
 
+# Question-to-question cosine. "tickets assigned to" questions share most words,
+# so a chunk-score floor of 0.30 treats them as the same. 0.85 keeps a headcount
+# paraphrase and rejects a different person's ticket question.
+QUESTION_MATCH_SIMILARITY = 0.85
+
+
 def _is_contribution(result: object) -> bool:
     chunk = getattr(result, "chunk", None)
     if chunk is None:
@@ -156,52 +162,73 @@ def _when(result: object) -> str:
     return str(metadata.get("contributed_at") or metadata.get("date") or "")
 
 
-def contribution_answer(question: str, results: object) -> object | None:
-    """Answer from a saved contribution before a shortcut can discard it.
+def _cosine(left: list[float], right: list[float]) -> float:
+    if len(left) != len(right) or not left:
+        return 0.0
+    dot = sum(a * b for a, b in zip(left, right, strict=True))
+    left_norm = sum(value * value for value in left) ** 0.5
+    right_norm = sum(value * value for value in right) ** 0.5
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    return dot / (left_norm * right_norm)
 
-    An exact saved question wins. Otherwise the newest top hit above the
-    similarity floor is used. No model call.
+
+def question_similarity(asked: str, saved: str) -> float:
+    """Cosine of the two question strings. A missing embedder does not match."""
+    try:
+        vectors = embed_texts([asked, saved])
+    except (RuntimeError, ValueError):
+        return 0.0
+    if len(vectors) != 2:
+        return 0.0
+    return _cosine(vectors[0], vectors[1])
+
+
+def _saved_body(chunk_text: str) -> tuple[str, str]:
+    """The attribution line plus every line of the saved answer, and a citable quote."""
+    lines = chunk_text.splitlines()
+    quote_lines: list[str] = []
+    capture = False
+    for line in lines:
+        if line.startswith("According to "):
+            capture = True
+        if capture:
+            quote_lines.append(line)
+    quote = "\n".join(quote_lines).strip()
+    if not quote or quote not in chunk_text:
+        quote = chunk_text.strip()
+        return quote, quote
+    body = "\n".join(line for line in quote_lines[1:] if line.strip()).strip()
+    return body or quote, quote
+
+
+def contribution_answer(question: str, results: object) -> object | None:
+    """Use a saved answer only when its question matches the one just asked.
+
+    Matching is exact after normalization, or a question-to-question cosine of
+    at least ``QUESTION_MATCH_SIMILARITY``. Chunk rank is not a match. No model call.
     """
-    from .config import MIN_COSINE_SIMILARITY
     from .models import AnswerResponse, Citation
 
     hits = [result for result in results or () if _is_contribution(result)]
     if not hits:
         return None
     asked = normalize_question(question)
-    exact = [hit for hit in hits if normalize_question(_stored_question(hit)) == asked]
-    if exact:
-        chosen = max(exact, key=lambda hit: (_when(hit), hit.chunk.id))
-    else:
-        ranked = [
-            hit
-            for index, hit in enumerate(results or ())
-            if _is_contribution(hit)
-            and index < 3
-            and hit.vector_score is not None
-            and hit.vector_score >= MIN_COSINE_SIMILARITY
-        ]
-        if not ranked:
-            return None
-        chosen = max(ranked, key=lambda hit: (_when(hit), hit.chunk.id))
+    matched = []
+    for hit in hits:
+        saved = _stored_question(hit)
+        if normalize_question(saved) == asked or question_similarity(question, saved) >= QUESTION_MATCH_SIMILARITY:
+            matched.append(hit)
+    if not matched:
+        return None
+    chosen = max(matched, key=lambda hit: (_when(hit), hit.chunk.id))
     metadata = chosen.chunk.metadata or {}
     name = str(metadata.get("author_name") or "a teammate")
     when = str(metadata.get("date") or _when(chosen))[:10]
-    lines = chosen.chunk.chunk_text.splitlines()
-    quote_lines: list[str] = []
-    capture = False
-    for line in lines:
-        if line.startswith("According to "):
-            capture = True
-        if capture and line.strip():
-            quote_lines.append(line)
-    quote = "\n".join(quote_lines).strip()
-    if not quote or quote not in chosen.chunk.chunk_text:
-        quote = chosen.chunk.chunk_text.strip()
+    body, quote = _saved_body(chosen.chunk.chunk_text)
     digest = (chosen.chunk.content_sha256 or "").strip()
-    if not digest:
+    if not digest or not quote or quote not in chosen.chunk.chunk_text:
         return None
-    body = quote_lines[-1] if len(quote_lines) > 1 else quote
     answer = f"According to {name} on {when}: {body}"
     return AnswerResponse(
         status="answered",
@@ -212,7 +239,7 @@ def contribution_answer(question: str, results: object) -> object | None:
                 source_file=chosen.chunk.source_file,
                 chunk_id=chosen.chunk.id,
                 content_sha256=digest,
-                quote=quote if quote in chosen.chunk.chunk_text else body,
+                quote=quote,
             )
         ],
     )
