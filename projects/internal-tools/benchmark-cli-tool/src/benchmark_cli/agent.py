@@ -59,10 +59,12 @@ from .trello_answers import (
     bare_list_name,
     board_link_from_chunk_rows,
     board_question,
+    cards_for_person,
     cards_from_rows,
     citations_for_answer,
     indexed_list_request,
     person_card_payload,
+    person_cards_answer,
     project_status_answer,
     requested_trello_list,
     snapshot_messages,
@@ -655,11 +657,66 @@ def _validation_errors(
     return errors
 
 
+def _names_all_person_cards(
+    answer: str, rows: tuple[object, ...], person: str, question: str
+) -> bool:
+    """True when every card the question asks for is named."""
+    from .trello_answers import _scoped_person_cards
+
+    cards = _scoped_person_cards(rows, person, question)
+    if not cards:
+        return False
+    folded = answer.casefold()
+    return all(card.title.casefold() in folded for card in cards)
+
+
+def _unsupported_document_link(
+    response: AnswerResponse,
+    evidence: dict[int, SearchChunk],
+    question: str,
+) -> bool:
+    """A link presented as a requested document has to be supported by the quote."""
+    if not re.search(r"https?://", response.answer):
+        return False
+    if re.search(r"\b(?:link|url|certificate|document)\b", question, re.IGNORECASE) is None:
+        return False
+    for citation in response.citations:
+        chunk = evidence.get(citation.chunk_id)
+        if chunk is not None and quote_covers_question(question, citation.quote, chunk):
+            return False
+    return True
+
+
+def _rejected_names(
+    answer: str,
+    evidence: dict[int, SearchChunk],
+    rows: tuple[object, ...] | None,
+    person: str | None,
+) -> bool:
+    """Reject an invented person. Roster aliases and that person's own cards are known."""
+    context = _known_name_text(evidence)
+    unknown = [
+        name
+        for name in re.findall(
+            r"\b(?:hir(?:e|ed|ing)|assigned to|according to)\s+([A-Za-z][A-Za-z']+(?: [A-Za-z][A-Za-z']+)?)",
+            answer,
+            flags=re.IGNORECASE,
+        )
+        if name.casefold() not in context
+    ]
+    if not unknown:
+        return False
+    if person and rows and citations_for_answer(answer, cards_for_person(rows, person)):
+        return False
+    return True
+
+
 def _validated_answer(
     response: AnswerResponse | None,
     evidence: dict[int, SearchChunk],
     rows: tuple[object, ...] | None,
     person: str | None = None,
+    question: str = "",
 ) -> AnswerResponse | None:
     """Keep a model answer whose citations, cards, and URLs exist. Do not rewrite it."""
     if response is None:
@@ -669,26 +726,25 @@ def _validated_answer(
             return None
         return response
     repaired = _repair_citation_presentation(response, evidence) or response
-    if rows and not _citations_are_exact(repaired, evidence):
-        named = citations_for_answer(response.answer, rows)
-        if named and answer_matches_snapshot(response.answer, rows):
-            repaired = response.model_copy(update={"citations": named})
-    if not _citations_are_exact(repaired, evidence):
-        return None
-    if rows and not answer_matches_snapshot(repaired.answer, rows):
-        return None
     if rows and titles_outside_person(repaired.answer, rows, person):
         return None
     if _invented_urls(repaired.answer, evidence, rows):
         return None
-    context = _known_name_text(evidence)
-    for name in re.findall(
-        r"\b(?:hir(?:e|ed|ing)|assigned to|according to)\s+([A-Z][a-z]+(?: [A-Z][a-z]+)?)",
-        repaired.answer,
-        flags=re.IGNORECASE,
-    ):
-        if name.casefold() not in context:
-            return None
+    if _rejected_names(repaired.answer, evidence, rows, person):
+        return None
+    if rows and not _citations_are_exact(repaired, evidence):
+        named = citations_for_answer(
+            repaired.answer,
+            cards_for_person(rows, person) if person else rows,
+        )
+        if named and answer_matches_snapshot(repaired.answer, rows, check_counts=not bool(person)):
+            repaired = repaired.model_copy(update={"citations": named})
+    if not _citations_are_exact(repaired, evidence):
+        return None
+    if rows and not answer_matches_snapshot(repaired.answer, rows, check_counts=not bool(person)):
+        return None
+    if _unsupported_document_link(repaired, evidence, question):
+        return None
     return repaired
 
 
@@ -726,6 +782,10 @@ def _deterministic_fallback(
     )
     if listed is not None:
         return listed
+    if person:
+        owned = person_cards_answer(rows, person, question)
+        if owned is not None:
+            return owned
     if rows:
         status = _respects_person(project_status_answer(question, rows), rows, person)
         if status is not None:
@@ -841,13 +901,9 @@ def run_agent(
         return _finish(_model_unavailable_answer(), outcome="model_quota", synthesis_attempts=0)
 
     evidence: dict[int, SearchChunk] = {}
-    try:
-        selected_tier = tier or classify_query(question)
-    except ModelQuotaError:
-        evidence = _context_evidence(decision, snapshot)
-        return _quota_reply()
-    except Exception:
-        selected_tier = tier or "cheap"
+    # Chat stays on the configured cheap model. The classifier cannot escalate.
+    classify_query(question)
+    selected_tier = "cheap"
     evidence = _context_evidence(decision, snapshot)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -892,7 +948,19 @@ def run_agent(
             logger.info("The answer model is unavailable; using indexed data.")
         messages = []
     def _checked(response: AnswerResponse | None) -> AnswerResponse | None:
-        return _validated_answer(response, evidence, snapshot, plan.person)
+        return _validated_answer(response, evidence, snapshot, plan.person, question)
+
+    def _complete(response: AnswerResponse | None) -> AnswerResponse | None:
+        """Use the full person list when a surviving draft omits one of that person's cards."""
+        if response is None or response.status != "answered" or answer_is_bare_cards(response.answer):
+            return None
+        if plan.person and snapshot and not _names_all_person_cards(
+            response.answer, snapshot, plan.person, question
+        ):
+            listed = person_cards_answer(snapshot, plan.person, question)
+            if listed is not None:
+                return listed
+        return response
 
     if quota:
         return _quota_reply()
@@ -905,9 +973,10 @@ def run_agent(
             logger.info("The answer service is rate limited; using indexed data when it can answer.")
             return _quota_reply()
     checked = _checked(response)
-    if checked is not None and checked.status == "answered" and not answer_is_bare_cards(checked.answer):
-        outcome = "answered" if checked == response else "answered_with_citation_normalization"
-        return _finish(checked, outcome=outcome, synthesis_attempts=1)
+    completed = _complete(checked)
+    if completed is not None:
+        outcome = "answered" if completed == response else "answered_with_citation_normalization"
+        return _finish(completed, outcome=outcome, synthesis_attempts=1)
     errors = (
         _validation_errors(response, evidence, snapshot or (), plan.person)
         if response is not None
@@ -926,18 +995,16 @@ def run_agent(
             logger.info("The answer service is rate limited; using indexed data when it can answer.")
             return _quota_reply()
     checked_retry = _checked(retry)
-    if checked_retry is not None and (
-        checked_retry.status == "no_relevant_information"
-        or not answer_is_bare_cards(checked_retry.answer)
-    ):
-        if checked_retry.status == "answered":
-            return _finish(checked_retry, outcome="answered_after_citation_retry", synthesis_attempts=2)
-        return _finish(checked_retry, outcome="model_abstained", synthesis_attempts=2)
+    completed_retry = _complete(checked_retry)
+    if completed_retry is not None:
+        return _finish(completed_retry, outcome="answered_after_citation_retry", synthesis_attempts=2)
     fallback = _deterministic_fallback(
         question, thread_question, snapshot, tuple(evidence.values()), plan.person
     )
     if fallback is not None:
         return _finish(fallback, outcome="deterministic_fallback", synthesis_attempts=2)
+    if checked_retry is not None and checked_retry.status == "no_relevant_information":
+        return _finish(checked_retry, outcome="model_abstained", synthesis_attempts=2)
     if checked is not None and checked.status == "no_relevant_information":
         return _finish(checked, outcome="model_abstained", synthesis_attempts=1)
     return _finish(_no_information(), outcome="validation_failed", synthesis_attempts=2)

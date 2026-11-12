@@ -756,6 +756,8 @@ def asks_for_current_work(question: str) -> bool:
 
 def board_question(question: str, thread_question: str | None = None) -> bool:
     """Whether this question, or a Trello thread follow-up, should use the card index."""
+    if _BOARD_OVERVIEW.search(question):
+        return True
     if asks_for_current_work(question) or re.search(r"\bblocked\b", question, re.IGNORECASE):
         return True
     if _WHO_OWNS.search(question) and _PROCEDURE.search(question) is None and _HISTORY.search(question) is None:
@@ -833,6 +835,47 @@ def cards_for_person(rows: Sequence[TrelloCardRow], person_name: str | None) -> 
 def person_card_payload(rows: Sequence[TrelloCardRow], person_name: str | None) -> list[dict[str, object]]:
     """Compact cards for the person filter. Active lists come first."""
     return [_card_brief(card) for card in cards_for_person(rows, person_name)]
+
+
+def _current_only(question: str) -> bool:
+    """A question about what is happening now, not the full ticket history."""
+    return re.search(
+        r"\b(?:currently|current|right now|at the moment)\b",
+        question,
+        re.IGNORECASE,
+    ) is not None
+
+
+def _scoped_person_cards(
+    rows: Sequence[TrelloCardRow], person_name: str | None, question: str
+) -> list[TrelloCardRow]:
+    cards = cards_for_person(rows, person_name)
+    if not _current_only(question):
+        return cards
+    active = [card for card in cards if _normalize(card.list_name) != "done"]
+    return active or cards
+
+
+def person_cards_answer(
+    rows: Sequence[TrelloCardRow], person_name: str | None, question: str = ""
+) -> AnswerResponse | None:
+    """Every indexed card for one resolved person. Active lists come first.
+
+    A question about what is happening now stays on the active lists. Any other
+    person question includes Done.
+    """
+    person = person_by_label(person_name)
+    cards = _scoped_person_cards(rows, person_name, question)
+    if person is None or not cards:
+        return None
+    lines = [f"{person.canonical}'s tickets:", ""]
+    lines.extend(f"{_bullet(card)} — {_list_label(card)}" for card in cards)
+    return AnswerResponse(
+        status="answered",
+        answer="\n".join(lines),
+        confidence=0.8,
+        citations=[_citation(card) for card in cards],
+    )
 
 
 def titles_outside_person(
@@ -946,7 +989,9 @@ def snapshot_messages(
     ]
 
 
-def answer_matches_snapshot(answer: str, rows: Sequence[TrelloCardRow]) -> bool:
+def answer_matches_snapshot(
+    answer: str, rows: Sequence[TrelloCardRow], *, check_counts: bool = True
+) -> bool:
     """Cited titles, URLs, list counts, and none-claims have to match the board."""
     payload = snapshot_payload(rows)
     cards = payload["cards"]
@@ -961,23 +1006,24 @@ def answer_matches_snapshot(answer: str, rows: Sequence[TrelloCardRow]) -> bool:
     for title in re.findall(r"\[([^\]]+)\]\(https://trello\.com/c/", answer):
         if title.casefold() not in titles:
             return False
-    for label, count in counts.items():
-        if not isinstance(label, str) or not isinstance(count, int):
-            continue
-        escaped = re.escape(label)
-        for pattern in (
-            rf"\b{escaped}\b[^,\n.]{{0,24}}?\b(\d+)\b",
-            rf"\b(\d+)\b[^,\n.]{{0,24}}?\b{escaped}\b",
-        ):
-            for match in re.finditer(pattern, answer, re.IGNORECASE):
-                if int(match.group(1)) != count:
-                    return False
-        if count and re.search(
-            rf"\bno\b[^\n.]{{0,40}}\b{escaped}\b",
-            answer,
-            re.IGNORECASE,
-        ):
-            return False
+    if check_counts:
+        for label, count in counts.items():
+            if not isinstance(label, str) or not isinstance(count, int):
+                continue
+            escaped = re.escape(label)
+            for pattern in (
+                rf"\b{escaped}\b[^,\n.]{{0,24}}?\b(\d+)\b",
+                rf"\b(\d+)\b[^,\n.]{{0,24}}?\b{escaped}\b",
+            ):
+                for match in re.finditer(pattern, answer, re.IGNORECASE):
+                    if int(match.group(1)) != count:
+                        return False
+            if count and re.search(
+                rf"\bno\b[^\n.]{{0,40}}\b{escaped}\b",
+                answer,
+                re.IGNORECASE,
+            ):
+                return False
     if re.search(r"\bnone\b[^\n.]{0,40}\bdue\b", answer, re.IGNORECASE):
         if any(isinstance(card, dict) and card.get("due") for card in cards):
             return False

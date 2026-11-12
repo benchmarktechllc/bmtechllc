@@ -252,11 +252,23 @@ def test_modal_submit_stores_redacted_metadata_and_a_later_answer_attributes_it(
         message_url="https://discord.com/channels/1/7/9",
     )
     modal.answer._value = "Standup is at nine."
-    saved: list[str] = []
 
     class _Response:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, object]] = []
+
+        async def defer(self, *, ephemeral: bool = False) -> None:
+            self.events.append(("defer", ephemeral))
+
         async def send_message(self, content: str, *, ephemeral: bool = False) -> None:
-            saved.append(content)
+            self.events.append(("send", content))
+
+    class _Followup:
+        def __init__(self, events: list[tuple[str, object]]) -> None:
+            self.events = events
+
+        async def send(self, content: str, *, ephemeral: bool = False) -> None:
+            self.events.append(("followup", content))
             assert ephemeral is True
 
     class _User:
@@ -266,11 +278,14 @@ def test_modal_submit_stores_redacted_metadata_and_a_later_answer_attributes_it(
     class _Interaction:
         user = _User()
         response = _Response()
+        followup = _Followup(response.events)
 
     import asyncio
 
-    asyncio.run(modal.on_submit(_Interaction()))
-    assert saved == [THANKS_REPLY]
+    interaction = _Interaction()
+    asyncio.run(modal.on_submit(interaction))
+    assert interaction.response.events[0] == ("defer", True)
+    assert interaction.response.events[1] == ("followup", THANKS_REPLY)
     assert len(stored) == 2
 
     note = _chunk(

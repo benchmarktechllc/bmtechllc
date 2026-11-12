@@ -325,6 +325,8 @@ class AddAnswerModal(discord.ui.Modal, title="Add answer"):
         self.message_url = message_url
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        # Discord drops the interaction if it is not acknowledged within 3 seconds.
+        await interaction.response.defer(ephemeral=True)
         try:
             store_contribution(
                 question=self.question,
@@ -337,12 +339,12 @@ class AddAnswerModal(discord.ui.Modal, title="Add answer"):
             )
         except (RuntimeError, ValueError):
             logger.exception("Could not store a contributed answer.")
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "I couldn't save that. Please try again in a moment.",
                 ephemeral=True,
             )
             return
-        await interaction.response.send_message(THANKS_REPLY, ephemeral=True)
+        await interaction.followup.send(THANKS_REPLY, ephemeral=True)
 
 
 ADD_ANSWER_CUSTOM_ID = "bmtech:add_answer"

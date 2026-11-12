@@ -58,6 +58,13 @@ def _record(completion: Any, *, tier: str, component: str, started_at: float) ->
     )
 
 
+def _chat_tier(tier: str) -> str:
+    """Chat completions stay on the cheap model. Embeddings keep their own tier."""
+    if tier == "embedding":
+        return tier
+    return "cheap"
+
+
 def call_llm(
     *, tier: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
     component: str = "agent",
@@ -65,7 +72,7 @@ def call_llm(
     """Call a configured model and record its token/latency/cost telemetry."""
     if not messages:
         raise ValueError("messages must not be empty.")
-    request: dict[str, Any] = {"model": get_model_config(tier).model, "messages": messages}
+    request: dict[str, Any] = {"model": get_model_config(_chat_tier(tier)).model, "messages": messages}
     if tools is not None:
         request["tools"] = tools
     started_at = perf_counter()
@@ -76,7 +83,7 @@ def call_llm(
         if quota is not None:
             raise quota from exc
         raise
-    _record(completion, tier=tier, component=component, started_at=started_at)
+    _record(completion, tier=_chat_tier(tier), component=component, started_at=started_at)
     return completion
 
 
@@ -90,7 +97,7 @@ def call_llm_structured(
     started_at = perf_counter()
     try:
         completion = _get_client().beta.chat.completions.parse(
-            model=get_model_config(tier).model,
+            model=get_model_config(_chat_tier(tier)).model,
             messages=list(messages),
             response_format=response_schema,
         )
@@ -99,7 +106,7 @@ def call_llm_structured(
         if quota is not None:
             raise quota from exc
         raise
-    _record(completion, tier=tier, component=component, started_at=started_at)
+    _record(completion, tier=_chat_tier(tier), component=component, started_at=started_at)
     parsed = completion.choices[0].message.parsed
     if not isinstance(parsed, response_schema):
         raise RuntimeError("The model did not return the requested structured response.")

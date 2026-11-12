@@ -245,8 +245,10 @@ def test_person_filter_rejects_another_persons_card(monkeypatch: pytest.MonkeyPa
     assert evidence["person_filter"] == "Dante Paniccia"
     assert [card["title"] for card in evidence["person_cards"]] == ["Ship the portal", "Old portal import"]
     assert "Dante Paniccia" in json.dumps(evidence["trello_board"]["roster"])
-    assert response.status == "no_relevant_information"
+    assert response.status == "answered"
     assert "Kiosk MVP" not in response.answer
+    assert "Ship the portal" in response.answer
+    assert "Old portal import" in response.answer
 
 @pytest.mark.unit
 def test_failed_model_does_not_list_someone_elses_doing_cards(monkeypatch: pytest.MonkeyPatch, quiet: None) -> None:
@@ -283,8 +285,10 @@ def test_failed_model_does_not_list_someone_elses_doing_cards(monkeypatch: pytes
 
     response = agent.run_agent("what is Fano doing right now")
 
+    assert response.status == "answered"
+    assert "Kiosk MVP" in response.answer
     assert "Ship the portal" not in response.answer
-    assert response.status == "no_relevant_information"
+    assert "Retired kiosk notes" not in response.answer
 
 
 @pytest.mark.unit
