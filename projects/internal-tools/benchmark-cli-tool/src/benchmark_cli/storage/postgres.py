@@ -936,6 +936,7 @@ def vector_search(
     date: str | None = None,
     include_synthetic: bool = False,
     source_type: str | None = None,
+    conn: Any | None = None,
 ) -> list[SearchChunk]:
     """Return vector-ranked candidates independently of keyword retrieval."""
     if limit < 1:
@@ -959,12 +960,17 @@ def vector_search(
         ORDER BY embedding <=> %s::vector
         LIMIT %s
     """
-    with connection() as conn, conn.cursor() as cursor:
-        cursor.execute(
-            statement,
-            (list(query_vector), *filter_parameters, list(query_vector), limit),
-        )
-        return [SearchChunk(*row) for row in cursor.fetchall()]
+    parameters = (list(query_vector), *filter_parameters, list(query_vector), limit)
+
+    def _run(active: Any) -> list[SearchChunk]:
+        with active.cursor() as cursor:
+            cursor.execute(statement, parameters)
+            return [SearchChunk(*row) for row in cursor.fetchall()]
+
+    if conn is not None:
+        return _run(conn)
+    with connection() as owned:
+        return _run(owned)
 
 
 def fts_search(
@@ -976,6 +982,7 @@ def fts_search(
     date: str | None = None,
     include_synthetic: bool = False,
     source_type: str | None = None,
+    conn: Any | None = None,
 ) -> list[SearchChunk]:
     """Return PostgreSQL full-text-ranked candidates independently of vectors."""
     if not query.strip() or limit < 1:
@@ -1007,9 +1014,17 @@ def fts_search(
         LIMIT %s
     """
 
-    with connection() as conn, conn.cursor() as cursor:
-        cursor.execute(statement, (query, *filter_parameters, limit))
-        return [SearchChunk(*row) for row in cursor.fetchall()]
+    parameters = (query, *filter_parameters, limit)
+
+    def _run(active: Any) -> list[SearchChunk]:
+        with active.cursor() as cursor:
+            cursor.execute(statement, parameters)
+            return [SearchChunk(*row) for row in cursor.fetchall()]
+
+    if conn is not None:
+        return _run(conn)
+    with connection() as owned:
+        return _run(owned)
 
 
 def select_context_window(

@@ -170,8 +170,8 @@ def test_remaining_board_paraphrases(monkeypatch: pytest.MonkeyPatch, quiet: Non
     assert "https://trello.com/c/" in detail.answer
 
     assigned = agent.run_agent("Which tickets are assigned to Fanuel?")
-    assert "not indexed" in assigned.answer.casefold()
-    assert "Fanuel" not in assigned.answer
+    assert assigned.status == "no_relevant_information"
+    assert "fanuel" not in assigned.answer.casefold()
 
     due = agent.run_agent("Any tickets due this week?")
     assert "none of the indexed" in due.answer.casefold()

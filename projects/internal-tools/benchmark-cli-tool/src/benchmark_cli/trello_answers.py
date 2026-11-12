@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 from .ingestion.clean import redact_secrets
 from .models import AnswerResponse, Citation
+from .roster import Person, load_people, person_by_label, person_in_text, roster_payload
 from .storage.postgres import SearchChunk
 
 MAX_LISTED_CARDS = 25
@@ -781,11 +782,87 @@ def _blocked_board_question(question: str) -> bool:
     return _NOT_MEMBERSHIP.search(question) is not None
 
 
-def _members_of(card: TrelloCardRow) -> list[str]:
+def _members_line(card: TrelloCardRow) -> str:
     for line in card.chunk_text.splitlines():
         if line.strip().lower().startswith("members:"):
-            return [part.strip() for part in line.split(":", 1)[1].split(",") if part.strip()]
-    return []
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _members_of(card: TrelloCardRow) -> list[str]:
+    line = _members_line(card)
+    if not line:
+        return []
+    parts = [part.strip() for part in line.replace(";", ",").split(",") if part.strip()]
+    return parts
+
+
+def member_records(card: TrelloCardRow) -> list[dict[str, object]]:
+    """Roster names on this card. Unknown member text stays as written."""
+    line = _members_line(card)
+    if not line:
+        return []
+    found = [person for person in roster_people_on_line(line)]
+    records = [
+        {"name": person.canonical, "aliases": list(person.aliases), "trello": list(person.trello)}
+        for person in found
+    ]
+    if records:
+        return records
+    return [{"name": part, "aliases": [], "trello": [part]} for part in _members_of(card)]
+
+
+def roster_people_on_line(line: str) -> list[Person]:
+    """Roster people whose names appear on one Members line."""
+    return [person for person in load_people() if person_in_text(person, line)]
+
+
+def cards_for_person(rows: Sequence[TrelloCardRow], person_name: str | None) -> list[TrelloCardRow]:
+    """That person's cards, Done included, active lists before Done."""
+    person = person_by_label(person_name)
+    if person is None:
+        return []
+    matched = [
+        card
+        for card in _usable_cards(rows)
+        if person_in_text(person, _members_line(card))
+    ]
+    return sorted(matched, key=lambda card: _normalize(card.list_name) == "done")
+
+
+def person_card_payload(rows: Sequence[TrelloCardRow], person_name: str | None) -> list[dict[str, object]]:
+    """Compact cards for the person filter. Active lists come first."""
+    return [_card_brief(card) for card in cards_for_person(rows, person_name)]
+
+
+def titles_outside_person(
+    answer: str, rows: Sequence[TrelloCardRow], person_name: str | None
+) -> list[str]:
+    """Board titles named in the answer that are not this person's cards."""
+    if person_by_label(person_name) is None:
+        return []
+    allowed = {card.title.casefold() for card in cards_for_person(rows, person_name)}
+    folded = answer.casefold()
+    foreign: list[str] = []
+    for card in _usable_cards(rows):
+        title = card.title.casefold()
+        if title and title in folded and title not in allowed and card.title not in foreign:
+            foreign.append(card.title)
+    return foreign
+
+
+def _card_brief(card: TrelloCardRow) -> dict[str, object]:
+    return {
+        "title": card.title,
+        "list": card.list_name,
+        "url": card.url,
+        "chunk_id": card.chunk_id,
+        "source_file": card.source_file,
+        "content_sha256": card.content_sha256,
+        "quote": _quote(card),
+        "labels": _labels_of(card),
+        "members": member_records(card),
+    }
 
 
 def _has_due(card: TrelloCardRow) -> bool:
@@ -837,7 +914,7 @@ def snapshot_payload(rows: Sequence[TrelloCardRow]) -> dict[str, object]:
                 "content_sha256": card.content_sha256,
                 "quote": _quote(card),
                 "labels": _labels_of(card),
-                "members": _members_of(card),
+                "members": member_records(card),
                 "due": next(
                     (
                         line.split(":", 1)[1].strip()
@@ -849,7 +926,7 @@ def snapshot_payload(rows: Sequence[TrelloCardRow]) -> dict[str, object]:
                 "excerpt": _public_excerpt(card)[:240],
             }
         )
-    return {"counts": counts, "cards": cards}
+    return {"counts": counts, "cards": cards, "roster": roster_payload()}
 
 
 def snapshot_messages(
@@ -1089,9 +1166,9 @@ def _who_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse 
         return None
     link = f"[{card.title}]({card.url})" if card.url.startswith("https://") else card.title
     label = _list_label(card)
-    members = _members_of(card)
+    members = [str(record["name"]) for record in member_records(card) if record.get("name")]
     if not members:
-        if not any(_members_of(item) for item in _usable_cards(rows)):
+        if not any(member_records(item) for item in _usable_cards(rows)):
             text = f"Assignees are not indexed yet. {link} is on {label}."
         else:
             text = f"No member is listed on {link} ({label})."
@@ -1108,32 +1185,6 @@ def _who_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse 
         confidence=0.8,
         citations=[_citation(card)],
     )
-
-
-def _assignee_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
-    match = re.search(r"\b(?:assigned to|assignee)\s+([A-Za-z][A-Za-z' -]{1,40})", question, re.IGNORECASE)
-    if match is None and re.search(r"\bassigned\b", question, re.IGNORECASE) is None:
-        return None
-    usable = _usable_cards(rows)
-    if not any(_members_of(card) for card in usable):
-        return AnswerResponse(
-            status="no_relevant_information",
-            answer="Assignees are not indexed yet.",
-            confidence=0.0,
-            citations=[],
-        )
-    if match is None:
-        return None
-    who = match.group(1).strip(" ?.")
-    matched = [card for card in usable if any(who.casefold() in name.casefold() for name in _members_of(card))]
-    if not matched:
-        return AnswerResponse(
-            status="no_relevant_information",
-            answer=f'No indexed card lists {who} as a member.',
-            confidence=0.0,
-            citations=[],
-        )
-    return trello_list_answer(OPEN_LISTS, matched, fit_to_discord=False)
 
 
 def _due_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
@@ -1297,7 +1348,6 @@ def answer_board_question(
     deterministic = (
         _who_answer(question, rows)
         or _card_focus_answer(question, rows)
-        or _assignee_answer(question, rows)
         or _due_answer(question, rows)
         or _topic_answer(question, rows)
         or _overview_answer(question, rows)
