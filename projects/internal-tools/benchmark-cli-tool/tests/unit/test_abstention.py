@@ -51,8 +51,8 @@ def _install_search(
 
     def fake_vector(_embedding: list[float], _limit: int = 40, *, conn: object, **kwargs: object) -> list[SearchChunk]:
         assert conn is seen["conn"]
-        assert kwargs.get("source_type") is None
         seen["vector_calls"] = int(seen["vector_calls"]) + 1
+        seen.setdefault("sources", []).append(kwargs.get("source_type"))
         return [chunk(text, vector_score)]
 
     def fake_fts(_query: str, _limit: int = 40, *, conn: object, **_kwargs: object) -> list[SearchChunk]:
@@ -116,6 +116,69 @@ def test_rewritten_queries_share_one_connection(monkeypatch: pytest.MonkeyPatch)
         min_keyword_overlap=1,
     )
     assert seen["connections"] == 1
-    assert seen["vector_calls"] == 2
+    assert int(seen["vector_calls"]) > 2
+    assert "discord" in seen["sources"]
     assert seen["embed_inputs"] == ["Fanuel Mengistu kiosk", "Fanuel Mengistu"]
     assert decision.status == "accepted"
+
+
+@pytest.mark.unit
+def test_per_source_floor_keeps_discord_when_trello_fills_the_global_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Discord note that is not in the global top ranks still survives."""
+    discord = SearchChunk(
+        9,
+        "discord-sample.json",
+        0,
+        "Use Anthropic Opus for high reasoning work.",
+        {"source_type": "discord", "channel": "sample"},
+        0.42,
+        content_sha256="cd" * 32,
+    )
+    trello = SearchChunk(
+        3,
+        "trello/board/card.md",
+        0,
+        "Card: Unrelated portal chore",
+        {"source_type": "trello"},
+        0.91,
+        content_sha256="ab" * 32,
+    )
+
+    @contextmanager
+    def fake_connection():
+        yield object()
+
+    def fake_embed(texts: list[str]) -> list[list[float]]:
+        return [[0.1, 0.2] for _ in texts]
+
+    def fake_vector(_embedding: list[float], _limit: int = 40, *, source_type: str | None = None, **_kwargs: object) -> list[SearchChunk]:
+        if source_type == "discord":
+            return [discord]
+        if source_type is None:
+            return [trello]
+        return []
+
+    def fake_fts(_query: str, _limit: int = 40, *, source_type: str | None = None, **_kwargs: object) -> list[SearchChunk]:
+        if source_type == "discord":
+            return [discord]
+        if source_type is None:
+            return [trello]
+        return []
+
+    monkeypatch.setattr(retrieval, "connection", fake_connection)
+    monkeypatch.setattr(retrieval, "embed_texts", fake_embed)
+    monkeypatch.setattr(retrieval, "vector_search", fake_vector)
+    monkeypatch.setattr(retrieval, "fts_search", fake_fts)
+
+    decision = retrieve_evidence(
+        "what model should we use for high reasoning work?",
+        snapshot_present=True,
+    )
+
+    assert decision.status == "accepted"
+    assert any(result.chunk.id == discord.id for result in decision.results)
+    assert any(
+        (result.chunk.metadata or {}).get("source_type") == "discord" for result in decision.results
+    )

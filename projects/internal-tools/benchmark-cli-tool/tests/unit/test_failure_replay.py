@@ -485,3 +485,99 @@ def test_current_person_work_labels_completed_cards(monkeypatch: pytest.MonkeyPa
     assert "Completed:" in response.answer
     assert response.answer.index("Kiosk MVP") < response.answer.index("Retired kiosk notes")
 
+
+@pytest.mark.unit
+def test_missing_list_beats_unrelated_process_advice(monkeypatch: pytest.MonkeyPatch) -> None:
+    _quiet(monkeypatch)
+    advice = (
+        "The QA process should involve establishing objective quality criteria "
+        "and test environments before execution begins."
+    )
+    note = SearchChunk(
+        70,
+        "portal/guide/sample-plan.md",
+        0,
+        advice,
+        {"source_type": "kb_page", "title": "Sample plan"},
+        0.6,
+        content_sha256=hashlib.sha256(b"qa-advice").hexdigest(),
+    )
+    monkeypatch.setattr(
+        agent,
+        "retrieve_evidence",
+        lambda *_args, **_kwargs: RetrievalDecision(
+            "accepted",
+            (HybridSearchResult(note, 0.2, vector_score=0.6, fts_score=1.0),),
+            0.6,
+            2,
+        ),
+    )
+    monkeypatch.setattr(agent, "understand_query", _plan(None, "QA process"))
+    monkeypatch.setattr(
+        agent,
+        "call_llm_structured",
+        lambda **_kwargs: _draft(
+            advice,
+            [
+                Citation(
+                    source_file=note.source_file,
+                    chunk_id=note.id,
+                    content_sha256=note.content_sha256 or "",
+                    quote=advice,
+                )
+            ],
+        ),
+    )
+
+    response = agent.run_agent("What's in QA?")
+
+    assert response.status == "no_relevant_information"
+    assert 'named "qa"' in response.answer.casefold()
+    assert "test environments" not in response.answer.casefold()
+
+
+@pytest.mark.unit
+def test_board_link_and_urgent_are_both_answered(monkeypatch: pytest.MonkeyPatch) -> None:
+    from benchmark_cli.trello_answers import TrelloCardRow
+
+    _quiet(monkeypatch)
+    rows = list(sample_board())
+    ship = rows[0]
+    board_url = "https://trello.com/b/tIvVZqio/sample-board"
+    rows[0] = TrelloCardRow(
+        board=ship.board,
+        list_name=ship.list_name,
+        card_id=ship.card_id,
+        title=ship.title,
+        url=ship.url,
+        chunk_id=ship.chunk_id,
+        source_file=ship.source_file,
+        content_sha256=ship.content_sha256,
+        chunk_text=ship.chunk_text + f"\nBoard URL: {board_url}",
+    )
+    rows.append(
+        TrelloCardRow(
+            board="Sample Board",
+            list_name="Sev 1",
+            card_id="sev1",
+            title="Sample urgent outage",
+            url="https://trello.com/c/sev1",
+            chunk_id=8,
+            source_file="trello/tIvVZqio/sev1.md",
+            content_sha256=hashlib.sha256(b"sev1").hexdigest(),
+            chunk_text="Card: Sample urgent outage\nList: Sev 1\nURL: https://trello.com/c/sev1",
+        )
+    )
+    monkeypatch.setattr(agent, "trello_card_rows", lambda: rows)
+    monkeypatch.setattr(agent, "understand_query", _plan(None, "trello board urgent"))
+    monkeypatch.setattr(
+        agent,
+        "call_llm_structured",
+        lambda **_kwargs: _draft("Most urgent tickets are Sev 1.", status="unknown"),
+    )
+
+    response = agent.run_agent("where do I find the Trello board and what's most urgent on it?")
+
+    assert board_url in response.answer
+    assert "Sample urgent outage" in response.answer
+

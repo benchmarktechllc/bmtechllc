@@ -68,6 +68,7 @@ from .trello_answers import (
     indexed_list_request,
     listed_cards_are_named,
     meaning_gap,
+    missing_list_answer,
     person_card_payload,
     person_cards_answer,
     project_status_answer,
@@ -868,7 +869,7 @@ def _deterministic_fallback(
     """Indexed Trello rules when the model is down or its draft does not validate."""
     if rows is None:
         return _active_project_fallback(question, chunks)
-    if asks_for_trello_board_link(question):
+    if asks_for_trello_board_link(question) and re.search(r"\band\b", question, re.IGNORECASE) is None:
         linked = _board_link_response(rows)
         if linked is not None and linked.status == "answered":
             return linked
@@ -1062,6 +1063,10 @@ def run_agent(
 
     def _complete(response: AnswerResponse | None) -> AnswerResponse | None:
         """Prefer a snapshot answer when the draft omits the cards it was asked for."""
+        if snapshot:
+            missing = missing_list_answer(question, snapshot)
+            if missing is not None:
+                return missing
         if asks_for_meaning(question) and snapshot:
             covered = False
             if response is not None:

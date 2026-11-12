@@ -369,7 +369,7 @@ def asks_for_trello_board_link(question: str) -> bool:
         return False
     if re.search(r"\btrello\b", text) is None or re.search(r"\bboards?\b", text) is None:
         return False
-    return re.search(r"\b(?:link|url|uri|address)\b", text) is not None
+    return re.search(r"\b(?:link|url|uri|address|where|find)\b", text) is not None
 
 
 def _url_in_text(text: str) -> str | None:
@@ -1451,22 +1451,75 @@ def listed_cards_are_named(question: str, answer: str, rows: Sequence[TrelloCard
     return all(card.title.casefold() in folded for card in matched)
 
 
+def missing_list_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
+    """The snapshot's no-such-list answer when the asked list is not indexed."""
+    known = _indexed_list_names(rows)
+    requested = resolve_board_list(question, known)
+    if not requested or requested == OPEN_LISTS:
+        return None
+    if any(_list_matches(name, requested) for name in known):
+        return None
+    return trello_list_answer(requested, rows, fit_to_discord=False)
+
+
+def _one_board_form(
+    text: str,
+    rows: Sequence[TrelloCardRow],
+    thread_question: str | None,
+) -> AnswerResponse | None:
+    if asks_for_trello_board_link(text):
+        linked = trello_board_link_answer(rows)
+        if linked.status == "answered":
+            return linked
+    return answer_board_question(text, rows, thread_question=thread_question)
+
+
 def answer_from_board_forms(
     question: str,
     searches: Sequence[str],
     rows: Sequence[TrelloCardRow],
     thread_question: str | None = None,
 ) -> AnswerResponse | None:
-    """Board rules on the question, a normalized typo, and any rewritten search."""
+    """Board rules on the question, a normalized typo, and any rewritten search.
+
+    A question joined by ``and`` keeps each half that the snapshot can answer.
+    """
     from .roster import normalize_known_terms
 
+    pieces = re.split(r"\s+\band\b\s+", question, flags=re.IGNORECASE)
+    if len(pieces) >= 2:
+        parts: list[AnswerResponse] = []
+        seen: set[str] = set()
+        for piece in pieces:
+            found = _one_board_form(piece, rows, thread_question)
+            if found is None or found.answer in seen:
+                continue
+            seen.add(found.answer)
+            parts.append(found)
+        if len(parts) >= 2:
+            text = "\n\n".join(part.answer for part in parts)
+            answered = [part for part in parts if part.status == "answered"]
+            if not answered:
+                return AnswerResponse(
+                    status="no_relevant_information",
+                    answer=text,
+                    confidence=0.0,
+                    citations=[],
+                )
+            citations = [citation for part in answered for citation in part.citations]
+            return AnswerResponse(
+                status="answered",
+                answer=text,
+                confidence=0.8,
+                citations=citations,
+            )
     forms: list[str] = []
     for text in (question, normalize_known_terms(question), *searches):
         cleaned = " ".join((text or "").split())
         if cleaned and cleaned not in forms:
             forms.append(cleaned)
     for form in forms:
-        found = answer_board_question(form, rows, thread_question=thread_question)
+        found = _one_board_form(form, rows, thread_question)
         if found is not None:
             return found
     return None

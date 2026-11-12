@@ -14,6 +14,16 @@ from .storage.postgres import SearchChunk, SearchFilters, connection, fts_search
 CANDIDATE_LIMIT = 40
 RRF_K = 60
 PER_SOURCE_LIMIT = 4
+# A global top-40 is mostly Trello. Each source still contributes its own top hits.
+RETRIEVAL_SOURCES = (
+    "discord",
+    "kb_page",
+    "trello",
+    "transcript",
+    "policy_doc",
+    "user_contributed",
+)
+SOURCE_ARM_LIMIT = PER_SOURCE_LIMIT
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,10 +223,12 @@ def retrieve_evidence(
     queries: Sequence[str] | None = None,
     snapshot_present: bool = False,
 ) -> RetrievalDecision:
-    """Hybrid search for one or two rewritten queries on a single connection.
+    """Hybrid search for rewritten queries on a single connection.
 
-    Vector and keyword arms are fused with RRF. One unfiltered search is run
-    per query string, not one search per source type.
+    Each query runs one global hybrid search plus a short hybrid search per
+    source type. Reciprocal rank fusion then keeps a floor from every source,
+    so Discord and the knowledge base are not dropped when Trello fills the
+    global top ranks. The raw question is one of the query strings.
     """
     if not 0.0 <= min_cosine_similarity <= 1.0:
         raise ValueError("min_cosine_similarity must be between 0 and 1.")
@@ -261,6 +273,37 @@ def retrieve_evidence(
                     fts_scores[chunk.id] = chunk.score
             ranked_lists.append(vector_hits)
             ranked_lists.append(fts_hits)
+            for source_type in RETRIEVAL_SOURCES:
+                source_vector = vector_search(
+                    embedding,
+                    SOURCE_ARM_LIMIT,
+                    speaker=speaker,
+                    source=source,
+                    date=date,
+                    include_synthetic=include_synthetic,
+                    source_type=source_type,
+                    conn=conn,
+                )
+                source_fts = fts_search(
+                    text,
+                    SOURCE_ARM_LIMIT,
+                    speaker=speaker,
+                    source=source,
+                    date=date,
+                    include_synthetic=include_synthetic,
+                    source_type=source_type,
+                    conn=conn,
+                )
+                for chunk in source_vector:
+                    current = vector_scores.get(chunk.id)
+                    if current is None or chunk.score > current:
+                        vector_scores[chunk.id] = chunk.score
+                for chunk in source_fts:
+                    current = fts_scores.get(chunk.id)
+                    if current is None or chunk.score > current:
+                        fts_scores[chunk.id] = chunk.score
+                ranked_lists.append(source_vector)
+                ranked_lists.append(source_fts)
     fused = [
         replace(
             result,
