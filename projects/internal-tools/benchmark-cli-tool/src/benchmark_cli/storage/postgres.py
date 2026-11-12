@@ -191,6 +191,7 @@ def initialize_database() -> None:
     apply_sql("006_fathom_sync.sql")
     apply_sql("007_fireflies_sync.sql")
     apply_sql("008_fts_url_tokens.sql")
+    apply_sql("009_github_sync.sql")
 
 
 def create_indexes() -> None:
@@ -1115,3 +1116,63 @@ def read_doc(chunk_id: int, *, max_tokens: int = PARENT_CONTEXT_MAX_TOKENS) -> P
     section_chunks = tuple(SearchChunk(*row) for row in section_rows)
     selected, total, complete = select_context_window(section_chunks, anchor.id, max_tokens)
     return ParentContext(anchor, section, selected, total, complete)
+
+
+def github_file_digests(repo: str) -> dict[str, str]:
+    """Indexed path to content digest for one repository."""
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT path, blob_sha FROM github_file_state WHERE repo = %s",
+            (repo,),
+        )
+        return {str(path): str(blob_sha) for path, blob_sha in cursor.fetchall()}
+
+
+def upsert_github_file(repo: str, path: str, source_file: str, blob_sha: str) -> None:
+    statement = """
+        INSERT INTO github_file_state (repo, path, source_file, blob_sha)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (repo, path) DO UPDATE
+            SET source_file = EXCLUDED.source_file,
+                blob_sha = EXCLUDED.blob_sha,
+                synced_at = now()
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (repo, path, source_file, blob_sha))
+        conn.commit()
+
+
+def delete_github_file(repo: str, path: str) -> None:
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM github_file_state WHERE repo = %s AND path = %s",
+            (repo, path),
+        )
+        conn.commit()
+
+
+def set_github_commit(repo: str, commit_sha: str) -> None:
+    statement = """
+        INSERT INTO github_sync_state (repo, commit_sha)
+        VALUES (%s, %s)
+        ON CONFLICT (repo) DO UPDATE
+            SET commit_sha = EXCLUDED.commit_sha,
+                synced_at = now()
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (repo, commit_sha))
+        conn.commit()
+
+
+def github_pull_request_chunks() -> list[SearchChunk]:
+    """Indexed pull-request chunks. Callers order them by merge time."""
+    statement = """
+        SELECT id, source_file, chunk_index, chunk_text, metadata, 0.0,
+               token_count, content_sha256
+        FROM document_chunks
+        WHERE metadata ->> 'source_type' = 'github'
+          AND metadata ->> 'kind' = 'pull_request'
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement)
+        return [SearchChunk(*row) for row in cursor.fetchall()]

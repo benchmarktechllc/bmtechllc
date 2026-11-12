@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 class ChunkMetadata(BaseModel):
     """Provenance retained for a persisted document chunk."""
 
-    source_type: Literal["discord", "transcript", "policy_doc", "kb_page", "trello"]
+    source_type: Literal["discord", "transcript", "policy_doc", "kb_page", "trello", "github"]
     date: str
     ingested_at: str
     section: str | None = None
@@ -39,6 +39,13 @@ class ChunkMetadata(BaseModel):
     attendees: list[str] = Field(default_factory=list)
     recording_id: str | None = None
     kind: str | None = None
+    repo: str | None = None
+    path: str | None = None
+    commit_sha: str | None = None
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+    symbol: str | None = None
+    merged_at: str | None = None
 
     @model_validator(mode="after")
     def validate_source_fields(self) -> ChunkMetadata:
@@ -62,6 +69,8 @@ class ChunkMetadata(BaseModel):
             raise ValueError(
                 "trello chunk metadata requires board, column, card_id, title, and url."
             )
+        if self.source_type == "github" and not (self.repo and self.path and self.commit_sha and self.url):
+            raise ValueError("github chunk metadata requires repo, path, commit_sha, and url.")
         return self
 
     def as_metadata(self) -> dict[str, Any]:
@@ -70,6 +79,9 @@ class ChunkMetadata(BaseModel):
         if self.source_type == "trello":
             # ``column`` is the Trello list. Keep ``list`` as the name the board uses.
             payload["list"] = self.column
+        if self.source_type != "github":
+            for key in ("repo", "path", "commit_sha", "start_line", "end_line", "symbol", "merged_at"):
+                payload.pop(key, None)
         return payload
 
 
