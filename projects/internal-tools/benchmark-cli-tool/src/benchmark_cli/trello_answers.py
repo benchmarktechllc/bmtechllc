@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from .ingestion.clean import redact_secrets
 from .models import AnswerResponse, Citation
-from .names import member_matches_person, resolve_question, split_members_field
+from .names import asks_person_work, member_matches_person, resolve_question, split_members_field
 from .storage.postgres import SearchChunk
 
 MAX_LISTED_CARDS = 25
@@ -1125,6 +1125,9 @@ def _assignee_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResp
         )
     if match is None:
         return None
+    worked = person_work_answer(question, rows)
+    if worked is not None:
+        return worked
     who = match.group(1).strip(" ?.")
     people = resolve_question(question).people
     if people:
@@ -1145,7 +1148,56 @@ def _assignee_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResp
             confidence=0.0,
             citations=[],
         )
-    return trello_list_answer(OPEN_LISTS, matched, fit_to_discord=False)
+    return _grouped_person_cards(matched)
+
+
+def person_work_answer(
+    question: str, rows: Sequence[TrelloCardRow]
+) -> AnswerResponse | None:
+    """Cards for a resolved person, including Done, with no one else's cards."""
+    if not asks_person_work(question):
+        return None
+    people = resolve_question(question).people
+    if not people:
+        return None
+    usable = _usable_cards(rows)
+    if not any(_members_of(card) for card in usable):
+        return AnswerResponse(
+            status="no_relevant_information",
+            answer="Assignees are not indexed yet.",
+            confidence=0.0,
+            citations=[],
+        )
+    matched = [
+        card
+        for card in usable
+        if any(member_matches_person(name, person) for name in _members_of(card) for person in people)
+    ]
+    if not matched:
+        return AnswerResponse(
+            status="no_relevant_information",
+            answer=f"No indexed card lists {people[0].canonical} as a member.",
+            confidence=0.0,
+            citations=[],
+        )
+    return _grouped_person_cards(matched)
+
+
+def _grouped_person_cards(cards: Sequence[TrelloCardRow]) -> AnswerResponse:
+    """Active lists first. Done is its own group at the end."""
+    active = [card for card in cards if _normalize(card.list_name) != "done"]
+    done = [card for card in cards if _normalize(card.list_name) == "done"]
+    lines = _render_groups(active)
+    if done:
+        if lines:
+            lines.append("")
+        lines.extend(_render_groups(done))
+    return AnswerResponse(
+        status="answered",
+        answer="\n".join(lines),
+        confidence=0.8,
+        citations=[_citation(card) for card in active + done],
+    )
 
 
 def _due_answer(question: str, rows: Sequence[TrelloCardRow]) -> AnswerResponse | None:
@@ -1321,9 +1373,9 @@ def answer_board_question(
         requested = resolve_board_list(question, known)
         if requested is not None:
             deterministic = trello_list_answer(requested, rows, fit_to_discord=False)
-    assignee = _assignee_answer(question, rows)
-    if assignee is not None and re.search(r"\b(?:assigned to|assignee)\b", question, re.IGNORECASE):
-        return assignee
+    worked = person_work_answer(question, rows)
+    if worked is not None:
+        return worked
     accepted = grounded_draft(draft, rows)
     if accepted is not None and _draft_matches_request(question, accepted, rows):
         return _state_count(question, accepted, rows)

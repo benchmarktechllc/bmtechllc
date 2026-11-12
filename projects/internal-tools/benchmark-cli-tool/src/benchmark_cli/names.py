@@ -237,17 +237,24 @@ def _candidates(extra_terms: tuple[str, ...] | list[str]) -> list[tuple[str, str
     return found
 
 
+def _typo_distance(surface: str, label: str) -> int | None:
+    """Edits allowed for a correction. Exact equality is not a typo."""
+    if surface == label or surface in _STOPWORDS:
+        return None
+    if len(surface) < _MIN_FUZZY_LENGTH or len(label) < _MIN_FUZZY_LENGTH:
+        return None
+    distance = _damerau(surface, label)
+    if distance == 1:
+        return distance
+    if distance == 2 and len(surface) >= 8 and len(label) >= 8:
+        return distance
+    return None
+
+
 def _acceptable(surface: str, label: str) -> bool:
     if surface == label:
         return True
-    if surface in _STOPWORDS or len(surface) < _MIN_FUZZY_LENGTH or len(label) < _MIN_FUZZY_LENGTH:
-        return False
-    distance = _damerau(surface, label)
-    if distance == 0:
-        return True
-    if distance == 1 and min(len(surface), len(label)) >= _MIN_FUZZY_LENGTH:
-        return True
-    return False
+    return _typo_distance(surface, label) is not None
 
 
 def resolve_question(question: str, extra_terms: tuple[str, ...] | list[str] = ()) -> NameResolution:
@@ -279,13 +286,15 @@ def resolve_question(question: str, extra_terms: tuple[str, ...] | list[str] = (
             continue
         _label, canonical, person = best
         used.update(range(start, end))
-        if person is not None and person not in people:
-            people.append(person)
         already = surface == canonical.casefold() or (
             person is not None and surface == person.canonical.casefold()
         )
-        if already:
+        # An exact vocabulary or canonical match must not rewrite the question.
+        # A person alias whose canonical differs, or a real typo, may.
+        if already or (person is None and surface == _label):
             continue
+        if person is not None and person not in people:
+            people.append(person)
         original = " ".join(tokens[start:end])
         hits.append(NameHit(original, canonical, "person" if person is not None else "term"))
     if not hits:
@@ -297,3 +306,37 @@ def resolve_question(question: str, extra_terms: tuple[str, ...] | list[str] = (
     query = text if not suffix else f"{text} {' '.join(suffix)}"
     note = " ".join(f"'{hit.surface}' interpreted as {hit.canonical}." for hit in hits)
     return NameResolution(query, note, tuple(people), tuple(hits))
+
+
+def corrected_question(question: str, resolution: NameResolution) -> str:
+    """Replace typo or alias surfaces. No hits returns the question unchanged."""
+    if not resolution.hits:
+        return question
+    text = question
+    for hit in sorted(resolution.hits, key=lambda item: len(item.surface), reverse=True):
+        text = re.sub(
+            rf"(?<![A-Za-z0-9]){re.escape(hit.surface)}(?![A-Za-z0-9])",
+            hit.canonical,
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    return text
+
+
+def asks_person_work(question: str) -> bool:
+    """A person's tickets, not a general board or team question."""
+    text = question.casefold()
+    if re.search(r"\b(?:assigned to|assignee)\b", text):
+        return True
+    if re.search(r"\bworking on\b", text):
+        return True
+    if re.search(r"\b(?:tickets?|cards?)\s+for\b", text):
+        return True
+    if re.search(r"\btasks?\b", text):
+        return True
+    if re.search(r"\bon\s+(?:his|her|their)\s+plate\b", text):
+        return True
+    if re.search(r"\bwhat(?:'s| is)\b.+\bdoing\b", text):
+        return True
+    return re.search(r"[A-Za-z]+'s\s+tickets?\b", question) is not None

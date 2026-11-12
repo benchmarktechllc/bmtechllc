@@ -34,7 +34,7 @@ from .ingestion.clean import redact_secrets
 from .llm import ModelQuotaError, _quota_error, call_llm, call_llm_structured
 from .logging import log_agent_diagnostic
 from .models import AnswerResponse, Citation
-from .names import resolve_question
+from .names import asks_person_work, corrected_question, resolve_question
 from .portal_urls import canonical_portal_base_url
 from .retrieval import HybridSearchResult, RetrievalDecision, retrieve_evidence
 from .router import classify_query
@@ -61,6 +61,7 @@ from .trello_answers import (
     cards_from_rows,
     citations_for_answer,
     indexed_list_request,
+    person_work_answer,
     project_status_answer,
     requested_trello_list,
     snapshot_messages,
@@ -704,18 +705,16 @@ def run_agent(
         logger.info("retrieval revision=%s outcome=credential_refused", ANSWER_PATH_REVISION)
         return _finish(credential_refusal(), outcome="credential_refused", synthesis_attempts=0)
     snapshot = _load_trello_catalog()
-    extra_terms = []
-    for card in snapshot or ():
-        extra_terms.extend(re.findall(r"[A-Za-z0-9]{4,}", f"{getattr(card, 'title', '')} {getattr(card, 'list_name', '')}"))
-    resolution = resolve_question(question, extra_terms)
-    if (
-        resolution.people
-        and snapshot
-        and re.search(r"\b(?:assigned to|assignee)\b", question, re.IGNORECASE)
-    ):
-        listed = answer_board_question(question, snapshot, thread_question=thread_question)
+    resolution = resolve_question(question)
+    routed = corrected_question(question, resolution)
+    if snapshot and asks_person_work(question):
+        listed = person_work_answer(question, snapshot)
         if listed is not None:
-            return _finish(listed, outcome="assignee_roster", synthesis_attempts=0)
+            return _finish(listed, outcome="person_work", synthesis_attempts=0)
+    if resolution.changed and snapshot and routed != question:
+        listed = answer_board_question(routed, snapshot, thread_question=thread_question)
+        if listed is not None and listed.status == "answered":
+            return _finish(listed, outcome="typo_routed", synthesis_attempts=0)
     retrieval_question = _retrieval_question(question, thread_question)
     if resolution.changed:
         extra = resolution.query.removeprefix(" ".join(question.split())).strip()
@@ -880,7 +879,7 @@ def run_agent(
         if checked_retry.status == "answered":
             return _finish(checked_retry, outcome="answered_after_citation_retry", synthesis_attempts=2)
         return _finish(checked_retry, outcome="model_abstained", synthesis_attempts=2)
-    fallback = _deterministic_fallback(question, thread_question, snapshot, tuple(evidence.values()))
+    fallback = _deterministic_fallback(routed, thread_question, snapshot, tuple(evidence.values()))
     if fallback is not None:
         return _finish(fallback, outcome="deterministic_fallback", synthesis_attempts=2)
     if checked is not None and checked.status == "no_relevant_information":
