@@ -325,13 +325,26 @@ def corrected_question(question: str, resolution: NameResolution) -> str:
 
 
 def asks_person_work(question: str) -> bool:
-    """A person's tickets, not a general board or team question."""
-    text = question.casefold()
+    """A person's tickets, not a general board or team question.
+
+    The follow-up is judged on its own. A thread starter that names someone
+    else is not part of this check.
+    """
+    text = question.casefold().replace("’", "'")
+    possessive = r"[a-z0-9]+'s\s+(?:plate|work|cards?|tasks?|tickets?)"
+    if re.search(rf"\b{possessive}\b", text):
+        return True
+    if re.search(rf"\bon\s+{possessive}\b", text):
+        return True
     if re.search(r"\b(?:assigned to|assignee)\b", text):
         return True
     if re.search(r"\bworking on\b", text):
         return True
     if re.search(r"\b(?:tickets?|cards?)\s+for\b", text):
+        return True
+    if re.search(r"\btickets?\s+assigned\s+to\b", text):
+        return True
+    if re.search(r"\b[a-z0-9]+\s+tickets?\b", text):
         return True
     if re.search(r"\btasks?\b", text):
         return True
@@ -339,4 +352,4 @@ def asks_person_work(question: str) -> bool:
         return True
     if re.search(r"\bwhat(?:'s| is)\b.+\bdoing\b", text):
         return True
-    return re.search(r"[A-Za-z]+'s\s+tickets?\b", question) is not None
+    return re.search(r"[A-Za-z0-9]+'s\s+tickets?\b", text) is not None

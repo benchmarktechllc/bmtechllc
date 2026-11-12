@@ -260,6 +260,58 @@ def test_working_on_uses_the_person_list(question: str) -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "question",
+    (
+        "what's on dante's plate",
+        "Tickets assigned to Dante",
+        "Tickets assigned to Anwar",
+        "fano's work",
+        "on fanual's plate",
+        "dantno's cards",
+        "Dante tickets",
+        "tickets for Fano",
+    ),
+)
+def test_possessive_and_bare_person_questions_match(question: str) -> None:
+    from benchmark_cli.names import asks_person_work
+
+    assert asks_person_work(question)
+    assert resolve_question(question).people
+
+
+@pytest.mark.unit
+def test_plate_and_work_list_only_that_person() -> None:
+    rows = _roster()
+    dante = person_work_answer("what's on dante's plate", rows)
+    fanuel = person_work_answer("fano's work", rows)
+    anwar = person_work_answer("Tickets assigned to Anwar", rows)
+    assert dante is not None and "Assessment Playbook" in dante.answer
+    assert "Sample anwar card" not in dante.answer
+    assert fanuel is not None and "Sample fanuel doing one" in fanuel.answer
+    assert "Assessment Playbook" not in fanuel.answer
+    assert anwar is not None and "Sample anwar card" in anwar.answer
+    assert "Initial audit template" not in anwar.answer
+
+
+@pytest.mark.unit
+def test_thread_followup_uses_only_the_new_person(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agent, "log_agent_diagnostic", lambda **_kwargs: None)
+    monkeypatch.setattr(agent, "trello_card_rows", lambda: list(_roster()))
+    monkeypatch.setattr(agent, "retrieve_evidence", lambda *_args, **_kwargs: pytest.fail("follow-up is a person list"))
+    monkeypatch.setattr(agent, "call_llm", lambda **_kwargs: pytest.fail("follow-up is a person list"))
+
+    response = agent.run_agent(
+        "Tickets assigned to Anwar",
+        thread_question="What tickets are assigned to Dante",
+    )
+
+    assert "Sample anwar card" in response.answer
+    assert "Assessment Playbook" not in response.answer
+    assert "Initial audit template" not in response.answer
+
+
+@pytest.mark.unit
 def test_trelo_corrects_without_a_snapshot_and_reaches_the_board() -> None:
     resolution = resolve_question("what's on the trelo board")
     corrected = corrected_question("what's on the trelo board", resolution)
