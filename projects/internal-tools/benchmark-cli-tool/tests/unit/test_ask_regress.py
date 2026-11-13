@@ -373,3 +373,46 @@ def test_prompt_hash_ignores_the_random_evidence_nonce_only() -> None:
     assert harness.prompt_sha256(first) == harness.prompt_sha256(second)
     other = [{"role": "system", "content": delimit_evidence("other text")}]
     assert harness.prompt_sha256(first) != harness.prompt_sha256(other)
+
+
+@pytest.mark.unit
+def test_code_retrieval_record_and_replay_run_offline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import json
+
+    from benchmark_cli import github_answers
+    from benchmark_cli.models import AnswerResponse, Citation
+
+    def chunk(chunk_id: int, path: str, symbol: str) -> SearchChunk:
+        text = f"{path}:L1-L2 {symbol}\nhttps://github.com/o/r/blob/abc/{path}#L1-L2\n\ndef {symbol or 'x'}() -> None:\n    return None\n"
+        return SearchChunk(
+            chunk_id,
+            f"github/o/r/{path}",
+            0,
+            text,
+            {"source_type": "github", "path": path, "kind": "code", "symbol": symbol, "header_words": path.replace("/", " "), "start_line": 1, "end_line": 2, "url": f"https://github.com/o/r/blob/abc/{path}#L1-L2"},
+            0.6,
+            10,
+            "d" * 64,
+        )
+
+    lane = [chunk(1_000_000_001, "src/benchmark_cli/trello_sync.py", "sync_board"), chunk(1_000_000_002, "src/benchmark_cli/config.py", "")]
+    monkeypatch.setattr(github_answers, "embed_texts", lambda texts: [[0.1] for _ in texts])
+    for name in ("github_vector_search", "github_fts_search", "github_header_search"):
+        monkeypatch.setattr(github_answers, name, lambda _q, limit, _kinds: lane[:limit])
+    monkeypatch.setattr(github_answers, "github_pull_rows", lambda: [])
+    drafts = iter([AnswerResponse(status="answered", answer="sync_board", confidence=0.8, citations=[Citation(source_file=lane[0].source_file, chunk_id=lane[0].id, content_sha256="d" * 64, quote="not in the chunk")])])
+    monkeypatch.setattr(github_answers, "call_llm_structured", lambda **_k: next(drafts, None) or AnswerResponse(status="no_relevant_information", answer="No.", confidence=0.0, citations=[]))
+
+    assert harness.main(["code-retrieval", "--out", str(tmp_path / "code.json")]) == 1  # expected paths missing for most cases
+    report = json.loads((tmp_path / "code.json").read_text())
+    assert next(row for row in report["cases"] if row["id"] == "trello-ingest")["rank"] == 1
+
+    assert harness.main(["record", "--out", str(tmp_path / "rec.json")]) == 0
+    recording = json.loads((tmp_path / "rec.json").read_text())
+    first = recording["cases"][0]
+    assert first["id"] == "trello-ingest" and first["drafts"][0]["status"] == "answered"
+    monkeypatch.setattr(github_answers, "call_llm_structured", lambda **_k: pytest.fail("replay makes no model call"))
+    assert harness.main(["replay", "--recording", str(tmp_path / "rec.json"), "--out", str(tmp_path / "replay.json")]) == 0
+    replayed = json.loads((tmp_path / "replay.json").read_text())
+    assert all(row["recorded_outcome"] == row["replayed_outcome"] for row in replayed["cases"])
+    assert replayed["cases"][0]["drafts"][0]["valid"] is False
