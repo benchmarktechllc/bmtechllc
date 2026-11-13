@@ -416,3 +416,11 @@ def test_code_retrieval_record_and_replay_run_offline(monkeypatch: pytest.Monkey
     replayed = json.loads((tmp_path / "replay.json").read_text())
     assert all(row["recorded_outcome"] == row["replayed_outcome"] for row in replayed["cases"])
     assert replayed["cases"][0]["drafts"][0]["valid"] is False
+
+
+@pytest.mark.unit
+def test_fingerprint_ignores_github_rows_but_reports_them() -> None:
+    assert "IS DISTINCT FROM 'github'" in harness.FINGERPRINT_SQL
+    base = {"count": 5, "max_id": 9, "md5": "m", "github_rows_in_document_chunks": 0}
+    assert harness.fingerprint_matches(base, {**base, "github_rows_in_document_chunks": 3000})
+    assert not harness.fingerprint_matches(base, {**base, "max_id": 10})

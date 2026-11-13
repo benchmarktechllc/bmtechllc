@@ -659,16 +659,29 @@ def diff_case(base: dict[str, Any], cand: dict[str, Any]) -> list[str]:
     return diffs
 
 
+FINGERPRINT_SQL = (
+    "SELECT count(*), max(id), md5(string_agg(content_sha256, ',' ORDER BY id)) "
+    "FROM document_chunks WHERE metadata ->> 'source_type' IS DISTINCT FROM 'github'"
+)
+GITHUB_ROWS_SQL = "SELECT count(*) FROM document_chunks WHERE metadata ->> 'source_type' = 'github'"
+
+
 def corpus_fingerprint() -> dict[str, Any]:
+    """Company rows of document_chunks. GitHub rows an older build wrote there are counted apart,
+    so a database carrying that index can still be compared and its displacement named."""
     from benchmark_cli.storage.postgres import connection
 
     with connection() as conn, conn.cursor() as cursor:
-        cursor.execute(
-            "SELECT count(*), max(id), md5(string_agg(content_sha256, ',' ORDER BY id)) "
-            "FROM document_chunks"
-        )
+        cursor.execute(FINGERPRINT_SQL)
         count, max_id, digest = cursor.fetchone()
-    return {"count": int(count), "max_id": None if max_id is None else int(max_id), "md5": digest}
+        cursor.execute(GITHUB_ROWS_SQL)
+        github_rows = int(cursor.fetchone()[0])
+    return {
+        "count": int(count),
+        "max_id": None if max_id is None else int(max_id),
+        "md5": digest,
+        "github_rows_in_document_chunks": github_rows,
+    }
 
 
 def fingerprint_matches(base: dict[str, Any], cand: dict[str, Any]) -> bool:
