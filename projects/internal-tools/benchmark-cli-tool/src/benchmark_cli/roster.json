@@ -1,0 +1,20 @@
+{
+  "people": [
+    {
+      "trello": ["Dantino12"],
+      "canonical": "Dante Paniccia",
+      "aliases": ["Dante", "Dantino", "Dantino12"]
+    },
+    {
+      "trello": ["Fanuel Mengistu"],
+      "canonical": "Fanuel Mengistu",
+      "aliases": ["Fanuel", "Fanuel Anteneh", "Fano", "Fanuel Mengistu"]
+    },
+    {
+      "trello": ["Anwar Hussein"],
+      "canonical": "Anwar Hussein",
+      "aliases": ["Anwar", "Anwar Hussein"]
+    }
+  ],
+  "terms": ["kiosk", "portal", "Fireflies", "Trello"]
+}

@@ -99,9 +99,13 @@ def test_board_parser_keeps_open_cards_and_redacts_secrets() -> None:
     assert "- [ ] Write docs" in text
     assert "- [x] Review" in text
     assert trello_source_file(board.short_link, card.card_id) == "trello/tIvVZqio/card-1.md"
+    assert "Board URL: https://trello.com/b/tIvVZqio/bmtech-general-board" in text
     assert card.members == ("Sample Person", "sampletwo")
-    assert "Members: Sample Person, sampletwo" in text
+    assert "Members: Sample Person; sampletwo" in text
     assert "missing-member" not in text
+    assert "Last activity: 2026-11-01" in text
+    assert "Checklists: 1 (1/2 items complete)" in text
+    assert "ATTI" not in text
 
     chunk = chunk_units(units, target_tokens=400, max_tokens=500, min_tokens=1)[0]
     metadata = metadata_for(chunk, Path("trello/tIvVZqio/card-1.md"), "trello")

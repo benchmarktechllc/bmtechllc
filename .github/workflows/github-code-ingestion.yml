@@ -1,0 +1,41 @@
+name: GitHub code ingestion
+
+on:
+  schedule:
+    # Schedules use UTC. Offset from discord (03:17), portal (04:17),
+    # trello (04:47), fathom (05:17), and fireflies (05:47).
+    - cron: "17 6 * * *"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: github-code-ingestion
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: projects/internal-tools/benchmark-cli-tool
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # DATABASE_URL and OPENAI_API_KEY already live on this environment.
+    # GITHUB_TOKEN below is the built-in token. Do not add a secret.
+    environment: discord-ingestion
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip && python -m pip install .
+      - run: benchmark-sync-github --root "${{ github.workspace }}" --sha "${{ github.sha }}"
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}

@@ -20,6 +20,7 @@ from .entailment import (
     claim_status,
     is_not_current_recommendation,
     meaningful_text,
+    shared_term_count,
     supported_steps,
     touches_question,
 )
@@ -172,16 +173,20 @@ def asks_for_core_team(question: str) -> bool:
 
 
 def asks_for_synced_channels(question: str) -> bool:
-    """Match only a catalog question. How-to requests fall through."""
+    """Match a catalog of channels that are synced, ingested, or indexed.
+
+    How-to and decision questions stay on the ordinary path. Discord does not
+    have to be named: "what channels has BMTech synced into the KB" is the
+    same catalog question.
+    """
     text = question.casefold()
     if re.search(r"\bhow\s+(?:do|can|should|to)\b", text):
         return False
     if re.search(r"\b(?:decide|decided|decision|said|discuss(?:ed)?)\b", text):
         return False
     return (
-        re.search(r"\bdiscord\b", text) is not None
-        and re.search(r"\bchannels\b", text) is not None
-        and re.search(r"\b(?:sync\w*|ingest\w*|index\w*)\b", text) is not None
+        re.search(r"\bchannels?\b", text) is not None
+        and re.search(r"\b(?:sync\w*|ingest\w*|index\w*|reads?|reading)\b", text) is not None
         and re.search(r"\b(?:which|what|list)\b", text) is not None
     )
 
@@ -473,10 +478,13 @@ _PLAN_QUALIFICATION = (
     "The retrieved evidence does not explicitly state that this was approved, decided, or completed. "
     "What follows is cited text, and it is not a final decision."
 )
+# Internal answer-status dumps only. ``status: draft`` in a procedure must stay.
 _STATUS_TOKEN = re.compile(
-    r"\bstatus\s*[:=]\s*[^\n.]*|\b(?:no_relevant_information|nothing matched)\b",
+    r"\bstatus\s*[:=]\s*(?:no_relevant_information|nothing matched|answered)\b"
+    r"|\b(?:no_relevant_information|nothing matched)\b",
     re.IGNORECASE,
 )
+_RENDERED_STEPS = re.compile(r"(?m)^\s*\d+[.)]\s+\S")
 
 
 def _cited_chunks(response: AnswerResponse, chunks: Sequence[SearchChunk]) -> list[SearchChunk]:
@@ -503,17 +511,83 @@ def _identity_has(identity: str, alias: str) -> bool:
 
 
 def _chunk_identity_text(chunk: SearchChunk) -> str:
-    """Identity comes from source metadata, not a passing mention in the body."""
+    """Identity comes from the path, title, and KB page type, not the body."""
     metadata = chunk.metadata or {}
-    return " ".join(
-        (
-            chunk.source_file,
-            str(metadata.get("title") or ""),
-            str(metadata.get("url") or ""),
-            str(metadata.get("section") or ""),
-            str(metadata.get("kb_section") or ""),
-        )
-    )
+    source_type = str(metadata.get("source_type") or "")
+    parts = [
+        chunk.source_file,
+        str(metadata.get("title") or ""),
+        str(metadata.get("url") or ""),
+        str(metadata.get("section") or ""),
+        str(metadata.get("kb_section") or ""),
+    ]
+    if source_type == "kb_page":
+        # The page type is the knowledge base. "page" stays a body/path word
+        # so a different KB page is not treated as an article about pages.
+        parts.append("knowledge base kb")
+    elif source_type:
+        parts.append(source_type.replace("_", " "))
+    return " ".join(parts)
+
+
+def _coverage_text(quote: str, chunk: SearchChunk | None) -> str:
+    """Quote plus document identity, so a how-to can be covered by its path."""
+    if chunk is None:
+        return quote
+    return f"{quote}\n{_chunk_identity_text(chunk)}"
+
+
+def quote_covers_question(question: str, quote: str, chunk: SearchChunk) -> bool:
+    """Whether the quote or the cited document's identity answers the question."""
+    return answers_question(question, _coverage_text(quote, chunk))
+
+
+_CONTINUATION_START = re.compile(
+    r"^(?:so|and|but|or|nor|because|which|that)\b",
+    re.IGNORECASE,
+)
+_CLOSER_START = "]).,;:}>\"”」"
+
+
+def starts_mid_sentence(text: str) -> bool:
+    """A fragment that begins after the sentence has already started."""
+    body = re.sub(r"^(?:[-*]\s+|\d+[.)]\s+)+", "", text.strip()).strip()
+    if not body:
+        return False
+    if body[0] in _CLOSER_START or body[0].islower():
+        return True
+    return _CONTINUATION_START.match(body) is not None
+
+
+def has_unbalanced_delimiters(text: str) -> bool:
+    """Quotes and brackets that open and never close, or the reverse."""
+    pairs = {")": "(", "]": "[", "}": "{", "】": "【", "”": "“"}
+    opening = set(pairs.values())
+    stack: list[str] = []
+    straight = 0
+    for char in text:
+        if char == '"':
+            straight += 1
+            continue
+        if char in opening:
+            stack.append(char)
+            continue
+        if char in pairs:
+            if not stack or stack[-1] != pairs[char]:
+                return True
+            stack.pop()
+    return bool(stack) or straight % 2 == 1
+
+
+def output_is_rejected(text: str) -> bool:
+    """Reject a mid-sentence fragment or an unbalanced quote or bracket."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if has_unbalanced_delimiters(stripped):
+        return True
+    first = re.split(r"[\n\r]+", stripped, maxsplit=1)[0]
+    return starts_mid_sentence(first)
 
 
 def _is_howto(question: str) -> bool:
@@ -619,8 +693,14 @@ def _page_is_identified(question: str, cited: Sequence[SearchChunk]) -> bool:
     return False
 
 
+_ABBREVIATION = re.compile(r"\b(?:e\.g|i\.e)\.", re.IGNORECASE)
+
+
 def _split_sentences(answer: str) -> list[str]:
-    return [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", answer.strip()) if sentence.strip()]
+    """Split on sentence boundaries. ``e.g.`` and ``i.e.`` are not boundaries."""
+    protected = _ABBREVIATION.sub(lambda match: match.group(0).replace(".", "\u0000"), answer.strip())
+    parts = re.split(r"(?<=[.!?])\s+", protected)
+    return [part.replace("\u0000", ".").strip() for part in parts if part.strip()]
 
 
 def _is_comparison(question: str) -> bool:
@@ -631,10 +711,207 @@ def _is_comparison(question: str) -> bool:
     ) is not None
 
 
+_HEADER_LINE = re.compile(r"^(?:Card|Board|List|URL|Labels|Due):")
+_STEP_LINE = re.compile(r"^\d+[.)]\s+\S")
+
+
+def _strip_list_marker(text: str) -> str:
+    """Drop a leading bullet or number so a quote is not rendered as ``- -``."""
+    return re.sub(r"^(?:[-*]\s+|\d+[.)]\s+)+", "", text.strip()).strip()
+
+
+def _present_quote(quote: str) -> str:
+    """One readable excerpt. Trello header rows share a line; list markers do not double."""
+    headers: list[str] = []
+    body: list[str] = []
+    for raw in quote.splitlines() or [quote]:
+        line = _strip_list_marker(raw)
+        if not line:
+            continue
+        if _HEADER_LINE.match(line):
+            headers.append(line)
+        else:
+            body.append(line)
+    parts: list[str] = []
+    if headers:
+        parts.append(" / ".join(headers))
+    if body:
+        parts.append(" ".join(body))
+    return "\n".join(parts)
+
+
+def _numbered_steps(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if _STEP_LINE.match(line.strip())]
+
+
+_CLIPPED_STEP = re.compile(
+    r"(?:[:;,]|\be\.g\.?|\bi\.e\.?|\b(?:and|or|the|a|an|to|of|for|with))\s*$",
+    re.IGNORECASE,
+)
+_TABLE_RULE = re.compile(r"^:?-{3,}:?$")
+
+
+def _table_fields(line: str) -> list[str] | None:
+    """Markdown table row as ``Name: value`` fields. A rule row is empty."""
+    stripped = line.strip()
+    if not stripped.startswith("|"):
+        return None
+    cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+    if not cells or all(not cell or _TABLE_RULE.fullmatch(cell) for cell in cells):
+        return []
+    if len(cells) == 1:
+        return [cells[0]]
+    name, value = cells[0], " ".join(cell for cell in cells[1:] if cell)
+    if not name or name.casefold() in {"field", "column", "name"}:
+        return []
+    return [f"{name}: {value}".rstrip()]
+
+
+def _blockquote_text(line: str) -> str:
+    """Drop ``>`` and ``[!NOTE]`` markers from one line of a callout."""
+    text = re.sub(r"^>\s*", "", line.strip())
+    return re.sub(r"^\[!NOTE\]\s*", "", text, flags=re.IGNORECASE).strip()
+
+
+def _render_procedure(text: str) -> str | None:
+    """Numbered steps from the full page.
+
+    A blank line ends the step paragraph. A ``> [!NOTE]`` callout becomes its
+    own ``Note:`` line. Tables under a step are folded into that step.
+    """
+    groups: list[dict[str, list[str]]] = []
+    current: dict[str, list[str]] | None = None
+    paragraph_open = False
+
+    def close() -> None:
+        nonlocal current
+        if current is not None:
+            groups.append(current)
+        current = None
+
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if _STEP_LINE.match(stripped):
+            close()
+            current = {"prose": [stripped], "fields": [], "notes": []}
+            paragraph_open = True
+            continue
+        if current is None:
+            continue
+        if not stripped:
+            paragraph_open = False
+            continue
+        if stripped.startswith(">"):
+            note = _blockquote_text(stripped)
+            if note:
+                current["notes"].append(note)
+            continue
+        if not paragraph_open:
+            continue
+        extracted = _table_fields(stripped)
+        if extracted is None:
+            current["prose"].append(stripped)
+        else:
+            current["fields"].extend(extracted)
+    close()
+    if len(groups) < 2:
+        return None
+    rendered: list[str] = []
+    for group in groups:
+        step = " ".join(group["prose"]).strip()
+        if group["fields"]:
+            step = f"{step.rstrip()} {'; '.join(group['fields'])}".strip()
+        if not step or _CLIPPED_STEP.search(re.sub(r"^\d+[.)]\s+", "", step)):
+            return None
+        rendered.append(step)
+        if group["notes"]:
+            rendered.append("Note: " + " ".join(group["notes"]))
+    return "\n".join(rendered)
+
+
+def _howto_procedure(
+    question: str,
+    citations: Sequence[Citation],
+    by_id: Mapping[int, SearchChunk],
+) -> tuple[str, list[Citation]] | None:
+    """Full numbered steps from the cited page, not from a shortened quote."""
+    best: tuple[str, list[Citation]] | None = None
+    best_count = 1
+    for citation in citations:
+        chunk = by_id.get(citation.chunk_id)
+        if chunk is None:
+            continue
+        rendered = _render_procedure(chunk.chunk_text)
+        if rendered is None:
+            continue
+        if not answers_question(
+            question,
+            f"{chunk.chunk_text}\n{_chunk_identity_text(chunk)}",
+            require_all=True,
+        ):
+            continue
+        count = len(_numbered_steps(chunk.chunk_text))
+        if count > best_count:
+            best = (rendered, [citation])
+            best_count = count
+    return best
+
+
+def _clean_excerpts(citations: Sequence[Citation]) -> str:
+    """Short verbatim quotes. Fragments and whole-page dumps are left out."""
+    lines: list[str] = []
+    for citation in citations:
+        kept: list[str] = []
+        for sentence in _split_sentences(citation.quote):
+            presented = _strip_list_marker(_present_quote(sentence))
+            if (
+                not presented
+                or _header_only(presented)
+                or output_is_rejected(presented)
+                or not meaningful_text(presented)
+            ):
+                continue
+            kept.append(presented)
+            if len(kept) == 2:
+                break
+        if not kept:
+            continue
+        lines.append("- " + " ".join(kept))
+    return "\n".join(lines)
+
+
+def _header_only(text: str) -> bool:
+    """A Trello provenance line with no description is not an excerpt."""
+    parts = [part.strip() for part in text.split(" / ") if part.strip()]
+    return bool(parts) and all(
+        re.fullmatch(r"(?:Card|Board|List|URL|Labels|Due):[^\n]*", part) for part in parts
+    )
+
+
+def _claim_evidence(citation: Citation, by_id: Mapping[int, SearchChunk]) -> str:
+    """Quote plus the cited chunk, so a short quote does not hide the rest of the page."""
+    chunk = by_id.get(citation.chunk_id)
+    if chunk is None:
+        return citation.quote
+    return f"{citation.quote}\n{chunk.chunk_text}"
+
+
+def _has_clipped_step(text: str) -> bool:
+    """A numbered step that stops at a colon, ``e.g.``, or another unfinished clause."""
+    for piece in re.split(r"(?=(?:^|\n)\s*\d+[.)]\s+)", text):
+        piece = piece.strip()
+        if not _STEP_LINE.match(piece):
+            continue
+        body = re.sub(r"^\d+[.)]\s+", "", piece).strip()
+        if body and _CLIPPED_STEP.search(body):
+            return True
+    return False
+
+
 def _rendered(response: AnswerResponse, text: str) -> AnswerResponse | None:
     """Ship only an answer that still says something."""
     cleaned = text.strip()
-    if not meaningful_text(cleaned):
+    if not meaningful_text(cleaned) or output_is_rejected(cleaned) or _has_clipped_step(cleaned):
         return None
     if cleaned == response.answer.strip():
         return response
@@ -656,14 +933,39 @@ def qualify_grounded_answer(
     if response.status != "answered" or not response.citations:
         return response
     visible = _without_orphan_citation_sentences(response.answer, len(response.citations))
+    visible = " ".join(
+        sentence for sentence in _split_sentences(visible) if not output_is_rejected(sentence)
+    )
     response = response.model_copy(update={"answer": visible})
     cited = _cited_chunks(response, chunks)
+    by_id = {chunk.id: chunk for chunk in chunks}
     quoted = "\n".join(citation.quote for citation in response.citations)
     identity = " ".join(_chunk_identity_text(chunk) for chunk in cited)
-    if _is_howto(question) and not answers_question(question, quoted, require_all=True):
+    coverage = "\n".join(
+        _coverage_text(citation.quote, by_id.get(citation.chunk_id)) for citation in response.citations
+    )
+    if _is_howto(question) and not answers_question(question, coverage, require_all=True):
         return _abstain(_NOT_RESPONSIVE)
-    topical = [citation for citation in response.citations if touches_question(question, citation.quote)]
-    relevant = [citation for citation in topical if answers_question(question, citation.quote)]
+    topical = [
+        citation
+        for citation in response.citations
+        if touches_question(question, _coverage_text(citation.quote, by_id.get(citation.chunk_id)))
+    ]
+    relevant = [
+        citation
+        for citation in topical
+        if answers_question(question, _coverage_text(citation.quote, by_id.get(citation.chunk_id)))
+    ]
+    if _is_howto(question):
+        procedure = _howto_procedure(question, response.citations, by_id)
+        if procedure is not None:
+            text, procedure_citations = procedure
+            rendered = _rendered(
+                response.model_copy(update={"citations": procedure_citations}),
+                text,
+            )
+            if rendered is not None:
+                return rendered
     kept: list[str] = []
     unsupported_decision = False
     for sentence in _split_sentences(visible):
@@ -671,20 +973,26 @@ def qualify_grounded_answer(
             continue
         verdict = next(
             (
-                assess_claim(sentence, citation.quote, identity)
+                assess_claim(sentence, _claim_evidence(citation, by_id), identity)
                 for citation in relevant
-                if assess_claim(sentence, citation.quote, identity) == "supported"
+                if assess_claim(sentence, _claim_evidence(citation, by_id), identity) == "supported"
             ),
             "unknown",
         )
         if verdict == "supported":
-            kept.append(sentence)
+            if not output_is_rejected(sentence):
+                kept.append(sentence)
             continue
         if claim_status(sentence) == "decided":
             unsupported_decision = True
             continue
         partial = supported_steps(sentence, quoted)
-        if partial and meaningful_text(partial) and answers_question(question, partial):
+        if (
+            partial
+            and meaningful_text(partial)
+            and answers_question(question, partial)
+            and not output_is_rejected(partial)
+        ):
             kept.append(partial)
     disclaimer = _identity_gap(question, cited)
     topical_text = "\n".join(f"- {citation.quote}" for citation in topical)
@@ -753,8 +1061,25 @@ def qualify_grounded_answer(
         rendered = _rendered(response.model_copy(update={"citations": relevant}), relevant_text)
         if rendered is not None:
             return rendered
-    if _is_howto(question) and relevant_text and answers_question(question, relevant_text, require_all=True):
-        rendered = _rendered(response.model_copy(update={"citations": relevant}), relevant_text)
+    broad = [
+        citation
+        for citation in response.citations
+        if shared_term_count(question, _coverage_text(citation.quote, by_id.get(citation.chunk_id))) >= 2
+    ]
+    pool = relevant or ([] if _is_howto(question) else broad)
+    relevant_coverage = "\n".join(
+        _coverage_text(citation.quote, by_id.get(citation.chunk_id)) for citation in pool
+    )
+    clean = _clean_excerpts(pool)
+    covered = bool(pool) and (
+        answers_question(question, relevant_coverage, require_all=_is_howto(question))
+        or (not _is_howto(question) and any(
+            shared_term_count(question, _coverage_text(citation.quote, by_id.get(citation.chunk_id))) >= 2
+            for citation in pool
+        ))
+    )
+    if clean and covered:
+        rendered = _rendered(response.model_copy(update={"citations": pool}), clean)
         if rendered is not None:
             return rendered
     return _abstain(_NOT_RESPONSIVE)
@@ -794,7 +1119,13 @@ def supported_outcome_answer(
 
 
 def _plain_answer(answer: str) -> str:
-    """Drop an internal status dump, including ``status : nothing matched``."""
+    """Drop an internal status dump, including ``status : nothing matched``.
+
+    Rendered steps and excerpts are left alone. ``status: draft`` is page
+    content, not an answer-status code.
+    """
+    if _RENDERED_STEPS.search(answer):
+        return answer
     if _STATUS_TOKEN.search(answer) is None:
         return answer
     cleaned = _STATUS_TOKEN.sub(" ", answer)

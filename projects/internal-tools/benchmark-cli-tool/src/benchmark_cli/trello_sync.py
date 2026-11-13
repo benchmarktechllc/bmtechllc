@@ -32,6 +32,7 @@ from urllib.request import Request, urlopen
 from .config import TRELLO_API_BASE_URL, TRELLO_API_KEY, TRELLO_BOARD_ID, TRELLO_TOKEN
 from .ingestion.clean import RawUnit, normalize_text
 from .ingestion.pipeline import content_hash, ingest_units
+from .roster import render_members
 from .storage.postgres import (
     TrelloSourceCard,
     create_indexes,
@@ -45,6 +46,10 @@ from .storage.postgres import (
 
 TRELLO_SYNC_VERSION = "1"
 _SAFE_ID = re.compile(r"[^A-Za-z0-9_-]+")
+_BOARD_PAGE = re.compile(
+    r"https://trello\.com/b/(?P<id>[A-Za-z0-9]+)/(?P<slug>[A-Za-z0-9-]+)/?",
+    re.IGNORECASE,
+)
 
 
 class TrelloApiError(RuntimeError):
@@ -153,7 +158,7 @@ class TrelloRestClient:
         payload = self._request_json(
             f"/boards/{quote(board_id, safe='')}",
             {
-                "fields": "id,name,shortLink,url",
+                "fields": "id,name,shortLink,url,shortUrl",
                 "lists": "open",
                 "list_fields": "name",
                 "cards": "open",
@@ -227,7 +232,7 @@ def parse_board(payload: dict[str, Any]) -> TrelloBoard:
         board_id=board_id,
         name=normalize_text(str(payload.get("name") or "")) or short_link,
         short_link=short_link,
-        url=str(payload.get("url") or f"https://trello.com/b/{short_link}"),
+        url=_board_url(payload, short_link),
         cards=tuple(parsed),
     )
 
@@ -245,6 +250,28 @@ def _member_names(payload: dict[str, Any]) -> dict[str, str]:
         if label:
             names[str(member["id"])] = label
     return names
+
+
+def _board_url(payload: dict[str, Any], short_link: str) -> str:
+    """Prefer a ``/b/<id>/<slug>`` URL from ``url``, then ``shortUrl``."""
+    candidates = (
+        str(payload.get("url") or "").strip(),
+        str(payload.get("shortUrl") or "").strip(),
+    )
+    for candidate in candidates:
+        if _BOARD_PAGE.search(candidate) and "/invite/" not in candidate.casefold() and "ATTI" not in candidate:
+            return candidate
+    return next((candidate for candidate in candidates if candidate), f"https://trello.com/b/{short_link}")
+
+
+def board_page_url(url: str) -> str | None:
+    """Canonical board link. Invite tokens and slug-less short URLs are omitted."""
+    if "/invite/" in url.casefold() or "ATTI" in url:
+        return None
+    match = _BOARD_PAGE.search(url)
+    if match is None:
+        return None
+    return f"https://trello.com/b/{match.group('id')}/{match.group('slug')}"
 
 
 def parse_comment(item: dict[str, Any]) -> TrelloComment | None:
@@ -281,12 +308,25 @@ def units_for_card(board: TrelloBoard, card: TrelloCard) -> list[RawUnit]:
         f"List: {card.list_name}",
         f"URL: {card.url}",
     ]
+    page = board_page_url(board.url)
+    if page:
+        lines.append(f"Board URL: {page}")
     if card.labels:
         lines.append("Labels: " + ", ".join(card.labels))
     if card.due is not None:
         lines.append(f"Due: {card.due.date().isoformat()}")
     if card.members:
-        lines.append("Members: " + ", ".join(card.members))
+        lines.append("Members: " + render_members(card.members))
+    if card.last_activity is not None:
+        lines.append(f"Last activity: {card.last_activity.date().isoformat()}")
+    if card.checklists:
+        total = sum(len(checklist.items) for checklist in card.checklists)
+        complete = sum(
+            1 for checklist in card.checklists for item in checklist.items if item.complete
+        )
+        lines.append(f"Checklists: {len(card.checklists)} ({complete}/{total} items complete)")
+    for comment in card.comments[-3:]:
+        lines.append(f"Recent comment by {comment.author}: {comment.text[:180]}")
     if card.description:
         lines.extend(("", card.description))
     units.append(RawUnit("\n".join(lines), None, stamp, ordinal, extra))

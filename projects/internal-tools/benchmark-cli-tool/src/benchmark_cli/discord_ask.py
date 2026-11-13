@@ -9,15 +9,23 @@ stays in ``discord_sync``.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
 import discord
 from discord import app_commands
 
-from .agent import run_agent
+from .agent import MODEL_UNAVAILABLE_REPLY, run_agent
+from .contributions import (
+    THANKS_REPLY,
+    UNKNOWN_INVITE,
+    is_contribution_reply,
+    store_contribution,
+)
 from .models import AnswerResponse, Citation
 
 logger = logging.getLogger(__name__)
@@ -85,6 +93,15 @@ def gateway_intents() -> discord.Intents:
     return intents
 
 
+def thread_question_for(content: str, starter: str | None) -> str | None:
+    """The thread's starting question, when this message is a follow-up."""
+    current = " ".join(content.split())
+    prior = " ".join((starter or "").split())
+    if not prior or prior == current:
+        return None
+    return prior
+
+
 def in_ask_channel(*, channel_id: int, parent_channel_id: int | None, ask_channel_id: int) -> bool:
     """Return whether a message lives in the ask channel or one of its threads."""
     return channel_id == ask_channel_id or parent_channel_id == ask_channel_id
@@ -149,14 +166,106 @@ def _format_citation(index: int, citation: Citation) -> str:
     return f"{index}. `{source}` (chunk {citation.chunk_id}): {quote}"
 
 
+def _linked_list_answer(answer: str) -> bool:
+    """Trello list replies already put each card link in the body."""
+    return "Trello cards in " in answer and "](https://" in answer
+
+
+def _summary_total(answer: str) -> int | None:
+    """Sum of the per-list counts on the first line, such as ``Backlog 11, Doing 4``."""
+    first = answer.splitlines()[0].strip() if answer else ""
+    if not first or "Trello cards in " in first:
+        return None
+    total = 0
+    for part in first.split(","):
+        match = re.search(r"(\d+)\s*$", part.strip())
+        if match is None:
+            return None
+        total += int(match.group(1))
+    return total or None
+
+
+def split_discord_messages(text: str, *, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
+    """Split a long reply on line boundaries so each Discord message fits."""
+    cleaned = text.strip() or "No answer text was returned."
+    if len(cleaned) <= limit:
+        return [cleaned]
+    parts: list[str] = []
+    buffer = ""
+    for line in cleaned.split("\n"):
+        piece = line if not buffer else f"{buffer}\n{line}"
+        if len(piece) <= limit:
+            buffer = piece
+            continue
+        if buffer:
+            parts.append(buffer)
+        if len(line) <= limit:
+            buffer = line
+            continue
+        while line:
+            parts.append(line[:limit])
+            line = line[limit:]
+        buffer = ""
+    if buffer:
+        parts.append(buffer)
+    return parts or ["No answer text was returned."[:limit]]
+
+
+def format_discord_messages(
+    response: AnswerResponse, *, limit: int = DISCORD_MESSAGE_LIMIT
+) -> list[str]:
+    """One or more Discord messages. Long board lists are split, not dropped."""
+    answer = response.answer.strip() or "No answer text was returned."
+    if response.citations and _linked_list_answer(answer):
+        shown = len(response.citations)
+        total = _summary_total(answer)
+        if total is not None and total != shown:
+            footer = f"\n\n**Sources**\n{shown} shown of {total}; links are in the list above."
+        else:
+            noun = "card" if shown == 1 else "cards"
+            footer = f"\n\n**Sources**\n{shown} indexed {noun}; links are in the list above."
+        text = answer + footer
+    elif response.citations:
+        text = answer + "\n\n**Citations**\n" + "\n".join(
+            _format_citation(index, citation)
+            for index, citation in enumerate(response.citations, start=1)
+        )
+    else:
+        text = answer
+    if (
+        response.status == "no_relevant_information"
+        and UNKNOWN_INVITE not in text
+        and MODEL_UNAVAILABLE_REPLY not in text
+    ):
+        text = f"{text.rstrip()}\n\n{UNKNOWN_INVITE}"
+    return split_discord_messages(discord.utils.escape_mentions(text), limit=limit)
+
+
 def format_discord_answer(response: AnswerResponse, *, limit: int = DISCORD_MESSAGE_LIMIT) -> str:
     """Render an agent response, keeping citations when they fit in one message."""
     answer = response.answer.strip() or "No answer text was returned."
-    if response.citations:
+    if (
+        response.status == "no_relevant_information"
+        and UNKNOWN_INVITE not in answer
+        and MODEL_UNAVAILABLE_REPLY not in answer
+    ):
+        answer = f"{answer.rstrip()}\n\n{UNKNOWN_INVITE}"
+    if response.citations and _linked_list_answer(answer):
+        shown = len(response.citations)
+        total = _summary_total(answer)
+        if total is not None and total != shown:
+            citation_block = f"**Sources**\n{shown} shown of {total}; links are in the list above."
+        else:
+            noun = "card" if shown == 1 else "cards"
+            citation_block = f"**Sources**\n{shown} indexed {noun}; links are in the list above."
+    elif response.citations:
         citation_block = "**Citations**\n" + "\n".join(
             _format_citation(index, citation)
             for index, citation in enumerate(response.citations, start=1)
         )
+    else:
+        citation_block = ""
+    if citation_block:
         separator = "\n\n"
         if len(separator) + len(citation_block) < limit:
             answer_limit = limit - len(separator) - len(citation_block)
@@ -170,27 +279,213 @@ def format_discord_answer(response: AnswerResponse, *, limit: int = DISCORD_MESS
     return rendered or "No answer text was returned."[:limit]
 
 
-async def deliver_channel_answer(message: discord.Message, body: str) -> None:
-    """Reply in the current thread, or open one on the channel message."""
+async def read_thread_starter(message: discord.Message) -> str | None:
+    """Text of the message that opened this thread, when Discord still has it."""
+    channel = message.channel
+    if not isinstance(channel, discord.Thread):
+        return None
+    starter = channel.starter_message
+    if starter is None and channel.parent is not None:
+        try:
+            starter = await channel.parent.fetch_message(channel.id)
+        except discord.HTTPException:
+            logger.warning("Could not read the thread starter for message %s.", message.id)
+            starter = None
+    if starter is None or starter.id == message.id:
+        return None
+    return starter.content
+
+
+class AddAnswerModal(discord.ui.Modal, title="Add answer"):
+    """Collect a missing answer and store it for the next question."""
+
+    answer = discord.ui.TextInput(
+        label="Answer",
+        style=discord.TextStyle.paragraph,
+        max_length=2000,
+        required=True,
+    )
+
+    def __init__(
+        self,
+        *,
+        question: str,
+        author_id: int,
+        author_name: str,
+        channel_id: int,
+        message_id: int,
+        message_url: str,
+    ) -> None:
+        super().__init__()
+        self.question = question
+        self.author_id = author_id
+        self.author_name = author_name
+        self.channel_id = channel_id
+        self.message_id = message_id
+        self.message_url = message_url
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # Discord drops the interaction if it is not acknowledged within 3 seconds.
+        await interaction.response.defer(ephemeral=True)
+        try:
+            store_contribution(
+                question=self.question,
+                text=str(self.answer.value),
+                author_id=self.author_id,
+                author_name=self.author_name,
+                channel_id=self.channel_id,
+                message_id=self.message_id,
+                message_url=self.message_url,
+            )
+        except (RuntimeError, ValueError):
+            logger.exception("Could not store a contributed answer.")
+            await interaction.followup.send(
+                "I couldn't save that. Please try again in a moment.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(THANKS_REPLY, ephemeral=True)
+
+
+ADD_ANSWER_CUSTOM_ID = "bmtech:add_answer"
+
+
+async def original_question_message(bot_message: discord.Message) -> discord.Message | None:
+    """The human question this unknown reply was posted for.
+
+    After a restart the button has no saved state, so the question is read from
+    the message the bot replied to, or from the thread starter.
+    """
+    reference = bot_message.reference
+    if reference is not None:
+        resolved = reference.resolved
+        if isinstance(resolved, discord.Message):
+            return resolved
+        message_id = reference.message_id
+        if message_id is not None:
+            try:
+                return await bot_message.channel.fetch_message(message_id)
+            except (discord.HTTPException, AttributeError):
+                logger.warning("Could not read the question message %s.", message_id)
+    channel = bot_message.channel
+    if isinstance(channel, discord.Thread):
+        starter = channel.starter_message
+        if starter is None and channel.parent is not None:
+            try:
+                starter = await channel.parent.fetch_message(channel.id)
+            except discord.HTTPException:
+                starter = None
+        if starter is not None and starter.id != bot_message.id:
+            return starter
+    return None
+
+
+class AddAnswerView(discord.ui.View):
+    """Persistent button that opens the contribution modal."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Add answer",
+        style=discord.ButtonStyle.primary,
+        custom_id=ADD_ANSWER_CUSTOM_ID,
+    )
+    async def add_answer(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        bot_message = interaction.message
+        original = await original_question_message(bot_message) if bot_message is not None else None
+        target = original or bot_message
+        question = original.content if original is not None else ""
+        user = interaction.user
+        if target is None:
+            await interaction.response.send_message(
+                "I couldn't find the original question. Reply to my message with the answer instead.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(
+            AddAnswerModal(
+                question=question,
+                author_id=user.id,
+                author_name=getattr(user, "display_name", "") or getattr(user, "name", "a teammate"),
+                channel_id=target.channel.id,
+                message_id=target.id,
+                message_url=message_jump_url(target),
+            )
+        )
+
+
+def message_jump_url(message: discord.Message) -> str:
+    guild_id = message.guild.id if message.guild is not None else "@me"
+    return f"https://discord.com/channels/{guild_id}/{message.channel.id}/{message.id}"
+
+
+async def deliver_channel_messages(
+    message: discord.Message,
+    parts: list[str],
+    *,
+    view: discord.ui.View | None = None,
+) -> None:
+    """Post every part in the thread. A long answer is several messages, not one cut reply."""
+    if not parts:
+        return
     if isinstance(message.channel, discord.Thread):
-        await message.reply(body, mention_author=False, allowed_mentions=NO_MENTIONS)
+        await message.reply(
+            parts[0],
+            mention_author=False,
+            allowed_mentions=NO_MENTIONS,
+            view=view if len(parts) == 1 else None,
+        )
+        for index, extra in enumerate(parts[1:], start=1):
+            await message.channel.send(
+                extra,
+                allowed_mentions=NO_MENTIONS,
+                view=view if index == len(parts) - 1 else None,
+            )
         return
     existing = message.thread
     if existing is not None:
         try:
-            await existing.send(body, allowed_mentions=NO_MENTIONS)
+            for index, part in enumerate(parts):
+                await existing.send(
+                    part,
+                    allowed_mentions=NO_MENTIONS,
+                    view=view if index == len(parts) - 1 else None,
+                )
             return
         except discord.HTTPException:
             logger.warning("Could not post in the existing thread for message %s.", message.id)
     try:
         thread = await message.create_thread(name=thread_name_for(message.content))
-        await thread.send(body, allowed_mentions=NO_MENTIONS)
+        for index, part in enumerate(parts):
+            await thread.send(
+                part,
+                allowed_mentions=NO_MENTIONS,
+                view=view if index == len(parts) - 1 else None,
+            )
     except (discord.HTTPException, ValueError):
         logger.warning(
             "Could not open a thread on message %s; replying in the channel.",
             message.id,
         )
-        await message.reply(body, mention_author=False, allowed_mentions=NO_MENTIONS)
+        await message.reply(
+            parts[0],
+            mention_author=False,
+            allowed_mentions=NO_MENTIONS,
+            view=view if len(parts) == 1 else None,
+        )
+        for index, extra in enumerate(parts[1:], start=1):
+            await message.reply(
+                extra,
+                mention_author=False,
+                allowed_mentions=NO_MENTIONS,
+                view=view if index == len(parts) - 1 else None,
+            )
+
+
+async def deliver_channel_answer(message: discord.Message, body: str) -> None:
+    """Reply in the current thread, or open one on the channel message."""
+    await deliver_channel_messages(message, [body])
 
 
 async def _safe_followup(interaction: discord.Interaction, body: str) -> None:
@@ -211,6 +506,7 @@ class AskClient(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
+        self.add_view(AddAnswerView())
         self.tree.add_command(ask_command)
         await self.sync_commands()
 
@@ -245,18 +541,57 @@ class AskClient(discord.Client):
             self.config.ask_channel_id,
         )
 
-    async def answer_question(self, question: str) -> str:
+    async def answer_question(self, question: str, *, thread_question: str | None = None) -> str:
         """Run the RAG agent and format the reply.
 
         Questions run one at a time. Usage telemetry is appended without a file
-        lock, and one in-flight retrieval is enough for this bot.
+        lock, and one in-flight retrieval is enough for this bot. A thread
+        follow-up also receives the thread's starting question.
         """
         cleaned = question.strip()
         if not cleaned:
             raise ValueError("question must not be empty.")
+
+        def _invoke() -> AnswerResponse:
+            if thread_question and "thread_question" in inspect.signature(self._agent).parameters:
+                return self._agent(cleaned, thread_question=thread_question)
+            return self._agent(cleaned)
+
         async with self._agent_lock:
-            response = await asyncio.to_thread(self._agent, cleaned)
+            response = await asyncio.to_thread(_invoke)
         return format_discord_answer(response)
+
+    async def answer_messages(self, question: str, *, thread_question: str | None = None) -> list[str]:
+        """Format the reply as one Discord message per 2000 characters."""
+        cleaned = question.strip()
+        if not cleaned:
+            raise ValueError("question must not be empty.")
+
+        def _invoke() -> AnswerResponse:
+            if thread_question and "thread_question" in inspect.signature(self._agent).parameters:
+                return self._agent(cleaned, thread_question=thread_question)
+            return self._agent(cleaned)
+
+        async with self._agent_lock:
+            response = await asyncio.to_thread(_invoke)
+        return format_discord_messages(response)
+
+    async def answer_bundle(
+        self, question: str, *, thread_question: str | None = None
+    ) -> tuple[list[str], AnswerResponse]:
+        """The Discord parts and the response, so an unknown answer can carry a button."""
+        cleaned = question.strip()
+        if not cleaned:
+            raise ValueError("question must not be empty.")
+
+        def _invoke() -> AnswerResponse:
+            if thread_question and "thread_question" in inspect.signature(self._agent).parameters:
+                return self._agent(cleaned, thread_question=thread_question)
+            return self._agent(cleaned)
+
+        async with self._agent_lock:
+            response = await asyncio.to_thread(_invoke)
+        return format_discord_messages(response), response
 
     async def on_message(self, message: discord.Message) -> None:
         channel = message.channel
@@ -288,10 +623,16 @@ class AskClient(discord.Client):
                     message.id,
                 )
             return
+        if await self._maybe_record_contribution(message):
+            return
         logger.info("Answering message %s in channel %s.", message.id, message.channel.id)
         try:
             async with message.channel.typing():
-                body = await self.answer_question(message.content)
+                starter = await read_thread_starter(message)
+                parts, response = await self.answer_bundle(
+                    message.content,
+                    thread_question=thread_question_for(message.content, starter),
+                )
         except Exception:
             logger.exception("Failed to answer message %s.", message.id)
             try:
@@ -299,10 +640,56 @@ class AskClient(discord.Client):
             except discord.HTTPException:
                 logger.exception("Failed to send the error reply for message %s.", message.id)
             return
+        view = None
+        if response.status == "no_relevant_information" and MODEL_UNAVAILABLE_REPLY not in response.answer:
+            view = AddAnswerView()
         try:
-            await deliver_channel_answer(message, body)
+            await deliver_channel_messages(message, parts, view=view)
         except discord.HTTPException:
             logger.exception("Failed to deliver the answer for message %s.", message.id)
+
+    async def _maybe_record_contribution(self, message: discord.Message) -> bool:
+        """Store a human reply to an unknown answer. Bot messages and other replies are ignored."""
+        reference = message.reference
+        if reference is None or message.author.bot:
+            return False
+        channel = message.channel
+        try:
+            referenced = reference.cached_message or await channel.fetch_message(reference.message_id)
+        except (discord.HTTPException, AttributeError):
+            return False
+        if referenced is None or not is_contribution_reply(
+            author_is_bot=message.author.bot,
+            referenced_author_is_bot=referenced.author.bot,
+            referenced_text=referenced.content or "",
+        ):
+            return False
+        question = message.content
+        if referenced.reference is not None:
+            try:
+                original = await channel.fetch_message(referenced.reference.message_id)
+                if original is not None and original.content.strip():
+                    question = original.content
+            except (discord.HTTPException, AttributeError):
+                question = referenced.content
+        try:
+            store_contribution(
+                question=question,
+                text=message.content,
+                author_id=message.author.id,
+                author_name=getattr(message.author, "display_name", "") or message.author.name,
+                channel_id=message.channel.id,
+                message_id=message.id,
+                message_url=message_jump_url(message),
+            )
+        except (RuntimeError, ValueError):
+            logger.exception("Could not store a reply contribution for message %s.", message.id)
+            return False
+        try:
+            await message.reply(THANKS_REPLY, mention_author=False, allowed_mentions=NO_MENTIONS)
+        except discord.HTTPException:
+            logger.exception("Could not confirm contribution %s.", message.id)
+        return True
 
 
 @app_commands.command(name="ask", description="Ask the company knowledge agent.")
@@ -318,12 +705,13 @@ async def ask_command(interaction: discord.Interaction, question: str) -> None:
         return
     await interaction.response.defer(thinking=True, ephemeral=False)
     try:
-        body = await client.answer_question(question)
+        parts = await client.answer_messages(question)
     except Exception:
         logger.exception("Failed to answer /ask in channel %s.", interaction.channel_id)
         await _safe_followup(interaction, FAILURE_REPLY)
         return
-    await _safe_followup(interaction, body)
+    for part in parts:
+        await _safe_followup(interaction, part)
 
 
 def main() -> None:

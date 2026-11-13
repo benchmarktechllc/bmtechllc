@@ -9,10 +9,21 @@ from dataclasses import dataclass, replace
 
 from .config import MIN_COSINE_SIMILARITY, MIN_KEYWORD_OVERLAP
 from .providers.openai import embed_texts
-from .storage.postgres import SearchChunk, SearchFilters, fts_search, vector_search
+from .storage.postgres import SearchChunk, SearchFilters, connection, fts_search, vector_search
 
 CANDIDATE_LIMIT = 40
 RRF_K = 60
+PER_SOURCE_LIMIT = 4
+# A global top-40 is mostly Trello. Each source still contributes its own top hits.
+RETRIEVAL_SOURCES = (
+    "discord",
+    "kb_page",
+    "trello",
+    "transcript",
+    "policy_doc",
+    "user_contributed",
+)
+SOURCE_ARM_LIMIT = PER_SOURCE_LIMIT
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +83,43 @@ def rrf_fuse(
     )
 
 
+def source_type_of(result: HybridSearchResult) -> str:
+    """Indexed source family for one hit. Missing metadata is its own bucket."""
+    return str((result.chunk.metadata or {}).get("source_type") or "other")
+
+
+def apply_source_quota(
+    ranked: Sequence[HybridSearchResult],
+    *,
+    per_source: int = PER_SOURCE_LIMIT,
+    limit: int = 16,
+) -> list[HybridSearchResult]:
+    """Keep the top hits from each source so one source cannot fill the context."""
+    if per_source < 1 or limit < 1:
+        return []
+    chosen: list[HybridSearchResult] = []
+    overflow: list[HybridSearchResult] = []
+    counts: dict[str, int] = {}
+    seen: set[int] = set()
+    for result in ranked:
+        if result.chunk.id in seen:
+            continue
+        seen.add(result.chunk.id)
+        source = source_type_of(result)
+        if counts.get(source, 0) < per_source:
+            chosen.append(result)
+            counts[source] = counts.get(source, 0) + 1
+        else:
+            overflow.append(result)
+        if len(chosen) >= limit:
+            return chosen
+    for result in overflow:
+        if len(chosen) >= limit:
+            break
+        chosen.append(result)
+    return chosen
+
+
 def search_docs(
     query: str,
     top_k: int = 5,
@@ -80,6 +128,7 @@ def search_docs(
     source: str | None = None,
     date: str | None = None,
     include_synthetic: bool = False,
+    source_type: str | None = None,
 ) -> list[HybridSearchResult]:
     """Run filtered 20-per-arm keyword/vector retrieval and return RRF top results."""
     if not query.strip():
@@ -99,6 +148,7 @@ def search_docs(
             source=filters.source,
             date=filters.date,
             include_synthetic=filters.include_synthetic,
+            source_type=source_type,
         )
         fts_future = executor.submit(
             fts_search,
@@ -108,6 +158,7 @@ def search_docs(
             source=filters.source,
             date=filters.date,
             include_synthetic=filters.include_synthetic,
+            source_type=source_type,
         )
         vector_candidates = vector_future.result()
         fts_candidates = fts_future.result()
@@ -123,6 +174,42 @@ def search_docs(
     ]
 
 
+def _search_texts(query: str, queries: Sequence[str] | None) -> list[str]:
+    """At most three non-empty search strings. The raw query is always eligible."""
+    source = list(queries) if queries else [query]
+    texts: list[str] = []
+    for item in source:
+        text = " ".join(str(item).split())
+        if text and text not in texts:
+            texts.append(text)
+        if len(texts) == 3:
+            break
+    return texts
+
+
+def _accept_evidence(
+    *,
+    has_results: bool,
+    top_cosine: float | None,
+    overlap: int,
+    min_cosine_similarity: float,
+    min_keyword_overlap: int,
+    snapshot_present: bool,
+) -> bool:
+    """Keep hits that clear both floors.
+
+    When the board snapshot is already in the prompt, a miss of the cosine
+    floor alone does not drop a set that still shares keywords with the query.
+    """
+    if not has_results:
+        return False
+    cosine_ok = top_cosine is not None and top_cosine >= min_cosine_similarity
+    overlap_ok = overlap >= min_keyword_overlap
+    if cosine_ok and overlap_ok:
+        return True
+    return bool(snapshot_present and overlap_ok and not cosine_ok)
+
+
 def retrieve_evidence(
     query: str,
     top_k: int = 5,
@@ -133,31 +220,114 @@ def retrieve_evidence(
     include_synthetic: bool = False,
     min_cosine_similarity: float = MIN_COSINE_SIMILARITY,
     min_keyword_overlap: int = MIN_KEYWORD_OVERLAP,
+    queries: Sequence[str] | None = None,
+    snapshot_present: bool = False,
 ) -> RetrievalDecision:
-    """Accept grounded evidence only when semantic and lexical checks both pass."""
+    """Hybrid search for rewritten queries on a single connection.
+
+    Each query runs one global hybrid search plus a short hybrid search per
+    source type. Reciprocal rank fusion then keeps a floor from every source,
+    so Discord and the knowledge base are not dropped when Trello fills the
+    global top ranks. The raw question is one of the query strings.
+    """
     if not 0.0 <= min_cosine_similarity <= 1.0:
         raise ValueError("min_cosine_similarity must be between 0 and 1.")
     if min_keyword_overlap < 0:
         raise ValueError("min_keyword_overlap must not be negative.")
-    results = tuple(
-        search_docs(
-            query,
-            top_k,
-            speaker=speaker,
-            source=source,
-            date=date,
-            include_synthetic=include_synthetic,
+    texts = _search_texts(query, queries)
+    if not texts:
+        return RetrievalDecision("no_relevant_information", (), None, 0)
+    embeddings = embed_texts(texts)
+    if len(embeddings) != len(texts):
+        raise RuntimeError("Embedding response length did not match the search strings.")
+    vector_scores: dict[int, float] = {}
+    fts_scores: dict[int, float] = {}
+    ranked_lists: list[list[SearchChunk]] = []
+    with connection() as conn:
+        for text, embedding in zip(texts, embeddings, strict=True):
+            vector_hits = vector_search(
+                embedding,
+                CANDIDATE_LIMIT,
+                speaker=speaker,
+                source=source,
+                date=date,
+                include_synthetic=include_synthetic,
+                conn=conn,
+            )
+            fts_hits = fts_search(
+                text,
+                CANDIDATE_LIMIT,
+                speaker=speaker,
+                source=source,
+                date=date,
+                include_synthetic=include_synthetic,
+                conn=conn,
+            )
+            for chunk in vector_hits:
+                current = vector_scores.get(chunk.id)
+                if current is None or chunk.score > current:
+                    vector_scores[chunk.id] = chunk.score
+            for chunk in fts_hits:
+                current = fts_scores.get(chunk.id)
+                if current is None or chunk.score > current:
+                    fts_scores[chunk.id] = chunk.score
+            ranked_lists.append(vector_hits)
+            ranked_lists.append(fts_hits)
+            for source_type in RETRIEVAL_SOURCES:
+                source_vector = vector_search(
+                    embedding,
+                    SOURCE_ARM_LIMIT,
+                    speaker=speaker,
+                    source=source,
+                    date=date,
+                    include_synthetic=include_synthetic,
+                    source_type=source_type,
+                    conn=conn,
+                )
+                source_fts = fts_search(
+                    text,
+                    SOURCE_ARM_LIMIT,
+                    speaker=speaker,
+                    source=source,
+                    date=date,
+                    include_synthetic=include_synthetic,
+                    source_type=source_type,
+                    conn=conn,
+                )
+                for chunk in source_vector:
+                    current = vector_scores.get(chunk.id)
+                    if current is None or chunk.score > current:
+                        vector_scores[chunk.id] = chunk.score
+                for chunk in source_fts:
+                    current = fts_scores.get(chunk.id)
+                    if current is None or chunk.score > current:
+                        fts_scores[chunk.id] = chunk.score
+                ranked_lists.append(source_vector)
+                ranked_lists.append(source_fts)
+    fused = [
+        replace(
+            result,
+            vector_score=vector_scores.get(result.chunk.id),
+            fts_score=fts_scores.get(result.chunk.id),
         )
+        for result in rrf_fuse(ranked_lists)
+    ]
+    per_source = max(PER_SOURCE_LIMIT, 1)
+    results = tuple(
+        apply_source_quota(fused, per_source=per_source, limit=max(top_k, per_source * 4))
     )
     top_cosine = max(
-        (result.vector_score for result in results if result.vector_score is not None), default=None
+        (result.vector_score for result in results if result.vector_score is not None),
+        default=None,
     )
-    overlap = meaningful_keyword_overlap(query, results)
-    accepted = (
-        bool(results)
-        and top_cosine is not None
-        and top_cosine >= min_cosine_similarity
-        and overlap >= min_keyword_overlap
+    overlap = meaningful_keyword_overlap(" ".join(texts), results)
+    accepted = _accept_evidence(
+        has_results=bool(results),
+        top_cosine=top_cosine,
+        overlap=overlap,
+        min_cosine_similarity=min_cosine_similarity,
+        min_keyword_overlap=min_keyword_overlap,
+        snapshot_present=snapshot_present,
     )
     return RetrievalDecision(
         status="accepted" if accepted else "no_relevant_information",

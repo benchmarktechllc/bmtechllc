@@ -16,6 +16,28 @@ _client: OpenAI | None = None
 StructuredResponse = TypeVar("StructuredResponse", bound=BaseModel)
 
 
+class ModelQuotaError(RuntimeError):
+    """The model provider returned HTTP 429 or an exhausted quota."""
+
+
+def _quota_error(exc: BaseException) -> ModelQuotaError | None:
+    """Translate a provider 429 or quota failure into ``ModelQuotaError``."""
+    if isinstance(exc, ModelQuotaError):
+        return exc
+    status = getattr(exc, "status_code", None)
+    text = f"{type(exc).__name__} {exc}".casefold()
+    if (
+        status == 429
+        or "ratelimit" in text
+        or "rate limit" in text
+        or "rate_limit" in text
+        or "insufficient_quota" in text
+        or "quota" in text
+    ):
+        return ModelQuotaError("The answer service is temporarily unavailable.")
+    return None
+
+
 def _get_client() -> OpenAI:
     global _client
     if _client is None:
@@ -36,6 +58,13 @@ def _record(completion: Any, *, tier: str, component: str, started_at: float) ->
     )
 
 
+def _chat_tier(tier: str) -> str:
+    """Chat completions stay on the cheap model. Embeddings keep their own tier."""
+    if tier == "embedding":
+        return tier
+    return "cheap"
+
+
 def call_llm(
     *, tier: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
     component: str = "agent",
@@ -43,12 +72,18 @@ def call_llm(
     """Call a configured model and record its token/latency/cost telemetry."""
     if not messages:
         raise ValueError("messages must not be empty.")
-    request: dict[str, Any] = {"model": get_model_config(tier).model, "messages": messages}
+    request: dict[str, Any] = {"model": get_model_config(_chat_tier(tier)).model, "messages": messages}
     if tools is not None:
         request["tools"] = tools
     started_at = perf_counter()
-    completion = _get_client().chat.completions.create(**request)
-    _record(completion, tier=tier, component=component, started_at=started_at)
+    try:
+        completion = _get_client().chat.completions.create(**request)
+    except Exception as exc:
+        quota = _quota_error(exc)
+        if quota is not None:
+            raise quota from exc
+        raise
+    _record(completion, tier=_chat_tier(tier), component=component, started_at=started_at)
     return completion
 
 
@@ -60,12 +95,18 @@ def call_llm_structured(
     if not messages:
         raise ValueError("messages must not be empty.")
     started_at = perf_counter()
-    completion = _get_client().beta.chat.completions.parse(
-        model=get_model_config(tier).model,
-        messages=list(messages),
-        response_format=response_schema,
-    )
-    _record(completion, tier=tier, component=component, started_at=started_at)
+    try:
+        completion = _get_client().beta.chat.completions.parse(
+            model=get_model_config(_chat_tier(tier)).model,
+            messages=list(messages),
+            response_format=response_schema,
+        )
+    except Exception as exc:
+        quota = _quota_error(exc)
+        if quota is not None:
+            raise quota from exc
+        raise
+    _record(completion, tier=_chat_tier(tier), component=component, started_at=started_at)
     parsed = completion.choices[0].message.parsed
     if not isinstance(parsed, response_schema):
         raise RuntimeError("The model did not return the requested structured response.")

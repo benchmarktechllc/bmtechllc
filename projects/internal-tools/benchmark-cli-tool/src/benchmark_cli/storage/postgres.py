@@ -128,6 +128,7 @@ class SearchFilters:
     source: str | None = None
     date: str | None = None
     include_synthetic: bool = False
+    source_type: str | None = None
 
     def __post_init__(self) -> None:
         for field_name, value in (("speaker", self.speaker), ("source", self.source)):
@@ -190,6 +191,7 @@ def initialize_database() -> None:
     apply_sql("006_fathom_sync.sql")
     apply_sql("007_fireflies_sync.sql")
     apply_sql("008_fts_url_tokens.sql")
+    apply_sql("009_github_sync.sql")
 
 
 def create_indexes() -> None:
@@ -536,6 +538,46 @@ def trello_card_rows() -> list[tuple[str, str, str, str, str, int, str, str, str
     return rows
 
 
+def board_url_chunk_rows(limit: int = 8) -> list[tuple[int, str, str, str]]:
+    """Chunks that mention a Trello board URL, including invite links.
+
+    Each tuple is ``(chunk_id, source_file, content_sha256, chunk_text)``.
+    Card rows only store ``/c/`` links, so a Discord line can still carry
+    ``trello.com/b/<id>/<slug>``.
+    """
+    if limit < 1:
+        return []
+    statement = """
+        SELECT id, source_file, content_sha256, chunk_text
+        FROM document_chunks
+        WHERE chunk_text ILIKE %s
+           OR chunk_text ILIKE %s
+        ORDER BY id
+        LIMIT %s
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, ("%trello.com/b/%", "%trello.com/invite/b/%", limit))
+        fetched = cursor.fetchall()
+    rows: list[tuple[int, str, str, str]] = []
+    for record in fetched:
+        if len(record) != 4:
+            continue
+        chunk_id, source_file, digest, chunk_text = record
+        if isinstance(chunk_id, bool):
+            continue
+        try:
+            parsed_id = int(chunk_id)
+        except (TypeError, ValueError):
+            continue
+        text = str(chunk_text or "")
+        source = str(source_file or "").strip()
+        hashed = str(digest or "").strip().lower()
+        if parsed_id < 1 or not source or not text:
+            continue
+        rows.append((parsed_id, source, hashed, text))
+    return rows
+
+
 def discord_source_messages(channel_id: str) -> list[DiscordSourceMessage]:
     """Return a channel's normalized source messages in chronological order."""
     statement = """
@@ -865,6 +907,9 @@ def _filters_where_clause(filters: SearchFilters) -> tuple[str, list[str]]:
     if filters.source is not None:
         clauses.append("source_file = %s")
         parameters.append(filters.source)
+    if filters.source_type is not None:
+        clauses.append("metadata ->> 'source_type' = %s")
+        parameters.append(filters.source_type)
     if filters.date is not None:
         clauses.append(
             """(
@@ -891,12 +936,20 @@ def vector_search(
     source: str | None = None,
     date: str | None = None,
     include_synthetic: bool = False,
+    source_type: str | None = None,
+    conn: Any | None = None,
 ) -> list[SearchChunk]:
     """Return vector-ranked candidates independently of keyword retrieval."""
     if limit < 1:
         return []
     filter_clause, filter_parameters = _filters_where_clause(
-        SearchFilters(speaker, source, date, include_synthetic=include_synthetic)
+        SearchFilters(
+            speaker,
+            source,
+            date,
+            include_synthetic=include_synthetic,
+            source_type=source_type,
+        )
     )
     statement = """
         SELECT id, source_file, chunk_index, chunk_text, metadata,
@@ -908,12 +961,17 @@ def vector_search(
         ORDER BY embedding <=> %s::vector
         LIMIT %s
     """
-    with connection() as conn, conn.cursor() as cursor:
-        cursor.execute(
-            statement,
-            (list(query_vector), *filter_parameters, list(query_vector), limit),
-        )
-        return [SearchChunk(*row) for row in cursor.fetchall()]
+    parameters = (list(query_vector), *filter_parameters, list(query_vector), limit)
+
+    def _run(active: Any) -> list[SearchChunk]:
+        with active.cursor() as cursor:
+            cursor.execute(statement, parameters)
+            return [SearchChunk(*row) for row in cursor.fetchall()]
+
+    if conn is not None:
+        return _run(conn)
+    with connection() as owned:
+        return _run(owned)
 
 
 def fts_search(
@@ -924,12 +982,20 @@ def fts_search(
     source: str | None = None,
     date: str | None = None,
     include_synthetic: bool = False,
+    source_type: str | None = None,
+    conn: Any | None = None,
 ) -> list[SearchChunk]:
     """Return PostgreSQL full-text-ranked candidates independently of vectors."""
     if not query.strip() or limit < 1:
         return []
     filter_clause, filter_parameters = _filters_where_clause(
-        SearchFilters(speaker, source, date, include_synthetic=include_synthetic)
+        SearchFilters(
+            speaker,
+            source,
+            date,
+            include_synthetic=include_synthetic,
+            source_type=source_type,
+        )
     )
     statement = """
         WITH query AS (
@@ -949,9 +1015,17 @@ def fts_search(
         LIMIT %s
     """
 
-    with connection() as conn, conn.cursor() as cursor:
-        cursor.execute(statement, (query, *filter_parameters, limit))
-        return [SearchChunk(*row) for row in cursor.fetchall()]
+    parameters = (query, *filter_parameters, limit)
+
+    def _run(active: Any) -> list[SearchChunk]:
+        with active.cursor() as cursor:
+            cursor.execute(statement, parameters)
+            return [SearchChunk(*row) for row in cursor.fetchall()]
+
+    if conn is not None:
+        return _run(conn)
+    with connection() as owned:
+        return _run(owned)
 
 
 def select_context_window(
@@ -1042,3 +1116,227 @@ def read_doc(chunk_id: int, *, max_tokens: int = PARENT_CONTEXT_MAX_TOKENS) -> P
     section_chunks = tuple(SearchChunk(*row) for row in section_rows)
     selected, total, complete = select_context_window(section_chunks, anchor.id, max_tokens)
     return ParentContext(anchor, section, selected, total, complete)
+
+
+def github_file_digests(repo: str) -> dict[str, str]:
+    """Indexed path to content digest for one repository."""
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT path, blob_sha FROM github_file_state WHERE repo = %s",
+            (repo,),
+        )
+        return {str(path): str(blob_sha) for path, blob_sha in cursor.fetchall()}
+
+
+def upsert_github_file(repo: str, path: str, source_file: str, blob_sha: str) -> None:
+    statement = """
+        INSERT INTO github_file_state (repo, path, source_file, blob_sha)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (repo, path) DO UPDATE
+            SET source_file = EXCLUDED.source_file,
+                blob_sha = EXCLUDED.blob_sha,
+                synced_at = now()
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (repo, path, source_file, blob_sha))
+        conn.commit()
+
+
+def delete_github_file(repo: str, path: str) -> None:
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM github_file_state WHERE repo = %s AND path = %s",
+            (repo, path),
+        )
+        conn.commit()
+
+
+def set_github_commit(repo: str, commit_sha: str) -> None:
+    statement = """
+        INSERT INTO github_sync_state (repo, commit_sha)
+        VALUES (%s, %s)
+        ON CONFLICT (repo) DO UPDATE
+            SET commit_sha = EXCLUDED.commit_sha,
+                synced_at = now()
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (repo, commit_sha))
+        conn.commit()
+
+
+GITHUB_LANE_KINDS = ("code", "config", "workflow", "doc")
+_GITHUB_COLUMNS = """
+    id, repo, path, kind, chunk_index, symbol, header_words, start_line, end_line,
+    chunk_text, token_count, content_sha256, metadata
+"""
+_OR_TSQUERY = "replace(websearch_to_tsquery('english', %s)::text, ' & ', ' | ')::tsquery"
+
+
+def _github_chunk(row: Sequence[Any], score: float) -> SearchChunk:
+    """One github_chunks row in the shape every answer path already reads."""
+    (
+        chunk_id,
+        repo,
+        path,
+        kind,
+        chunk_index,
+        symbol,
+        header_words,
+        start_line,
+        end_line,
+        chunk_text,
+        token_count,
+        content_sha256,
+        stored,
+    ) = row
+    stored = dict(stored or {})
+    metadata = {
+        "source_type": "github",
+        "repo": repo,
+        "path": path,
+        "url": str(stored.get("url") or ""),
+        "kind": kind,
+        "symbol": symbol,
+        "header_words": header_words,
+        "start_line": int(start_line),
+        "end_line": int(end_line),
+        "merged_at": stored.get("merged_at"),
+        "title": stored.get("title"),
+    }
+    return SearchChunk(
+        int(chunk_id),
+        f"github/{repo}/{path}",
+        int(chunk_index),
+        str(chunk_text),
+        metadata,
+        float(score),
+        int(token_count),
+        str(content_sha256).strip(),
+    )
+
+
+def _github_rows(statement: str, parameters: Sequence[Any]) -> list[SearchChunk]:
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, tuple(parameters))
+        return [_github_chunk(row[:-1], row[-1]) for row in cursor.fetchall()]
+
+
+def github_vector_search(
+    query_vector: Sequence[float], limit: int, kinds: Sequence[str] = GITHUB_LANE_KINDS
+) -> list[SearchChunk]:
+    """Nearest github_chunks rows by cosine. Reads only github_chunks."""
+    if limit < 1:
+        return []
+    statement = f"""
+        SELECT {_GITHUB_COLUMNS}, 1 - (embedding <=> %s::vector) AS score
+        FROM github_chunks
+        WHERE kind = ANY(%s)
+        ORDER BY embedding <=> %s::vector, id
+        LIMIT %s
+    """
+    vector = list(query_vector)
+    return _github_rows(statement, (vector, list(kinds), vector, limit))
+
+
+def github_fts_search(
+    query: str, limit: int, kinds: Sequence[str] = GITHUB_LANE_KINDS
+) -> list[SearchChunk]:
+    """Full-text rank over header words (weight A) and code text. Same OR rewrite as fts_search."""
+    if not query.strip() or limit < 1:
+        return []
+    statement = f"""
+        WITH query AS (SELECT {_OR_TSQUERY} AS tsq)
+        SELECT {_GITHUB_COLUMNS}, ts_rank_cd(search_vector, query.tsq) AS score
+        FROM github_chunks, query
+        WHERE search_vector @@ query.tsq AND kind = ANY(%s)
+        ORDER BY score DESC, id ASC
+        LIMIT %s
+    """
+    return _github_rows(statement, (query, list(kinds), limit))
+
+
+def github_header_search(
+    query: str, limit: int, kinds: Sequence[str] = GITHUB_LANE_KINDS
+) -> list[SearchChunk]:
+    """Rank by path, symbol, and defined names only."""
+    if not query.strip() or limit < 1:
+        return []
+    statement = f"""
+        WITH query AS (SELECT {_OR_TSQUERY} AS tsq)
+        SELECT {_GITHUB_COLUMNS}, ts_rank_cd(header_vector, query.tsq) AS score
+        FROM github_chunks, query
+        WHERE header_vector @@ query.tsq AND kind = ANY(%s)
+        ORDER BY score DESC, id ASC
+        LIMIT %s
+    """
+    return _github_rows(statement, (query, list(kinds), limit))
+
+
+def github_identity_rows(kinds: Sequence[str] = GITHUB_LANE_KINDS) -> list[tuple[str, str, str]]:
+    """Distinct (path, symbol, header_words) of lane rows: the vocabulary the code lane ranks with."""
+    statement = "SELECT DISTINCT path, symbol, header_words FROM github_chunks WHERE kind = ANY(%s)"
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (list(kinds),))
+        return [(str(path), str(symbol or ""), str(words or "")) for path, symbol, words in cursor.fetchall()]
+
+
+def github_pull_rows() -> list[SearchChunk]:
+    """Indexed pull-request chunks. Callers order them by merge time."""
+    statement = f"""
+        SELECT {_GITHUB_COLUMNS}, 0.0 AS score
+        FROM github_chunks
+        WHERE kind = 'pull_request'
+    """
+    return _github_rows(statement, ())
+
+
+def github_chunk_count() -> int:
+    """Rows in github_chunks. A missing table raises, and callers treat that as empty."""
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT count(*) FROM github_chunks")
+        return int(cursor.fetchone()[0])
+
+
+def github_indexed_paths(repo: str) -> set[str]:
+    """Paths that have at least one row in github_chunks."""
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT DISTINCT path FROM github_chunks WHERE repo = %s", (repo,))
+        return {str(row[0]) for row in cursor.fetchall()}
+
+
+def github_existing_embeddings(hashes: Sequence[str]) -> dict[str, list[float]]:
+    """Vectors already stored in github_chunks, keyed by content hash."""
+    if not hashes:
+        return {}
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT content_sha256, embedding FROM github_chunks WHERE content_sha256 = ANY(%s)",
+            (list(hashes),),
+        )
+        return {digest.strip(): embedding.to_list() for digest, embedding in cursor.fetchall()}
+
+
+def replace_github_chunks(repo: str, path: str, rows: Sequence[dict[str, Any]]) -> int:
+    """Atomically replace one file's rows in github_chunks. Embeddings are prepared first."""
+    _, _, Json = _dependencies()
+    statement = """
+        INSERT INTO github_chunks
+            (repo, path, kind, chunk_index, symbol, header_words, start_line, end_line,
+             chunk_text, content_sha256, token_count, embedding, metadata)
+        VALUES (%(repo)s, %(path)s, %(kind)s, %(chunk_index)s, %(symbol)s, %(header_words)s,
+                %(start_line)s, %(end_line)s, %(chunk_text)s, %(content_sha256)s,
+                %(token_count)s, %(embedding)s, %(metadata)s)
+    """
+    prepared = [{**row, "repo": repo, "path": path, "metadata": Json(row["metadata"])} for row in rows]
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("DELETE FROM github_chunks WHERE repo = %s AND path = %s", (repo, path))
+        if prepared:
+            cursor.executemany(statement, prepared)
+        conn.commit()
+    return len(prepared)
+
+
+def delete_github_chunks(repo: str, path: str) -> None:
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("DELETE FROM github_chunks WHERE repo = %s AND path = %s", (repo, path))
+        conn.commit()

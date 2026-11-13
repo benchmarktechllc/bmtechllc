@@ -53,6 +53,7 @@ class ModelConfig:
 
 
 CHEAP_MODEL: Final[str] = os.getenv("CHEAP_MODEL", "gpt-4o-mini")
+# Kept for cost-comparison logs only. Chat calls do not use this model.
 FLAGSHIP_MODEL: Final[str] = os.getenv("FLAGSHIP_MODEL", "gpt-4o")
 MODEL_TIERS: Final[dict[str, ModelConfig]] = {
     "cheap": ModelConfig(

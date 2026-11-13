@@ -1,0 +1,248 @@
+{
+  "sample_board": true,
+  "cases": [
+    {
+      "id": "dante-assigned",
+      "question": "What tickets are assigned to Dante",
+      "thread_question": null,
+      "plan": {"searches": ["tickets assigned to Dante Paniccia"], "person": "Dante Paniccia"},
+      "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.12, "keyword_overlap": 0},
+      "model": {"status": "answered", "confidence": 0.8, "answer": "Dante Paniccia is assigned to [Ship the portal](https://trello.com/c/ship) on Doing and [Old portal import](https://trello.com/c/old) on Done."},
+      "expect": {"status": "answered", "titles": ["Ship the portal", "Old portal import"], "absent": ["Kiosk MVP", "Review the lobby copy"], "order": ["Ship the portal", "Old portal import"]}
+    },
+    {
+      "id": "dante-possessive",
+      "question": "Dante's tickets",
+      "thread_question": null,
+      "plan": {"searches": ["Dante Paniccia tickets"], "person": "Dante Paniccia"},
+      "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.12, "keyword_overlap": 0},
+      "model": {"status": "answered", "confidence": 0.8, "answer": "Dante Paniccia is assigned to [Ship the portal](https://trello.com/c/ship) on Doing and [Old portal import](https://trello.com/c/old) on Done."},
+      "expect": {"status": "answered", "titles": ["Ship the portal", "Old portal import"], "absent": ["Kiosk MVP"], "order": ["Ship the portal", "Old portal import"]}
+    },
+    {
+      "id": "dantino-nickname",
+      "question": "tickets for Dantino",
+      "thread_question": null,
+      "plan": {"searches": ["Dante Paniccia tickets", "Dantino"], "person": "Dante Paniccia"},
+      "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.1, "keyword_overlap": 0},
+      "model": {"status": "answered", "confidence": 0.8, "answer": "Dante Paniccia is assigned to [Ship the portal](https://trello.com/c/ship) on Doing and [Old portal import](https://trello.com/c/old) on Done."},
+      "expect": {"status": "answered", "titles": ["Ship the portal", "Old portal import"], "absent": ["Kiosk MVP"], "order": ["Ship the portal", "Old portal import"]}
+    },
+    {
+      "id": "dantino12-username",
+      "question": "what's on Dantino12's plate",
+      "thread_question": null,
+      "plan": {"searches": ["Dante Paniccia"], "person": "Dante Paniccia"},
+      "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.05, "keyword_overlap": 0},
+      "model": {"status": "answered", "confidence": 0.8, "answer": "Dante Paniccia is assigned to [Ship the portal](https://trello.com/c/ship) on Doing and [Old portal import](https://trello.com/c/old) on Done."},
+      "expect": {"status": "answered", "titles": ["Ship the portal", "Old portal import"], "absent": ["Kiosk MVP"], "order": ["Ship the portal", "Old portal import"]}
+    },
+    {
+      "id": "fanual-typo",
+      "question": "Tickets assigned to Fanual",
+      "thread_question": null,
+      "plan": {"searches": ["tickets assigned to Fanuel Mengistu"], "person": "Fanuel Mengistu"},
+      "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.18, "keyword_overlap": 0},
+      "model": {"status": "answered", "confidence": 0.8, "answer": "Fanuel Mengistu is assigned to [Kiosk MVP](https://trello.com/c/kiosk) on Doing and [Retired kiosk notes](https://trello.com/c/retired) on Done."},
+      "expect": {"status": "answered", "titles": ["Kiosk MVP", "Retired kiosk notes"], "absent": ["Ship the portal", "Review the lobby copy"], "order": ["Kiosk MVP", "Retired kiosk notes"]}
+    },
+    {
+      "id": "fanual-possessive",
+      "question": "fanual's tickets",
+      "thread_question": null,
+      "plan": {"searches": ["Fanuel Mengistu tickets"], "person": "Fanuel Mengistu"},
+      "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.18, "keyword_overlap": 0},
+      "model": {"status": "answered", "confidence": 0.8, "answer": "Fanuel Mengistu is assigned to [Kiosk MVP](https://trello.com/c/kiosk) on Doing and [Retired kiosk notes](https://trello.com/c/retired) on Done."},
+      "expect": {"status": "answered", "titles": ["Kiosk MVP", "Retired kiosk notes"], "absent": ["Ship the portal"], "order": ["Kiosk MVP", "Retired kiosk notes"]}
+    },
+    {
+      "id": "fano-nickname",
+      "question": "what tickets does Fano have",
+      "thread_question": null,
+      "plan": {"searches": ["Fanuel Mengistu tickets"], "person": "Fanuel Mengistu"},
+      "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.2, "keyword_overlap": 0},
+      "model": {"status": "answered", "confidence": 0.8, "answer": "Fanuel Mengistu is assigned to [Kiosk MVP](https://trello.com/c/kiosk) on Doing and [Retired kiosk notes](https://trello.com/c/retired) on Done."},
+      "expect": {"status": "answered", "titles": ["Kiosk MVP", "Retired kiosk notes"], "absent": ["Ship the portal"], "order": ["Kiosk MVP", "Retired kiosk notes"]}
+    },
+    {
+      "id": "anwar-in-dante-thread",
+      "question": "Tickets assigned to Anwar",
+      "thread_question": "What tickets are assigned to Dante",
+      "plan": {"searches": ["tickets assigned to Anwar Hussein"], "person": "Anwar Hussein"},
+      "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.22, "keyword_overlap": 1},
+      "model": {"status": "answered", "confidence": 0.8, "answer": "Anwar Hussein is assigned to [Review the lobby copy](https://trello.com/c/lobby) on Backlog."},
+      "expect": {"status": "answered", "titles": ["Review the lobby copy"], "absent": ["Ship the portal", "Kiosk MVP"]}
+    },
+    {
+      "id": "anwar-possessive-in-thread",
+      "question": "Anwar's tickets please",
+      "thread_question": "Dante's tickets",
+      "plan": {"searches": ["Anwar Hussein tickets"], "person": "Anwar Hussein"},
+      "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.22, "keyword_overlap": 0},
+      "model": {"status": "answered", "confidence": 0.8, "answer": "Anwar Hussein is assigned to [Review the lobby copy](https://trello.com/c/lobby) on Backlog."},
+      "expect": {"status": "answered", "titles": ["Review the lobby copy"], "absent": ["Ship the portal", "Old portal import"]}
+    },
+    {
+      "id": "anwar-follow-up",
+      "question": "what about Anwar",
+      "thread_question": "What tickets are assigned to Dante",
+      "plan": {"searches": ["Anwar Hussein"], "person": "Anwar Hussein"},
+      "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.11, "keyword_overlap": 0},
+      "model": {"status": "answered", "confidence": 0.8, "answer": "Anwar Hussein is assigned to [Review the lobby copy](https://trello.com/c/lobby) on Backlog."},
+      "expect": {"status": "answered", "titles": ["Review the lobby copy"], "absent": ["Ship the portal"]}
+    },
+    {
+      "id": "fanuel-currently-working",
+      "question": "What is Fanuel currently working on",
+      "thread_question": null,
+      "plan": {"searches": ["Fanuel Mengistu currently working"], "person": "Fanuel Mengistu"},
+      "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.19, "keyword_overlap": 0},
+      "model": {"status": "answered", "confidence": 0.8, "answer": "Fanuel Mengistu is currently working on [Kiosk MVP](https://trello.com/c/kiosk), which is in Doing."},
+      "expect": {"status": "answered", "titles": ["Kiosk MVP", "Retired kiosk notes"], "absent": ["Ship the portal", "Review the lobby copy"], "order": ["Kiosk MVP", "Retired kiosk notes"]}
+    },
+    {
+      "id": "fano-current",
+      "question": "what is Fano doing right now",
+      "thread_question": null,
+      "plan": {"searches": ["Fanuel Mengistu current work"], "person": "Fanuel Mengistu"},
+      "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.16, "keyword_overlap": 0},
+      "model": {"status": "answered", "confidence": 0.8, "answer": "Fanuel Mengistu is currently working on [Kiosk MVP](https://trello.com/c/kiosk), which is in Doing."},
+      "expect": {"status": "answered", "titles": ["Kiosk MVP", "Retired kiosk notes"], "absent": ["Ship the portal"], "order": ["Kiosk MVP", "Retired kiosk notes"]}
+    },
+    {
+      "id": "fanuel-current-work",
+      "question": "Fanuel Mengistu's current work",
+      "thread_question": null,
+      "plan": {"searches": ["Fanuel Mengistu current work"], "person": "Fanuel Mengistu"},
+      "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.4, "keyword_overlap": 1},
+      "model": {"status": "answered", "confidence": 0.8, "answer": "Fanuel Mengistu is currently working on [Kiosk MVP](https://trello.com/c/kiosk), which is in Doing."},
+      "expect": {"status": "answered", "titles": ["Kiosk MVP", "Retired kiosk notes"], "absent": ["Ship the portal"], "order": ["Kiosk MVP", "Retired kiosk notes"]}
+    },
+    {
+      "id": "no-name-doing",
+      "question": "Which tickets are in Doing right now?",
+      "thread_question": null,
+      "plan": {"searches": ["Which tickets are in Doing right now?"], "person": null},
+      "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.12, "keyword_overlap": 0},
+      "model_calls": [null],
+      "expect": {"status": "answered", "titles": ["Ship the portal", "Kiosk MVP", "Unassigned sample"], "absent": ["Old portal import", "Retired kiosk notes", "Review the lobby copy"]}
+    },
+    {
+      "id": "no-name-backlog",
+      "question": "What's in Backlog?",
+      "thread_question": null,
+      "plan": {"searches": ["What's in Backlog?"], "person": null},
+      "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": null, "keyword_overlap": 0},
+      "model_calls": [null],
+      "expect": {"status": "answered", "titles": ["Review the lobby copy"], "absent": ["Ship the portal", "Kiosk MVP", "Old portal import"]}
+    },
+    {
+      "id": "no-name-open",
+      "question": "Which tickets are still open?",
+      "thread_question": null,
+      "plan": {"searches": ["Which tickets are still open?"], "person": null},
+      "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.2, "keyword_overlap": 0},
+      "model_calls": [null],
+      "expect": {"status": "answered", "titles": ["Ship the portal", "Kiosk MVP", "Review the lobby copy", "Unassigned sample"], "absent": ["Old portal import", "Retired kiosk notes"]}
+    },
+    {
+      "id": "saved-headcount-reask",
+      "question": "How many employees does BMTech currently have ?",
+      "thread_question": null,
+      "plan": {"searches": ["How many employees does BMTech currently have ?"], "person": null},
+      "retrieval": {
+        "status": "accepted",
+        "top_cosine_similarity": 0.81,
+        "keyword_overlap": 2,
+        "results": [
+          {
+            "id": 8802,
+            "source_file": "user_contributed/7/9.md",
+            "chunk_index": 0,
+            "chunk_text": "Question: How many employees does BMTech currently have?\nAccording to Ada Example on 2026-11-12:\nSample count is 3.",
+            "metadata": {
+              "source_type": "user_contributed",
+              "question": "How many employees does BMTech currently have?",
+              "author_name": "Ada Example",
+              "contributed_at": "2026-11-12",
+              "date": "2026-11-12"
+            },
+            "score": 0.81,
+            "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "rrf_score": 0.2,
+            "vector_score": 0.91,
+            "fts_score": 1.0
+          }
+        ]
+      },
+      "model_calls": [null],
+      "expect": {"status": "answered", "titles": ["According to", "Sample count is 3", "Ada Example"], "absent": ["does not state a current employee count"]}
+    },
+    {
+      "id": "fanual-not-dante-contribution",
+      "question": "Tickets assigned to Fanual",
+      "thread_question": null,
+      "plan": {"searches": ["Fanuel Mengistu tickets"], "person": "Fanuel Mengistu"},
+      "retrieval": {
+        "status": "accepted",
+        "top_cosine_similarity": 0.93,
+        "keyword_overlap": 2,
+        "results": [
+          {
+            "id": 8801,
+            "source_file": "user_contributed/1/1.md",
+            "chunk_index": 0,
+            "chunk_text": "Question: Tickets assigned to Dante\nAccording to Ada Example on 2026-11-12:\nDante is dantino12",
+            "metadata": {
+              "source_type": "user_contributed",
+              "question": "Tickets assigned to Dante",
+              "author_name": "Ada Example",
+              "contributed_at": "2026-11-12",
+              "date": "2026-11-12"
+            },
+            "score": 0.93,
+            "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "rrf_score": 0.3,
+            "vector_score": 0.93,
+            "fts_score": 1.0
+          }
+        ]
+      },
+      "model_calls": [null],
+      "expect": {"status": "answered", "titles": ["Kiosk MVP"], "absent": ["According to", "Dante is dantino12"]}
+    },
+    {
+      "id": "open-tickets-not-contribution",
+      "question": "Which tickets are still open?",
+      "thread_question": null,
+      "plan": {"searches": ["Which tickets are still open?"], "person": null},
+      "retrieval": {
+        "status": "accepted",
+        "top_cosine_similarity": 0.93,
+        "keyword_overlap": 1,
+        "results": [
+          {
+            "id": 8801,
+            "source_file": "user_contributed/1/1.md",
+            "chunk_index": 0,
+            "chunk_text": "Question: Tickets assigned to Dante\nAccording to Ada Example on 2026-11-12:\nDante is dantino12",
+            "metadata": {
+              "source_type": "user_contributed",
+              "question": "Tickets assigned to Dante",
+              "author_name": "Ada Example",
+              "contributed_at": "2026-11-12",
+              "date": "2026-11-12"
+            },
+            "score": 0.93,
+            "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "rrf_score": 0.3,
+            "vector_score": 0.93,
+            "fts_score": 1.0
+          }
+        ]
+      },
+      "model_calls": [null],
+      "expect": {"status": "answered", "titles": ["Ship the portal"], "absent": ["According to"]}
+    }
+  ]
+}
