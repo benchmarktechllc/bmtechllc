@@ -12,7 +12,7 @@ record          Store the code lane's chunks and raw model drafts for the code c
 replay          Run the lane validator over a recording. Zero OpenAI calls.
 live            Saved, names, code, then suite against the real model, with early stop.
 
-The private case files (suite, names, saved, optional paraphrase, baseline results) are passed by
+The private case files (suite, names, saved, optional paraphrase and meetings, baseline results) are passed by
 directory (``--private-dir`` or ``ASK_PRIVATE_DIR``). Every output is private, and
 the harness refuses to write inside a git working tree.
 
@@ -68,7 +68,10 @@ MODEL_DOWN = "ask-regress: answer model is down for this offline run"
 # ``check`` accepts a changed answer only for these cases: group in the set, private
 # expectation ``saved_paraphrase``, at most the cap. Everything else must be identical.
 INTENDED_CHANGE_EXPECT = "saved_paraphrase"
-INTENDED_CHANGE_GROUPS = frozenset({"saved", "paraphrase"})
+INTENDED_CHANGE_GROUPS = frozenset({"saved", "paraphrase", "meetings"})
+MEETING_GROUP = "meetings"
+MEETING_PREFIX = "fireflies/"
+MEETING_NOT_FOUND_OUTCOME = "meeting_not_found"
 MAX_INTENDED_CHANGES = 12
 PARAPHRASE_OUTCOME = "user_contributed_paraphrase"
 SAVED_OUTCOMES = frozenset({"user_contributed", PARAPHRASE_OUTCOME})
@@ -276,9 +279,10 @@ class PrivateInputs:
     titles: dict[str, list[str]]
     baseline: dict[str, dict[str, Any]]  # suite case key -> baseline result
     paraphrase: tuple[Case, ...] = ()
+    meetings: tuple[Case, ...] = ()
 
     def non_code_cases(self) -> tuple[Case, ...]:
-        return (*self.suite, *self.names, *self.saved, *self.paraphrase)
+        return (*self.suite, *self.names, *self.saved, *self.paraphrase, *self.meetings)
 
 
 def private_dir(value: str | None) -> Path:
@@ -289,7 +293,7 @@ def private_dir(value: str | None) -> Path:
 
 
 def load_private(directory: Path) -> PrivateInputs:
-    """Read suite.json, names.json, saved.json, optional paraphrase.json, and baseline-suite.json."""
+    """Read suite.json, names.json, saved.json, optional paraphrase.json and meetings.json, and baseline-suite.json."""
     suite_rows = read_json(directory / "suite.json")
     suite = tuple(
         Case(f"suite:{index}", "suite", str(row["q"]), row.get("starter") or None)
@@ -309,7 +313,18 @@ def load_private(directory: Path) -> PrivateInputs:
     if baseline_path.is_file():
         payload = read_json(baseline_path)
         rows = list(payload.get("results", []) if isinstance(payload, dict) else payload)
-    return PrivateInputs(suite, names, saved, titles, align_baseline(suite, rows), paraphrase)
+    meetings_path = directory / "meetings.json"
+    meetings = _meeting_cases(read_json(meetings_path)) if meetings_path.is_file() else ()
+    return PrivateInputs(suite, names, saved, titles, align_baseline(suite, rows), paraphrase, meetings)
+
+
+def _meeting_cases(rows: Sequence[dict[str, Any]]) -> tuple[Case, ...]:
+    """Each row: ``q``, ``expect`` (meeting_answer or meeting_not_found), optional ``phrases``,
+    ``min_phrases``, ``mentions``, ``must_contain``, ``runs`` and ``min_pass``."""
+    return tuple(
+        Case(f"{MEETING_GROUP}:{index}", MEETING_GROUP, str(row["q"]), None, {**row})
+        for index, row in enumerate(rows)
+    )
 
 
 def _saved_cases(group: str, rows: Sequence[dict[str, Any]]) -> tuple[Case, ...]:
@@ -326,11 +341,12 @@ def _saved_cases(group: str, rows: Sequence[dict[str, Any]]) -> tuple[Case, ...]
 
 
 def intended_change_keys(cases: Sequence[Case]) -> list[str]:
-    """Cases whose answer may change: saved/paraphrase group and ``saved_paraphrase`` only."""
+    """Cases whose answer may change: ``saved_paraphrase`` saved/paraphrase cases and every meetings case."""
     return [
         case.key
         for case in cases
-        if case.group in INTENDED_CHANGE_GROUPS and case.extra.get("expect") == INTENDED_CHANGE_EXPECT
+        if case.group == MEETING_GROUP
+        or (case.group in INTENDED_CHANGE_GROUPS and case.extra.get("expect") == INTENDED_CHANGE_EXPECT)
     ]
 
 
@@ -743,6 +759,24 @@ def diff_intended(base: dict[str, Any], cand: dict[str, Any], shortcut_answers: 
     return diffs
 
 
+def diff_meeting(base: dict[str, Any], cand: dict[str, Any]) -> list[str]:
+    """A meetings case may differ from the baseline. It must still be the same question, run clean,
+    and a ``meeting_not_found`` case must answer without a model call or a citation."""
+    if base["q"] != cand["q"] or base.get("starter") != cand.get("starter"):
+        return [_QUESTION_CHANGED]
+    diffs: list[str] = []
+    if cand.get("error"):
+        diffs.append(f"error {cand.get('error')!r}")
+    if cand.get("expect") == "meeting_not_found":
+        if cand.get("outcome") != MEETING_NOT_FOUND_OUTCOME:
+            diffs.append(f"outcome {cand.get('outcome')} is not {MEETING_NOT_FOUND_OUTCOME}")
+        if cand.get("model_calls"):
+            diffs.append(f"candidate made {len(cand['model_calls'])} model call(s)")
+        if (cand.get("response") or {}).get("citations"):
+            diffs.append("response carries citations")
+    return diffs
+
+
 def best_probe(record: dict[str, Any]) -> float | None:
     values = [float(item["similarity"]) for item in record.get("saved_probes") or []]
     return max(values) if values else None
@@ -861,6 +895,7 @@ def run_offline_case(case: Case, plan: Any) -> dict[str, Any]:
         "group": case.group,
         "q": case.q,
         "starter": case.starter,
+        **({"expect": case.extra.get("expect")} if case.group == MEETING_GROUP else {}),
         "plan": plan.model_dump() if hasattr(plan, "model_dump") else dict(plan),
         "retrievals": [],
         "phrase_lookups": [],
@@ -951,11 +986,12 @@ def evaluate_check(
     ``intended`` = allow-listed keys (see ``intended_change_keys``); ``shortcut_keys`` =
     cases expected to take the exact saved shortcut, whose baseline answers fix the template.
     """
-    if len(intended) > MAX_INTENDED_CHANGES:
+    capped = [key for key in intended if not key.startswith(f"{MEETING_GROUP}:")]
+    if len(capped) > MAX_INTENDED_CHANGES:
         return {
             "green": False,
             "fingerprint_ok": True,
-            "message": f"{len(intended)} allow-listed changes exceed the cap of {MAX_INTENDED_CHANGES}.",
+            "message": f"{len(capped)} allow-listed changes exceed the cap of {MAX_INTENDED_CHANGES}.",
             "cases": [],
             "failed": [],
             "missing": [],
@@ -983,6 +1019,17 @@ def evaluate_check(
         base = by_key.get(cand["key"])
         if base is None:
             diffs = ["case missing from baseline capture"]
+        elif cand["key"] in allowed and cand.get("group") == MEETING_GROUP:
+            diffs = diff_meeting(base, cand)
+            changes.append(
+                {
+                    "key": cand["key"],
+                    "q": cand["q"],
+                    "baseline_outcome": base.get("outcome"),
+                    "candidate_outcome": cand.get("outcome"),
+                    "ok": not diffs,
+                }
+            )
         elif cand["key"] in allowed:
             diffs = diff_intended(base, cand, shortcut_answers)
             citations = (cand.get("response") or {}).get("citations") or [{}]
@@ -1341,6 +1388,37 @@ def score_saved(case: dict[str, Any], result: dict[str, Any]) -> tuple[bool, str
     raise ValueError(f"Unknown saved expectation {expect!r}.")
 
 
+def score_meeting(case: dict[str, Any], result: dict[str, Any]) -> tuple[bool, str]:
+    """``meeting_answer`` or ``meeting_not_found``; ``must_contain`` applies to both."""
+    expect = case["expect"]
+    answer = str(result.get("answer") or "")
+    lowered = answer.lower()
+    missing = [item for item in case.get("must_contain") or [] if str(item).lower() not in lowered]
+    if missing:
+        return False, f"missing {missing}"
+    if expect == "meeting_not_found":
+        if result.get("outcome") != MEETING_NOT_FOUND_OUTCOME:
+            return False, f"outcome {result.get('outcome')} is not {MEETING_NOT_FOUND_OUTCOME}"
+        if _citations(result):
+            return False, "carries citations"
+        return True, ""
+    if expect == "meeting_answer":
+        if result.get("status") != "answered":
+            return False, f"status {result.get('status')}"
+        if not any(source.startswith(MEETING_PREFIX) for source in _sources(result)):
+            return False, f"does not cite a {MEETING_PREFIX} chunk"
+        phrases = [str(item).lower() for item in case.get("phrases") or []]
+        needed = int(case.get("min_phrases", len(phrases)))
+        found = sum(item in lowered for item in phrases)
+        if found < needed:
+            return False, f"{found} of {needed} key phrases"
+        mentions = [str(item).lower() for item in case.get("mentions") or []]
+        if mentions and not any(item in lowered for item in mentions):
+            return False, "names neither the meeting title nor its date"
+        return True, ""
+    raise ValueError(f"Unknown meeting expectation {expect!r}.")
+
+
 def score_name(case: dict[str, Any], result: dict[str, Any], titles: dict[str, list[str]]) -> tuple[bool, str]:
     person = case["person"]
     answer = str(result.get("answer") or "")
@@ -1560,6 +1638,7 @@ def command_live(args: argparse.Namespace) -> int:
         "saved": [],
         "names": [],
         "code": [],
+        "meetings": [],
         "suite_runs": [],
         "early_stop": None,
     }
@@ -1580,6 +1659,25 @@ def command_live(args: argparse.Namespace) -> int:
                     result.update({"key": case.key, "passed": ok, "why": why})
                     report["names"].append(result)
                     tally.after_name(ok, case.key)
+            if "meetings" in groups:
+                for case in inputs.meetings:
+                    runs = []
+                    for _ in range(int(case.extra.get("runs", 1))):
+                        result = run_live_case(case.q, None, guard)
+                        ok, why = score_meeting(case.extra, result)
+                        result.update({"passed": ok, "why": why})
+                        runs.append(result)
+                    passes = sum(item["passed"] for item in runs)
+                    report["meetings"].append(
+                        {
+                            "key": case.key,
+                            "q": case.q,
+                            "expect": case.extra["expect"],
+                            "passes": passes,
+                            "runs": runs,
+                            "passed": passes >= int(case.extra.get("min_pass", len(runs))),
+                        }
+                    )
             if "code" in groups:
                 if not lane_present:
                     raise EarlyStop("code group requested on a build without the code lane")
@@ -1632,6 +1730,7 @@ def summarize_live(report: dict[str, Any], groups: Sequence[str]) -> dict[str, A
     saved = report["saved"]
     names = report["names"]
     code = report["code"]
+    meetings = report.get("meetings") or []
     suite = report["suite_runs"][-1] if report["suite_runs"] else []
     code_original = [item for item in code if item["original"]]
     suite_answered = sum(item["answered"] for item in suite)
@@ -1642,6 +1741,7 @@ def summarize_live(report: dict[str, Any], groups: Sequence[str]) -> dict[str, A
         "names": f"{sum(item['passed'] for item in names)}/{len(names)}",
         "code_original": f"{sum(item['passed'] for item in code_original)}/{len(code_original)}",
         "code_twelfth": [item["passed"] for item in code if not item["original"]],
+        "meetings": _passed_of(meetings),
         "suite": f"{suite_answered}/{len(suite)}",
         "suite_hijacks": hijacks,
         "suite_runs": len(report["suite_runs"]),
@@ -1657,6 +1757,7 @@ def summarize_live(report: dict[str, Any], groups: Sequence[str]) -> dict[str, A
         and sum(item["passed"] for item in code_original) >= CODE_ORIGINAL_BAR
         and suite_answered >= SUITE_BAR
         and hijacks == 0
+        and all(item["passed"] for item in meetings)
     )
     return {"bar": bar, "pass": passed}
 

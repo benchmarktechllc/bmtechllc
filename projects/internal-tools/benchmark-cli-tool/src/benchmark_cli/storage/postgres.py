@@ -1075,6 +1075,40 @@ def select_context_window(
     return selected, total, len(selected) == len(chunks)
 
 
+def list_meetings(source_file: str | None = None) -> list[tuple[str, str, str, str]]:
+    """Distinct indexed meetings as ``(source_file, title, date, url)``. Read only."""
+    statement = """
+        SELECT DISTINCT source_file, coalesce(metadata ->> 'title', ''),
+               coalesce(metadata ->> 'date', ''), coalesce(metadata ->> 'url', '')
+        FROM document_chunks
+        WHERE metadata ->> 'source_type' = 'transcript'
+          AND metadata ->> 'kind' = 'meeting_transcript'
+    """
+    parameters: tuple[str, ...] = ()
+    if source_file is not None:
+        statement += " AND source_file = %s"
+        parameters = (source_file,)
+    statement += " ORDER BY source_file"
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, parameters)
+        return [tuple(str(value) for value in row) for row in cursor.fetchall()]  # type: ignore[misc]
+
+
+def meeting_summary_chunks(source_file: str) -> list[SearchChunk]:
+    """The Overview and Summary chunks of one meeting, in document order."""
+    statement = """
+        SELECT id, source_file, chunk_index, chunk_text, metadata, 0.0 AS score,
+               NULL::integer AS token_count, content_sha256
+        FROM document_chunks
+        WHERE source_file = %s
+          AND metadata ->> 'section' IN ('Overview', 'Summary')
+        ORDER BY chunk_index ASC, id ASC
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (source_file,))
+        return [SearchChunk(*row) for row in cursor.fetchall()]
+
+
 def read_doc(chunk_id: int, *, max_tokens: int = PARENT_CONTEXT_MAX_TOKENS) -> ParentContext | None:
     """Fetch the hit and a token-bounded window from its containing section.
 

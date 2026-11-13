@@ -627,3 +627,55 @@ def test_live_summary_counts_paraphrase_cases_under_the_saved_bar() -> None:
     summary = harness.summarize_live(report, ["saved", "names", "code", "suite"])
     assert summary["bar"]["saved"] == "1/1" and summary["bar"]["paraphrase"] == "1/2"
     assert summary["pass"] is False
+
+
+@pytest.mark.unit
+def test_meetings_file_is_optional_and_allow_listed(tmp_path: Path) -> None:
+    import json
+
+    (tmp_path / "suite.json").write_text(json.dumps([{"q": "Q1?"}]))
+    (tmp_path / "names.json").write_text(json.dumps({"cases": [], "titles": {}}))
+    (tmp_path / "saved.json").write_text(json.dumps([]))
+    assert harness.load_private(tmp_path).meetings == ()
+    rows = [{"q": "M0?", "expect": "meeting_answer"}, {"q": "M1?", "expect": "meeting_not_found"}]
+    (tmp_path / "meetings.json").write_text(json.dumps(rows))
+    inputs = harness.load_private(tmp_path)
+    assert [case.key for case in inputs.non_code_cases()] == ["suite:0", "meetings:0", "meetings:1"]
+    assert harness.intended_change_keys(inputs.non_code_cases()) == ["meetings:0", "meetings:1"]
+
+
+@pytest.mark.unit
+def test_meeting_scorers() -> None:
+    rule = {
+        "expect": "meeting_answer",
+        "phrases": ["Alpha", "beta", "gamma"],
+        "min_phrases": 2,
+        "mentions": ["November 13", "Team Sync"],
+        "must_contain": ["owner"],
+    }
+    good = _result(answer="Team Sync on March 1: ALPHA and Beta, owner is Sam.", sources=("fireflies/x.md",))
+    assert harness.score_meeting(rule, good)[0]
+    assert not harness.score_meeting(rule, {**good, "answer": "Team Sync: alpha only, owner Sam."})[0]
+    assert not harness.score_meeting(rule, {**good, "answer": "alpha beta owner"})[0]
+    assert not harness.score_meeting(rule, {**good, "answer": "Team Sync alpha beta"})[0]
+    assert not harness.score_meeting(rule, _result(answer=good["answer"], sources=("kb/x.md",)))[0]
+    assert not harness.score_meeting(rule, {**good, "status": "no_relevant_information"})[0]
+    missing = {"expect": "meeting_not_found", "must_contain": ["2026-11-13"]}
+    reply = _result(status="no_relevant_information", answer="None. Indexed: Sync (2026-11-13).", sources=(), outcome="meeting_not_found")
+    assert harness.score_meeting(missing, reply)[0]
+    assert not harness.score_meeting(missing, {**reply, "outcome": "answered"})[0]
+    assert not harness.score_meeting(missing, _result(sources=("fireflies/x.md",), outcome="meeting_not_found"))[0]
+    with pytest.raises(ValueError):
+        harness.score_meeting({"expect": "other"}, good)
+
+
+@pytest.mark.unit
+def test_meeting_cases_may_differ_but_not_not_found_with_model_calls() -> None:
+    base = {"q": "M?", "starter": None}
+    cand = {**base, "expect": "meeting_not_found", "outcome": "meeting_not_found", "model_calls": [], "response": {"citations": []}}
+    assert harness.diff_meeting(base, cand) == []
+    assert harness.diff_meeting(base, {**cand, "outcome": "model_abstained"})
+    assert harness.diff_meeting(base, {**cand, "model_calls": [{"fn": "call_llm"}]})
+    assert harness.diff_meeting(base, {**cand, "q": "other"}) == [harness._QUESTION_CHANGED]
+    positive = {**base, "expect": "meeting_answer", "outcome": "model_abstained"}
+    assert harness.diff_meeting(base, positive) == []

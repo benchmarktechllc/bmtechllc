@@ -26,6 +26,7 @@ from .contributions import (
     is_contribution_reply,
     store_contribution,
 )
+from .meeting_answers import meeting_for_source
 from .models import AnswerResponse, Citation
 
 logger = logging.getLogger(__name__)
@@ -163,6 +164,11 @@ def _format_citation(index: int, citation: Citation) -> str:
     quote = " ".join(citation.quote.split())
     if len(quote) > _QUOTE_LIMIT:
         quote = quote[: _QUOTE_LIMIT - 1].rstrip() + "…"
+    meeting = meeting_for_source(citation.source_file)
+    if meeting is not None and meeting.title and meeting.date:
+        title = " ".join(meeting.title.split()).replace("`", "'")
+        link = f" <{meeting.url}>" if meeting.url.startswith("https://") and ">" not in meeting.url else ""
+        return f"{index}. {title} ({meeting.date}){link} (chunk {citation.chunk_id}): {quote}"
     return f"{index}. `{source}` (chunk {citation.chunk_id}): {quote}"
 
 
