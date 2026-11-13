@@ -1117,7 +1117,7 @@ def command_check(args: argparse.Namespace) -> int:
     for change in report.get("intended_changes") or []:
         print(
             f"  INTENDED {change['key']}: {change['q']} | {change['baseline_outcome']} -> "
-            f"{change['candidate_outcome']} chunk={change['chunk_id']} sim={change['similarity']} "
+            f"{change['candidate_outcome']} chunk={change.get('chunk_id')} sim={change.get('similarity')} "
             f"{'ok' if change['ok'] else 'FAIL'}"
         )
     for row in report.get("calibration") or []:
