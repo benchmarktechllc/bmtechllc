@@ -514,3 +514,116 @@ def test_fingerprint_ignores_github_rows_but_reports_them() -> None:
     base = {"count": 5, "max_id": 9, "md5": "m", "github_rows_in_document_chunks": 0}
     assert harness.fingerprint_matches(base, {**base, "github_rows_in_document_chunks": 3000})
     assert not harness.fingerprint_matches(base, {**base, "max_id": 10})
+
+
+# --------------------------------------------------------------------------- paraphrase allow-list
+
+_SAVED_SRC = "user_contributed/1/2.md"
+
+
+def _saved_response(answer_sha: str = "saved-answer") -> dict[str, object]:
+    return {"status": "answered", "answer_sha256": answer_sha, "answer_preview": "According to Ada Example on 2026-01-01: three.", "citations": [{"chunk_id": 7, "source_file": _SAVED_SRC}]}
+
+
+def _paraphrase_check(cand_overrides: dict[str, object], base_overrides: dict[str, object] | None = None, **kwargs: object) -> dict[str, object]:
+    shortcut = _case("saved:1", model_calls=[], response=_saved_response(), outcome="user_contributed")
+    base = _case("paraphrase:0", **(base_overrides or {}))
+    cand = _case("paraphrase:0", **{"model_calls": [], "response": _saved_response(), "outcome": harness.PARAPHRASE_OUTCOME, **cand_overrides})
+    baseline = {"fingerprint": _FP, "cases": [shortcut, base]}
+    options: dict[str, object] = {"intended": ["paraphrase:0"], "shortcut_keys": ["saved:1"], **kwargs}
+    return harness.evaluate_check(baseline, [shortcut, cand], fingerprint=_FP, is_code=None, **options)  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+def test_allow_listed_paraphrase_is_green_and_reported() -> None:
+    report = _paraphrase_check({"saved_probes": [{"saved_question_sha256": "h", "similarity": 0.77}]})
+    assert report["green"] is True
+    assert report["intended_changes"] == [
+        {"key": "paraphrase:0", "q": "Synthetic question?", "baseline_outcome": "validation_failed", "candidate_outcome": harness.PARAPHRASE_OUTCOME, "chunk_id": 7, "similarity": 0.77, "ok": True}
+    ]
+    assert [row["key"] for row in report["calibration"]] == ["paraphrase:0"]
+
+
+@pytest.mark.unit
+def test_allow_listed_case_fails_each_rule() -> None:
+    moved = _case("paraphrase:0", ids=(1, 3, 2))["retrievals"]
+    assert "chunk ids differ" in str(_paraphrase_check({"retrievals": moved})["cases"])
+    assert "is not user_contributed_paraphrase" in str(_paraphrase_check({"outcome": "model"})["cases"])
+    assert "model call" in str(_paraphrase_check({"model_calls": [{"messages_sha256": "m"}]})["cases"])
+    assert "exactly one saved-row citation" in str(_paraphrase_check({"response": {**_saved_response(), "citations": []}})["cases"])
+    assert "exact-match answer" in str(_paraphrase_check({"response": _saved_response("other")})["cases"])
+    assert "already took the exact saved shortcut" in str(_paraphrase_check({}, {"outcome": "user_contributed"})["cases"])
+    for report in (_paraphrase_check({"outcome": "model"}), _paraphrase_check({"response": _saved_response("other")})):
+        assert report["green"] is False and report["failed"] == ["paraphrase:0"]
+
+
+@pytest.mark.unit
+def test_without_a_shortcut_case_the_answer_must_carry_the_attribution() -> None:
+    assert _paraphrase_check({}, shortcut_keys=[])["green"] is True
+    plain = {**_saved_response(), "answer_preview": "Three."}
+    assert "According to" in str(_paraphrase_check({"response": plain}, shortcut_keys=[])["cases"])
+
+
+@pytest.mark.unit
+def test_unlisted_paraphrase_outcome_and_the_cap_are_red() -> None:
+    report = _paraphrase_check({}, intended=[])  # e.g. a build without the tier: plain identity
+    assert report["green"] is False
+    assert "paraphrase tier fired for a case not on the allow-list" in str(report["cases"])
+    capped = _paraphrase_check({}, intended=[f"paraphrase:{index}" for index in range(harness.MAX_INTENDED_CHANGES + 1)])
+    assert capped["green"] is False and "exceed the cap" in capped["message"]
+
+
+@pytest.mark.unit
+def test_only_saved_and_paraphrase_groups_can_be_allow_listed() -> None:
+    expect = {"expect": "saved_paraphrase"}
+    cases = [
+        harness.Case("suite:0", "suite", "Q?", None, dict(expect)),
+        harness.Case("names:0", "names", "Q?", None, dict(expect)),
+        harness.Case("saved:2", "saved", "Q?", None, dict(expect)),
+        harness.Case("saved:3", "saved", "Q?", None, {"expect": "not_saved"}),
+        harness.Case("paraphrase:0", "paraphrase", "Q?", None, dict(expect)),
+        harness.Case("paraphrase:1", "paraphrase", "Q?", None, {"expect": "not_saved_shortcut"}),
+    ]
+    assert harness.intended_change_keys(cases) == ["saved:2", "paraphrase:0"]
+
+
+@pytest.mark.unit
+def test_paraphrase_file_is_optional_and_loads_after_saved(tmp_path: Path) -> None:
+    import json
+
+    (tmp_path / "suite.json").write_text(json.dumps([{"q": "Q1?"}]))
+    (tmp_path / "names.json").write_text(json.dumps({"cases": [], "titles": {}}))
+    (tmp_path / "saved.json").write_text(json.dumps([{"q": "S0?", "expect": "saved_shortcut"}, {"q": "S1?", "expect": "saved_paraphrase"}]))
+    assert harness.load_private(tmp_path).paraphrase == ()
+    (tmp_path / "paraphrase.json").write_text(json.dumps([{"q": "P0?", "expect": "saved_paraphrase"}, {"q": "P1?", "expect": "not_saved_shortcut"}]))
+    inputs = harness.load_private(tmp_path)
+    assert [case.key for case in inputs.non_code_cases()] == ["suite:0", "saved:0", "saved:1", "paraphrase:0", "paraphrase:1"]
+    assert inputs.paraphrase[1].group == "paraphrase" and inputs.paraphrase[1].extra["source_prefix"] == "user_contributed/"
+
+
+@pytest.mark.unit
+def test_paraphrase_scorers() -> None:
+    rule = {"expect": "saved_paraphrase", "source_prefix": "user_contributed/"}
+    good = {**_result(answer="According to Ada Example on 2026-01-01: three.", sources=(_SAVED_SRC,), outcome=harness.PARAPHRASE_OUTCOME), "chat_calls": 1}
+    assert harness.score_saved(rule, good)[0]
+    assert not harness.score_saved(rule, {**good, "outcome": "user_contributed"})[0]
+    assert not harness.score_saved(rule, {**good, "chat_calls": 2})[0]
+    assert not harness.score_saved(rule, {**good, "citations": []})[0]
+    negative = {"expect": "not_saved_shortcut"}
+    assert harness.score_saved(negative, _result(outcome="answered"))[0]
+    assert not harness.score_saved(negative, _result(outcome=harness.PARAPHRASE_OUTCOME))[0]
+    assert not harness.score_saved(negative, _result(outcome="user_contributed"))[0]
+
+
+@pytest.mark.unit
+def test_live_summary_counts_paraphrase_cases_under_the_saved_bar() -> None:
+    report = {
+        "saved": [{"key": "saved:0", "passed": True}, {"key": "paraphrase:0", "passed": True}, {"key": "paraphrase:1", "passed": False}],
+        "names": [{"passed": True}] * 12,
+        "code": [{"passed": True, "original": True}] * 11,
+        "suite_runs": [[{"answered": True, "hijack": None}] * 56],
+        "early_stop": None,
+    }
+    summary = harness.summarize_live(report, ["saved", "names", "code", "suite"])
+    assert summary["bar"]["saved"] == "1/1" and summary["bar"]["paraphrase"] == "1/2"
+    assert summary["pass"] is False

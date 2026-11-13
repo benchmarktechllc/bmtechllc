@@ -12,7 +12,7 @@ record          Store the code lane's chunks and raw model drafts for the code c
 replay          Run the lane validator over a recording. Zero OpenAI calls.
 live            Saved, names, code, then suite against the real model, with early stop.
 
-The private case files (suite, names, saved, baseline results) are passed by
+The private case files (suite, names, saved, optional paraphrase, baseline results) are passed by
 directory (``--private-dir`` or ``ASK_PRIVATE_DIR``). Every output is private, and
 the harness refuses to write inside a git working tree.
 
@@ -38,7 +38,7 @@ import logging
 import math
 import re
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -64,6 +64,15 @@ CODE_RETRIEVAL_TOP = 3
 SAVED_PREFIX = "user_contributed/"
 GITHUB_PREFIX = "github/"
 MODEL_DOWN = "ask-regress: answer model is down for this offline run"
+
+# ``check`` accepts a changed answer only for these cases: group in the set, private
+# expectation ``saved_paraphrase``, at most the cap. Everything else must be identical.
+INTENDED_CHANGE_EXPECT = "saved_paraphrase"
+INTENDED_CHANGE_GROUPS = frozenset({"saved", "paraphrase"})
+MAX_INTENDED_CHANGES = 12
+PARAPHRASE_OUTCOME = "user_contributed_paraphrase"
+SAVED_OUTCOMES = frozenset({"user_contributed", PARAPHRASE_OUTCOME})
+CALIBRATION_SIMILARITY = 0.40
 
 # Code questions about the public repository. Expected paths are any-of suffixes.
 # ``original`` marks the eleven cases the live bar counts; the twelfth is reported only.
@@ -266,9 +275,10 @@ class PrivateInputs:
     saved: tuple[Case, ...]
     titles: dict[str, list[str]]
     baseline: dict[str, dict[str, Any]]  # suite case key -> baseline result
+    paraphrase: tuple[Case, ...] = ()
 
     def non_code_cases(self) -> tuple[Case, ...]:
-        return (*self.suite, *self.names, *self.saved)
+        return (*self.suite, *self.names, *self.saved, *self.paraphrase)
 
 
 def private_dir(value: str | None) -> Path:
@@ -279,7 +289,7 @@ def private_dir(value: str | None) -> Path:
 
 
 def load_private(directory: Path) -> PrivateInputs:
-    """Read suite.json, names.json, saved.json, and baseline-suite.json."""
+    """Read suite.json, names.json, saved.json, optional paraphrase.json, and baseline-suite.json."""
     suite_rows = read_json(directory / "suite.json")
     suite = tuple(
         Case(f"suite:{index}", "suite", str(row["q"]), row.get("starter") or None)
@@ -291,22 +301,37 @@ def load_private(directory: Path) -> PrivateInputs:
         for index, row in enumerate(names_payload["cases"])
     )
     titles = {str(person): list(values) for person, values in names_payload["titles"].items()}
-    saved = tuple(
-        Case(
-            f"saved:{index}",
-            "saved",
-            str(row["q"]),
-            None,
-            {"expect": row["expect"], "source_prefix": row.get("source_prefix") or SAVED_PREFIX},
-        )
-        for index, row in enumerate(read_json(directory / "saved.json"))
-    )
+    saved = _saved_cases("saved", read_json(directory / "saved.json"))
+    paraphrase_path = directory / "paraphrase.json"
+    paraphrase = _saved_cases("paraphrase", read_json(paraphrase_path)) if paraphrase_path.is_file() else ()
     baseline_path = directory / "baseline-suite.json"
     rows: list[dict[str, Any]] = []
     if baseline_path.is_file():
         payload = read_json(baseline_path)
         rows = list(payload.get("results", []) if isinstance(payload, dict) else payload)
-    return PrivateInputs(suite, names, saved, titles, align_baseline(suite, rows))
+    return PrivateInputs(suite, names, saved, titles, align_baseline(suite, rows), paraphrase)
+
+
+def _saved_cases(group: str, rows: Sequence[dict[str, Any]]) -> tuple[Case, ...]:
+    return tuple(
+        Case(
+            f"{group}:{index}",
+            group,
+            str(row["q"]),
+            None,
+            {"expect": row["expect"], "source_prefix": row.get("source_prefix") or SAVED_PREFIX},
+        )
+        for index, row in enumerate(rows)
+    )
+
+
+def intended_change_keys(cases: Sequence[Case]) -> list[str]:
+    """Cases whose answer may change: saved/paraphrase group and ``saved_paraphrase`` only."""
+    return [
+        case.key
+        for case in cases
+        if case.group in INTENDED_CHANGE_GROUPS and case.extra.get("expect") == INTENDED_CHANGE_EXPECT
+    ]
 
 
 def align_baseline(suite: Sequence[Case], rows: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -645,11 +670,11 @@ def diff_trace(base: dict[str, Any] | None, cand: dict[str, Any] | None, label: 
     return diffs
 
 
-def diff_case(base: dict[str, Any], cand: dict[str, Any]) -> list[str]:
-    """Every field ``check`` requires to be identical for a non-code case."""
-    diffs: list[str] = []
+def _diff_question_and_retrievals(base: dict[str, Any], cand: dict[str, Any]) -> list[str] | None:
+    """None when the case question itself differs; otherwise error and retrieval diffs."""
     if base["q"] != cand["q"] or base.get("starter") != cand.get("starter"):
-        return ["case question differs; the private files changed between capture and check"]
+        return None
+    diffs: list[str] = []
     if base.get("error") != cand.get("error"):
         diffs.append(f"error {base.get('error')!r} -> {cand.get('error')!r}")
     base_r, cand_r = base.get("retrievals") or [], cand.get("retrievals") or []
@@ -659,6 +684,17 @@ def diff_case(base: dict[str, Any], cand: dict[str, Any]) -> list[str]:
         if left.get("args") != right.get("args"):
             diffs.append(f"retrieval[{index}]: search strings differ")
         diffs.extend(diff_trace(left.get("decision"), right.get("decision"), f"retrieval[{index}]"))
+    return diffs
+
+
+_QUESTION_CHANGED = "case question differs; the private files changed between capture and check"
+
+
+def diff_case(base: dict[str, Any], cand: dict[str, Any]) -> list[str]:
+    """Every field ``check`` requires to be identical for a non-code case."""
+    diffs = _diff_question_and_retrievals(base, cand)
+    if diffs is None:
+        return [_QUESTION_CHANGED]
     if base.get("phrase_lookups") != cand.get("phrase_lookups"):
         diffs.append("supplemental phrase lookups differ")
     if base.get("model_calls") != cand.get("model_calls"):
@@ -673,7 +709,43 @@ def diff_case(base: dict[str, Any], cand: dict[str, Any]) -> list[str]:
             diffs.append(f"model-down response {key} differs")
     if base.get("outcome") != cand.get("outcome"):
         diffs.append(f"outcome {base.get('outcome')} -> {cand.get('outcome')}")
+    if cand.get("outcome") == PARAPHRASE_OUTCOME:
+        diffs.append("paraphrase tier fired for a case not on the allow-list")
     return diffs
+
+
+def diff_intended(base: dict[str, Any], cand: dict[str, Any], shortcut_answers: dict[int, set[str]]) -> list[str]:
+    """An allow-listed case: same retrieval, and the saved answer without a model call."""
+    diffs = _diff_question_and_retrievals(base, cand)
+    if diffs is None:
+        return [_QUESTION_CHANGED]
+    if base.get("outcome") == "user_contributed":
+        diffs.append("baseline already took the exact saved shortcut; expect saved_shortcut instead")
+    if cand.get("outcome") != PARAPHRASE_OUTCOME:
+        diffs.append(f"outcome {cand.get('outcome')} is not {PARAPHRASE_OUTCOME}")
+    if cand.get("model_calls"):
+        diffs.append(f"candidate made {len(cand['model_calls'])} model call(s)")
+    response = cand.get("response") or {}
+    citations = response.get("citations") or []
+    if (
+        response.get("status") != "answered"
+        or len(citations) != 1
+        or not str(citations[0].get("source_file") or "").startswith(SAVED_PREFIX)
+    ):
+        diffs.append("response is not answered with exactly one saved-row citation")
+        return diffs
+    expected = shortcut_answers.get(citations[0].get("chunk_id"))
+    if expected is not None:
+        if response.get("answer_sha256") not in expected:
+            diffs.append(f"answer differs from the exact-match answer for chunk {citations[0].get('chunk_id')}")
+    elif not str(response.get("answer_preview") or "").startswith("According to "):
+        diffs.append("answer does not start with 'According to '")
+    return diffs
+
+
+def best_probe(record: dict[str, Any]) -> float | None:
+    values = [float(item["similarity"]) for item in record.get("saved_probes") or []]
+    return max(values) if values else None
 
 
 FINGERPRINT_SQL = (
@@ -712,10 +784,18 @@ def fingerprint_matches(base: dict[str, Any], cand: dict[str, Any]) -> bool:
 @contextmanager
 def offline_agent(record: dict[str, Any], plan: Any) -> Iterator[None]:
     """Pin the query plan, stub the answer model, and record what the agent did."""
-    from benchmark_cli import agent
+    from benchmark_cli import agent, contributions
 
     real_retrieve = agent.retrieve_evidence
     real_fts = agent.fts_search
+    real_similarity = contributions.question_similarity
+
+    def similarity(asked: str, saved: str) -> float:
+        value = real_similarity(asked, saved)
+        record.setdefault("saved_probes", []).append(
+            {"saved_question_sha256": sha256_text(saved), "similarity": round(float(value), 6)}
+        )
+        return value
 
     def retrieve(*args: Any, **kwargs: Any) -> Any:
         decision = real_retrieve(*args, **kwargs)
@@ -758,6 +838,7 @@ def offline_agent(record: dict[str, Any], plan: Any) -> Iterator[None]:
         stack.enter_context(mock.patch.object(agent, "understand_query", lambda *_a, **_k: plan))
         stack.enter_context(mock.patch.object(agent, "retrieve_evidence", retrieve))
         stack.enter_context(mock.patch.object(agent, "fts_search", fts))
+        stack.enter_context(mock.patch.object(contributions, "question_similarity", similarity))
         stack.enter_context(mock.patch.object(agent, "call_llm", model_stub("call_llm")))
         stack.enter_context(
             mock.patch.object(agent, "call_llm_structured", model_stub("call_llm_structured"))
@@ -784,6 +865,7 @@ def run_offline_case(case: Case, plan: Any) -> dict[str, Any]:
         "retrievals": [],
         "phrase_lookups": [],
         "model_calls": [],
+        "saved_probes": [],
         "response": None,
         "outcome": None,
         "attempts": None,
@@ -861,8 +943,24 @@ def evaluate_check(
     *,
     fingerprint: dict[str, Any],
     is_code: Callable[[str], bool] | None,
+    intended: Sequence[str] = (),
+    shortcut_keys: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """Pure comparison used by ``check``. Returns the report body."""
+    """Pure comparison used by ``check``. Returns the report body.
+
+    ``intended`` = allow-listed keys (see ``intended_change_keys``); ``shortcut_keys`` =
+    cases expected to take the exact saved shortcut, whose baseline answers fix the template.
+    """
+    if len(intended) > MAX_INTENDED_CHANGES:
+        return {
+            "green": False,
+            "fingerprint_ok": True,
+            "message": f"{len(intended)} allow-listed changes exceed the cap of {MAX_INTENDED_CHANGES}.",
+            "cases": [],
+            "failed": [],
+            "missing": [],
+            "intended_changes": [],
+        }
     if not fingerprint_matches(baseline["fingerprint"], fingerprint):
         return {
             "green": False,
@@ -871,10 +969,36 @@ def evaluate_check(
             "cases": [],
         }
     by_key = {case["key"]: case for case in baseline["cases"]}
+    allowed = set(intended)
+    shortcut_answers: dict[int, set[str]] = {}
+    for key in shortcut_keys:
+        base = by_key.get(key) or {}
+        response = base.get("response") or {}
+        if base.get("outcome") == "user_contributed" and len(response.get("citations") or []) == 1:
+            chunk_id = response["citations"][0].get("chunk_id")
+            shortcut_answers.setdefault(chunk_id, set()).add(response.get("answer_sha256"))
     rows = []
+    changes = []
     for cand in candidate_cases:
         base = by_key.get(cand["key"])
-        diffs = ["case missing from baseline capture"] if base is None else diff_case(base, cand)
+        if base is None:
+            diffs = ["case missing from baseline capture"]
+        elif cand["key"] in allowed:
+            diffs = diff_intended(base, cand, shortcut_answers)
+            citations = (cand.get("response") or {}).get("citations") or [{}]
+            changes.append(
+                {
+                    "key": cand["key"],
+                    "q": cand["q"],
+                    "baseline_outcome": base.get("outcome"),
+                    "candidate_outcome": cand.get("outcome"),
+                    "chunk_id": citations[0].get("chunk_id"),
+                    "similarity": best_probe(cand),
+                    "ok": not diffs,
+                }
+            )
+        else:
+            diffs = diff_case(base, cand)
         classified = None
         if is_code is not None:
             classified = bool(is_code(cand["q"]))
@@ -883,12 +1007,19 @@ def evaluate_check(
         rows.append({"key": cand["key"], "q": cand["q"], "ok": not diffs, "classified_as_code": classified, "diffs": diffs})
     missing = sorted(set(by_key) - {case["key"] for case in candidate_cases})
     green = all(row["ok"] for row in rows) and not missing
+    calibration = [
+        {"key": cand["key"], "similarity": best_probe(cand), "outcome": cand.get("outcome")}
+        for cand in candidate_cases
+        if (best_probe(cand) or 0.0) >= CALIBRATION_SIMILARITY
+    ]
     return {
         "green": green,
         "fingerprint_ok": True,
         "classifier_checked": is_code is not None,
         "failed": [row["key"] for row in rows if not row["ok"]],
         "missing": missing,
+        "intended_changes": changes,
+        "calibration": calibration,
         "cases": rows,
     }
 
@@ -899,9 +1030,14 @@ def command_check(args: argparse.Namespace) -> int:
     inputs = load_private(private_dir(args.private_dir))
     guard = OpenAIGuard(allow_chat=False, allow_embed=False)
     store = EmbeddingStore(baseline.get("embeddings") or {}, replay=True)
-    from benchmark_cli import agent  # noqa: F401
+    from benchmark_cli import agent, contributions  # noqa: F401  (agent: load before patching)
 
     base_plans = {case["key"]: case.get("plan") for case in baseline["cases"]}
+    all_cases = inputs.non_code_cases()
+    # A build without the paraphrase tier (0caab09 self-check) gets plain identity everywhere.
+    tiered = getattr(contributions, "contribution_match", None) is not None
+    intended = intended_change_keys(all_cases) if tiered else []
+    shortcut_keys = [case.key for case in all_cases if case.extra.get("expect") == "saved_shortcut"]
     cases = []
     with guarded_openai(guard), patched_embeddings(store):
         fingerprint = corpus_fingerprint()
@@ -910,7 +1046,9 @@ def command_check(args: argparse.Namespace) -> int:
                 payload = base_plans.get(case.key)
                 plan = plan_from_dict(payload) if payload else stored_plan(case, "raw")
                 cases.append(run_offline_case(case, plan))
-    body = evaluate_check(baseline, cases, fingerprint=fingerprint, is_code=classifier())
+    body = evaluate_check(
+        baseline, cases, fingerprint=fingerprint, is_code=classifier(), intended=intended, shortcut_keys=shortcut_keys
+    )
     report = {
         "kind": "ask-regress-check",
         "created_at": datetime.now(UTC).isoformat(),
@@ -928,7 +1066,16 @@ def command_check(args: argparse.Namespace) -> int:
             print(f"FAIL {row['key']}: {row['q']}")
             for line in row["diffs"]:
                 print(f"    {line}")
-    if not report["fingerprint_ok"]:
+    print(f"paraphrase tier present: {tiered}; allow-listed changes: {len(report.get('intended_changes') or [])}")
+    for change in report.get("intended_changes") or []:
+        print(
+            f"  INTENDED {change['key']}: {change['q']} | {change['baseline_outcome']} -> "
+            f"{change['candidate_outcome']} chunk={change['chunk_id']} sim={change['similarity']} "
+            f"{'ok' if change['ok'] else 'FAIL'}"
+        )
+    for row in report.get("calibration") or []:
+        print(f"  CALIBRATION {row['key']}: best saved-question similarity {row['similarity']} outcome={row['outcome']}")
+    if report.get("message"):
         print(report["message"])
     print(f"check: {'GREEN' if report['green'] else 'RED'} ({len(report['failed'])} failed) -> {out}")
     return 0 if report["green"] else 1
@@ -1161,7 +1308,7 @@ def _sources(result: dict[str, Any]) -> list[str]:
 
 
 def score_saved(case: dict[str, Any], result: dict[str, Any]) -> tuple[bool, str]:
-    """``saved_shortcut``, ``cites_saved`` or ``not_saved``."""
+    """``saved_shortcut``, ``saved_paraphrase``, ``cites_saved``, ``not_saved`` or ``not_saved_shortcut``."""
     expect = case["expect"]
     prefix = case.get("source_prefix") or SAVED_PREFIX
     answer = str(result.get("answer") or "")
@@ -1172,6 +1319,16 @@ def score_saved(case: dict[str, Any], result: dict[str, Any]) -> tuple[bool, str
             return False, f"outcome {result.get('outcome')} is not user_contributed"
         ok = answered and cites_saved and answer.startswith("According to")
         return ok, "" if ok else "not answered from the saved row"
+    if expect == "saved_paraphrase":
+        if result.get("outcome") != PARAPHRASE_OUTCOME:
+            return False, f"outcome {result.get('outcome')} is not {PARAPHRASE_OUTCOME}"
+        if int(result.get("chat_calls") or 0) > 1:
+            return False, f"{result.get('chat_calls')} chat calls; only the plan call is allowed"
+        ok = answered and cites_saved and answer.startswith("According to ")
+        return ok, "" if ok else "not answered from the saved row"
+    if expect == "not_saved_shortcut":
+        ok = result.get("outcome") not in SAVED_OUTCOMES
+        return ok, "" if ok else f"outcome {result.get('outcome')} is a saved shortcut"
     if expect == "cites_saved":
         ok = answered and cites_saved
         return ok, "" if ok else "does not cite the saved row"
@@ -1410,7 +1567,7 @@ def command_live(args: argparse.Namespace) -> int:
     try:
         with guarded_openai(guard):
             if "saved" in groups:
-                for case in inputs.saved:
+                for case in (*inputs.saved, *inputs.paraphrase):
                     result = run_live_case(case.q, None, guard)
                     ok, why = score_saved(case.extra, result)
                     result.update({"key": case.key, "expect": case.extra["expect"], "passed": ok, "why": why})
@@ -1462,6 +1619,15 @@ def command_live(args: argparse.Namespace) -> int:
     return 0 if report["pass"] else 1
 
 
+def _is_paraphrase(item: dict[str, Any]) -> bool:
+    return str(item.get("key") or "").startswith("paraphrase:")
+
+
+def _passed_of(items: Iterable[dict[str, Any]]) -> str:
+    rows = list(items)
+    return f"{sum(item['passed'] for item in rows)}/{len(rows)}"
+
+
 def summarize_live(report: dict[str, Any], groups: Sequence[str]) -> dict[str, Any]:
     saved = report["saved"]
     names = report["names"]
@@ -1471,7 +1637,8 @@ def summarize_live(report: dict[str, Any], groups: Sequence[str]) -> dict[str, A
     suite_answered = sum(item["answered"] for item in suite)
     hijacks = sum(bool(item["hijack"]) for run in report["suite_runs"] for item in run)
     bar = {
-        "saved": f"{sum(item['passed'] for item in saved)}/{len(saved)}",
+        "saved": _passed_of(item for item in saved if not _is_paraphrase(item)),
+        "paraphrase": _passed_of(item for item in saved if _is_paraphrase(item)),
         "names": f"{sum(item['passed'] for item in names)}/{len(names)}",
         "code_original": f"{sum(item['passed'] for item in code_original)}/{len(code_original)}",
         "code_twelfth": [item["passed"] for item in code if not item["original"]],
