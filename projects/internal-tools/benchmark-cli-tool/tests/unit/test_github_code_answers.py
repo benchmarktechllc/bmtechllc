@@ -542,12 +542,16 @@ def test_rerank_caps_files_and_docs_and_prefers_code() -> None:
         results.append(HybridSearchResult(_github_chunk(1_000_000_100 + index, f"docs/d{index}.md", f"text {index}\n", symbol="", kind="doc"), 0.05))
     for index in range(3):
         results.append(HybridSearchResult(_github_chunk(1_000_000_200 + index, f"{_PKG}/same.py", f"x = {index}\n", symbol=""), 0.03))
-    chosen = rerank(results)
+    chosen = [result for result, _ in rerank(results)]
     paths = [chunk.chunk.metadata["path"] for chunk in chosen]
     assert sum(path.endswith(".md") for path in paths) == 2
     assert paths.count(f"{_PKG}/same.py") == 2
     assert chosen[0].chunk.metadata["kind"] == "code"
     assert len(rerank(results * 3)) <= 8
+
+
+def _identity_rows(chunks: list[SearchChunk]) -> list[tuple[str, str, str]]:
+    return [(str(c.metadata.get("path") or c.source_file), str(c.metadata.get("symbol") or ""), str(c.metadata.get("header_words") or "")) for c in chunks]
 
 
 def _lane_storage(monkeypatch: pytest.MonkeyPatch, chunks: list[SearchChunk], *, count: int = 10) -> dict[str, Any]:
@@ -565,6 +569,7 @@ def _lane_storage(monkeypatch: pytest.MonkeyPatch, chunks: list[SearchChunk], *,
     monkeypatch.setattr(github_answers, "github_vector_search", search("vector"))
     monkeypatch.setattr(github_answers, "github_fts_search", search("fts"))
     monkeypatch.setattr(github_answers, "github_header_search", search("header"))
+    monkeypatch.setattr(github_answers, "github_identity_rows", lambda _kinds: _identity_rows(chunks))
     return seen
 
 
@@ -913,3 +918,128 @@ def test_kiosk_database_question_does_not_answer_from_the_trello_card(monkeypatc
     assert seen["outcome"] == "code_abstained"
     assert response.status == "no_relevant_information"
     assert "Kiosk MVP" not in response.answer
+
+
+# --------------------------------------------------------------------------- lane ranking rules
+# Synthetic paths and words only ("zebra", "gadget"); no gate question or expected path appears here.
+
+_HOME = github_answers.HOME_PROJECT
+_OTHER = "projects/labs/gadget-helper"
+
+
+def _vocab(*chunks: SearchChunk, filler: int = 40) -> github_answers.LaneVocabulary:
+    """The chunks plus unrelated files, so document frequency behaves like a real index."""
+    rows = [(c.metadata["path"], c.metadata["symbol"], c.metadata["header_words"]) for c in chunks]
+    rows += [(f"{_HOME}/src/pkg/unrelated_{index}.py", f"helper_{index}", f"unrelated {index} helper") for index in range(filler)]
+    return github_answers.LaneVocabulary.from_rows(rows)
+
+
+def _ranked_paths(question: str, fused: list[HybridSearchResult], vocab: github_answers.LaneVocabulary) -> list[str]:
+    query = github_answers.LaneQuery.build(question, vocab)
+    return [result.chunk.metadata["path"] for result, _ in rerank(fused, query)]
+
+
+@pytest.mark.unit
+def test_stems_and_prefixes_join_word_forms() -> None:
+    stem = github_answers._stem
+    assert stem("ingestion") == stem("ingest") and stem("storage") == stem("store")
+    assert stem("matching") == stem("matches") and stem("chunks") == stem("chunking")
+    assert github_answers.terms_match(stem("configured"), stem("config"))
+    assert not github_answers.terms_match("run", "runner")  # short stems must match exactly
+    assert github_answers._stems("AddAnswerView.add_answer PRs") == ["add", "answ", "view", "add", "answ", "prs"]
+
+
+@pytest.mark.unit
+def test_rare_subject_term_outranks_a_common_one_with_better_fts() -> None:
+    """The file named for the rare word wins over files that share only the common word,
+    even when those files were higher in the FTS list."""
+    subject = _github_chunk(1_000_001_001, f"{_HOME}/src/pkg/zebra_sync.py", "x = 1\n", symbol="")
+    commons = [_github_chunk(1_000_001_010 + i, f"{_HOME}/src/pkg/loading/loader_{i}.py", "y = 1\n", symbol="load_rows") for i in range(6)]
+    vocab = _vocab(subject, *commons)
+    fused = [HybridSearchResult(chunk, 1.0 / (61 + rank)) for rank, chunk in enumerate(commons)]
+    fused.append(HybridSearchResult(subject, 1.0 / 70))
+    paths = _ranked_paths("where is the zebra loading code", fused, vocab)
+    assert paths[0] == subject.metadata["path"]
+
+
+@pytest.mark.unit
+def test_generic_code_words_earn_no_identity_credit() -> None:
+    generic = _github_chunk(1_000_001_101, ".github/workflows/code-files.yml", "on: push\n", symbol="", kind="workflow")
+    vocab = _vocab(generic)
+    query = github_answers.LaneQuery.build("which file has the code for the zebra", vocab)
+    assert set(query.terms) == {"zebra"}
+    assert query.lexical(generic) == 0.0
+
+
+@pytest.mark.unit
+def test_path_and_symbol_count_fully_and_defined_names_count_half() -> None:
+    by_path = _github_chunk(1_000_001_201, f"{_HOME}/src/pkg/zebra.py", "x = 1\n", symbol="")
+    by_symbol = _github_chunk(1_000_001_202, f"{_HOME}/src/pkg/other.py", "x = 1\n", symbol="ZebraClient")
+    by_name = _github_chunk(1_000_001_203, f"{_HOME}/src/pkg/settings.py", "ZEBRA_KEY = 1\n", symbol="", names=("ZEBRA_KEY",))
+    query = github_answers.LaneQuery.build("where is zebra", _vocab(by_path, by_symbol, by_name))
+    assert query.lexical(by_path) == query.lexical(by_symbol) == 1.0
+    assert query.lexical(by_name) == pytest.approx(github_answers.NAME_MATCH_WEIGHT)
+
+
+@pytest.mark.unit
+def test_header_list_adds_candidates_but_no_rrf_vote() -> None:
+    both = _github_chunk(1_000_001_301, f"{_HOME}/src/pkg/a.py", "a = 1\n", symbol="")
+    header_only = _github_chunk(1_000_001_302, f"{_HOME}/src/pkg/b.py", "b = 1\n", symbol="")
+    fused = github_answers.candidates([], [both], [both, header_only])
+    scores = {result.chunk.id: result.rrf_score for result in fused}
+    assert scores == {both.id: pytest.approx(1.0 / 61), header_only.id: 0.0}
+    assert next(r for r in fused if r.chunk.id == both.id).fts_score == both.score
+
+
+@pytest.mark.unit
+def test_home_project_is_the_default_scope_and_other_projects_are_down_weighted() -> None:
+    home = _github_chunk(1_000_001_401, f"{_HOME}/src/pkg/gizmo.py", "x = 1\n", symbol="")
+    other = _github_chunk(1_000_001_402, f"{_OTHER}/src/gizmo.py", "x = 1\n", symbol="")
+    workflow = _github_chunk(1_000_001_403, ".github/workflows/gizmo.yml", "on: push\n", symbol="", kind="workflow")
+    top_level = _github_chunk(1_000_001_404, "portal/src/gizmo.ts", "x\n", symbol="")
+    vocab = _vocab(home, other, workflow, top_level)
+    query = github_answers.LaneQuery.build("where is the gizmo", vocab)
+    assert query.scope_weight(home) == query.scope_weight(workflow) == 1.0
+    assert query.scope_weight(other) == query.scope_weight(top_level) == github_answers.OFF_SCOPE_WEIGHT
+    # Other project first in the vector list, home second: home still wins.
+    fused = [HybridSearchResult(other, 1.0 / 61), HybridSearchResult(home, 1.0 / 62)]
+    assert _ranked_paths("where is the gizmo", fused, vocab)[0] == home.metadata["path"]
+
+
+@pytest.mark.unit
+def test_naming_the_bot_scopes_home_and_naming_a_project_scopes_that_project() -> None:
+    home = _github_chunk(1_000_001_501, f"{_HOME}/src/pkg/gizmo.py", "x = 1\n", symbol="")
+    other = _github_chunk(1_000_001_502, f"{_OTHER}/src/gizmo.py", "x = 1\n", symbol="")
+    vocab = _vocab(home, other)
+    for question in ("how does the Ask bot store gizmos", "where does the bot keep gizmos", "how does Ask pick a gizmo"):
+        query = github_answers.LaneQuery.build(question, vocab)
+        assert _HOME in query.scope and _OTHER not in query.scope, question
+        assert not {"ask", "bot"} & set(query.terms), question  # scope words are not subject terms
+    query = github_answers.LaneQuery.build("where does the gadget helper store gizmos", vocab)
+    assert _OTHER in query.scope and _HOME not in query.scope and "" in query.scope
+    assert query.scope_weight(other) == 1.0 and query.scope_weight(home) == github_answers.OFF_SCOPE_WEIGHT
+    assert "gadget" not in query.terms and "gizmo" in query.terms
+    # "ask" as an ordinary verb does not name the bot.
+    assert github_answers.LaneQuery.build("where do we ask for gizmos", vocab).scope == frozenset({_HOME, ""})
+
+
+@pytest.mark.unit
+def test_project_of_maps_paths_to_projects() -> None:
+    assert github_answers.project_of(f"{_HOME}/src/x.py") == _HOME
+    assert github_answers.project_of(".github/workflows/x.yml") == ""
+    assert github_answers.project_of("README.md") == ""
+    assert github_answers.project_of("portal/src/x.ts") == "portal"
+
+
+@pytest.mark.unit
+def test_retrieve_code_reports_one_score_scale_in_rank_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    subject = _github_chunk(1_000_001_601, f"{_HOME}/src/pkg/zebra_sync.py", "x = 1\n", symbol="")
+    common = _github_chunk(1_000_001_602, ".github/workflows/zebra-free-loading.yml", "on: push\n", symbol="", kind="workflow")
+    _lane_storage(monkeypatch, [common, subject])
+    found = github_answers.retrieve_code("where is the zebra loading code")
+    assert len(found.ranking) == len(found.chunks)
+    scores = [parts["score"] for parts in found.ranking]
+    assert scores == sorted(scores, reverse=True)
+    for parts in found.ranking:
+        expected = parts["kind_weight"] * parts["scope"] * (parts["rrf"] + github_answers.LEXICAL_WEIGHT * parts["lexical"])
+        assert parts["score"] == pytest.approx(expected)

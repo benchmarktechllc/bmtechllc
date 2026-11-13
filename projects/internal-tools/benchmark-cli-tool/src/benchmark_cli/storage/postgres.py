@@ -1272,6 +1272,14 @@ def github_header_search(
     return _github_rows(statement, (query, list(kinds), limit))
 
 
+def github_identity_rows(kinds: Sequence[str] = GITHUB_LANE_KINDS) -> list[tuple[str, str, str]]:
+    """Distinct (path, symbol, header_words) of lane rows: the vocabulary the code lane ranks with."""
+    statement = "SELECT DISTINCT path, symbol, header_words FROM github_chunks WHERE kind = ANY(%s)"
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (list(kinds),))
+        return [(str(path), str(symbol or ""), str(words or "")) for path, symbol, words in cursor.fetchall()]
+
+
 def github_pull_rows() -> list[SearchChunk]:
     """Indexed pull-request chunks. Callers order them by merge time."""
     statement = f"""

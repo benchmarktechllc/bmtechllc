@@ -966,6 +966,7 @@ def forbidden_lane_chunk(chunk: Any) -> str | None:
 
 def evaluate_code_retrieval(case: dict[str, Any], retrieval: Any) -> dict[str, Any]:
     chunks = list(getattr(retrieval, "chunks", ()) or ())
+    ranking = list(getattr(retrieval, "ranking", ()) or ())
     rank = next(
         (index for index, chunk in enumerate(chunks, start=1) if path_matches(path_of(chunk), case["expect_paths"])),
         None,
@@ -981,9 +982,15 @@ def evaluate_code_retrieval(case: dict[str, Any], retrieval: Any) -> dict[str, A
         "gated": gated,
         "passed": (not gated or (rank is not None and rank <= CODE_RETRIEVAL_TOP)) and not forbidden,
         "forbidden": forbidden,
+        # "score" is the lane's own ranking score; the raw list scores (cosine, ts_rank) are its parts.
         "top": [
-            {"path": path_of(chunk), "kind": (chunk.metadata or {}).get("kind"), "symbol": (chunk.metadata or {}).get("symbol"), "score": chunk.score}
-            for chunk in chunks
+            {
+                "path": path_of(chunk),
+                "kind": (chunk.metadata or {}).get("kind"),
+                "symbol": (chunk.metadata or {}).get("symbol"),
+                **(ranking[index] if index < len(ranking) else {"score": None, "raw_score": chunk.score}),
+            }
+            for index, chunk in enumerate(chunks)
         ],
     }
 
@@ -1048,6 +1055,7 @@ def retrieval_to_dict(retrieval: Any) -> dict[str, Any]:
         "top_cosine": retrieval.top_cosine,
         "overlap": retrieval.overlap,
         "pulls": None if pulls is None else pulls.model_dump(),
+        "ranking": [dict(parts) for parts in getattr(retrieval, "ranking", ()) or ()],
     }
 
 
@@ -1062,6 +1070,7 @@ def retrieval_from_dict(payload: dict[str, Any]) -> Any:
         top_cosine=payload["top_cosine"],
         overlap=payload["overlap"],
         pulls=None if payload.get("pulls") is None else AnswerResponse(**payload["pulls"]),
+        ranking=tuple(payload.get("ranking") or ()),
     )
 
 

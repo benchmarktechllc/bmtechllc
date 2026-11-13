@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -19,13 +20,14 @@ from .config import MIN_COSINE_SIMILARITY
 from .llm import ModelQuotaError, call_llm_structured
 from .models import AnswerResponse, Citation
 from .providers.openai import embed_texts
-from .retrieval import HybridSearchResult, meaningful_keyword_overlap, rrf_fuse
+from .retrieval import RRF_K, HybridSearchResult, meaningful_keyword_overlap, rrf_fuse
 from .storage.postgres import (
     GITHUB_LANE_KINDS,
     SearchChunk,
     github_chunk_count,
     github_fts_search,
     github_header_search,
+    github_identity_rows,
     github_pull_rows,
     github_vector_search,
 )
@@ -174,9 +176,24 @@ LANE_LIMIT = 8
 PER_FILE_LIMIT = 2
 DOC_LIMIT = 2
 KIND_WEIGHTS = {"code": 1.0, "config": 1.0, "workflow": 1.0, "doc": 0.5}
-HOME_PREFIXES = ("projects/internal-tools/benchmark-cli-tool/", ".github/workflows/")
-HOME_WEIGHT = 1.25
+HOME_PROJECT = "projects/internal-tools/benchmark-cli-tool"
+ROOT_DIRS = frozenset({".github"})  # top-level directories that belong to no single project
 POINTER_MIN_HEADER_TOKENS = 2
+# Identity match (path, symbol, defined names) is added to RRF in RRF units: a chunk whose
+# identity covers every question term earns as much as two first-place votes.
+LEXICAL_WEIGHT = 2.0 / (RRF_K + 1)
+NAME_MATCH_WEIGHT = 0.5  # a defined name (a constant, an env var) says less than the path or symbol
+OFF_SCOPE_WEIGHT = 0.5  # chunks outside the project the question is about
+# The question names the Ask bot itself (the home project).
+HOME_ALIASES = re.compile(r"\b(?:[Aa]sk|BMTech|bmtech)\s+bot\b|\bthe\s+bot\b|\bAsk\b")
+# Words that say the question is about code, not which code. They match paths everywhere.
+_GENERIC_WORDS = (
+    "code codebase source-code file files function functions method methods class classes module modules "
+    "script scripts repo repository implemented implementation implement handle handles handled handling "
+    "defined define defines located locate live lives logic find part thing things done happen happens"
+)
+_EXTRA_STOPWORDS = "is be been being can could should would will we our us i my you your there here have has had did"
+_PROJECT_GENERIC = frozenset({"tool", "tools", "app", "project", "src"})
 
 _POINTER_QUESTION = re.compile(r"\bwhere\b|\bwhich\s+(file|workflow|module|function|script)\b", re.IGNORECASE)
 _TOKEN = re.compile(r"[a-z0-9]+")
@@ -196,6 +213,8 @@ class CodeRetrieval:
     top_cosine: float | None = None
     overlap: int = 0
     pulls: AnswerResponse | None = None
+    # One entry per chunk, same order: the lane score and its parts, for the offline gate.
+    ranking: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -214,20 +233,168 @@ def _kind(chunk: SearchChunk) -> str:
     return str((chunk.metadata or {}).get("kind") or "code")
 
 
-def rerank(fused: Sequence[HybridSearchResult]) -> list[HybridSearchResult]:
-    """RRF times kind weight times home-project weight, then per-file and doc caps."""
+# Ranking. Order = kind weight x project scope x (RRF of the vector and FTS lists + identity
+# match). The header list is a candidate source and the pointer check, not a third RRF vote:
+# FTS already weights header words at A, so a third vote counted the same path words twice and
+# let a chunk win on generic words. Identity match weights each question term by its rarity
+# among indexed files, so "trello" counts for more than "ingest".
 
-    def score(result: HybridSearchResult) -> float:
-        path = _path(result.chunk)
-        home = HOME_WEIGHT if path.startswith(HOME_PREFIXES) else 1.0
-        return result.rrf_score * KIND_WEIGHTS.get(_kind(result.chunk), 0.0) * home
+_CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z]{2})")  # "PRs" stays one word
+_WORD = re.compile(r"[a-z0-9]+")
+_SUFFIXES = ("ations", "ation", "ings", "ing", "ions", "ion", "ages", "age", "ers", "er", "ies", "es", "ed", "s", "e")
+MIN_PREFIX_MATCH = 4
 
-    ordered = sorted(fused, key=lambda result: (-score(result), result.chunk.id))
-    chosen: list[HybridSearchResult] = []
+
+def _stem(word: str) -> str:
+    """Crude suffix strip, applied the same way to questions and paths."""
+    for suffix in _SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)] + ("y" if suffix == "ies" else "")
+    return word
+
+
+def _stems(text: str) -> list[str]:
+    """camelCase, snake_case, kebab-case, and paths split into stemmed lower-case words."""
+    return [_stem(word) for word in _WORD.findall(_CAMEL.sub(" ", text or "").casefold())]
+
+
+_IGNORED_STEMS = frozenset(
+    _stem(word) for word in (*_STOPWORDS, *_EXTRA_STOPWORDS.split(), *_GENERIC_WORDS.replace("-", " ").split())
+)
+
+
+def terms_match(left: str, right: str) -> bool:
+    """Same stem, or one stem a prefix of the other (config/configur, embed/embedd)."""
+    if left == right:
+        return True
+    short, long = sorted((left, right), key=len)
+    return len(short) >= MIN_PREFIX_MATCH and long.startswith(short)
+
+
+def project_of(path: str) -> str:
+    """``projects/<group>/<name>``, another top-level directory (``portal``), or "" for
+    repository-root files and ``.github`` workflows, which serve every project."""
+    parts = path.split("/")
+    if parts[0] == "projects" and len(parts) > 3:
+        return "/".join(parts[:3])
+    if len(parts) == 1 or parts[0] in ROOT_DIRS:
+        return ""
+    return parts[0]
+
+
+def _identity(path: str, symbol: str, header: str) -> tuple[frozenset[str], frozenset[str]]:
+    """(path and symbol stems, defined-name stems). header_words is path + symbol + names."""
+    strong = frozenset(_stems(path)) | frozenset(_stems(symbol))
+    names = frozenset(_stem(word) for word in header.split()) - strong
+    return strong, names
+
+
+def _matches(term: str, words: frozenset[str]) -> bool:
+    return any(terms_match(term, word) for word in words)
+
+
+@dataclass(frozen=True)
+class LaneVocabulary:
+    """Per-file identity words of the indexed lane rows: document frequency and project names."""
+
+    files: Mapping[str, tuple[frozenset[str], frozenset[str]]]
+
+    @classmethod
+    def from_rows(cls, rows: Sequence[tuple[str, str, str]]) -> LaneVocabulary:
+        files: dict[str, tuple[frozenset[str], frozenset[str]]] = {}
+        for path, symbol, header in rows:
+            strong, names = _identity(path, symbol, header)
+            old_strong, old_names = files.get(path, (frozenset(), frozenset()))
+            files[path] = (old_strong | strong, old_names | names)
+        return cls(files)
+
+    def weight(self, term: str) -> float:
+        """Smoothed IDF over files; a term no file carries gets the largest weight."""
+        count = sum(1 for strong, names in self.files.values() if _matches(term, strong | names))
+        return math.log(1.0 + len(self.files) / (1.0 + count))
+
+    def projects(self) -> set[str]:
+        return {project for path in self.files if (project := project_of(path))}
+
+
+@dataclass(frozen=True)
+class LaneQuery:
+    """What the ranking reads from a question: weighted subject terms and the project scope."""
+
+    terms: Mapping[str, float]
+    scope: frozenset[str]
+
+    @classmethod
+    def build(cls, question: str, vocabulary: LaneVocabulary) -> LaneQuery:
+        stems = [stem for stem in _stems(question) if stem not in _IGNORED_STEMS and len(stem) > 1]
+        named: set[str] = set()
+        scope_words: set[str] = set()
+        for project in vocabulary.projects():
+            name = [stem for stem in _stems(project.rsplit("/", 1)[-1]) if stem not in _PROJECT_GENERIC]
+            hits = [word for word in name if any(terms_match(word, stem) for stem in stems)]
+            if name and len(hits) >= min(2, len(name)):
+                named.add(project)
+                scope_words.update(hits)
+        if HOME_ALIASES.search(question or ""):
+            named.add(HOME_PROJECT)
+            scope_words.update(_stems(" ".join(HOME_ALIASES.findall(question or ""))))
+        scope = (set(named) or {HOME_PROJECT}) | {""}
+        terms: dict[str, float] = {}
+        for stem in stems:
+            if stem not in scope_words and stem not in terms:
+                terms[stem] = vocabulary.weight(stem)
+        return cls(terms, frozenset(scope))
+
+    def lexical(self, chunk: SearchChunk) -> float:
+        """Share of the question's term weight found in the chunk's path, symbol, or names."""
+        total = sum(self.terms.values())
+        if total <= 0:
+            return 0.0
+        metadata = chunk.metadata or {}
+        strong, names = _identity(_path(chunk), str(metadata.get("symbol") or ""), str(metadata.get("header_words") or ""))
+        found = 0.0
+        for term, weight in self.terms.items():
+            if _matches(term, strong):
+                found += weight
+            elif _matches(term, names):
+                found += weight * NAME_MATCH_WEIGHT
+        return found / total
+
+    def scope_weight(self, chunk: SearchChunk) -> float:
+        return 1.0 if project_of(_path(chunk)) in self.scope else OFF_SCOPE_WEIGHT
+
+
+_NO_QUERY = LaneQuery({}, frozenset({HOME_PROJECT, ""}))
+
+
+def lane_score(result: HybridSearchResult, query: LaneQuery = _NO_QUERY) -> dict[str, Any]:
+    """The lane score of one candidate with its parts. Every part is on one scale (RRF units)."""
+    kind = KIND_WEIGHTS.get(_kind(result.chunk), 0.0)
+    lexical = query.lexical(result.chunk)
+    scope = query.scope_weight(result.chunk)
+    score = kind * scope * (result.rrf_score + LEXICAL_WEIGHT * lexical)
+    return {
+        "score": score,
+        "rrf": result.rrf_score,
+        "lexical": lexical,
+        "scope": scope,
+        "kind_weight": kind,
+        "vector": result.vector_score,
+        "fts": result.fts_score,
+    }
+
+
+def rerank(
+    fused: Sequence[HybridSearchResult], query: LaneQuery = _NO_QUERY
+) -> list[tuple[HybridSearchResult, dict[str, Any]]]:
+    """Order by ``lane_score``, then keep at most two chunks per file, two docs, eight in all."""
+    scored = [(result, lane_score(result, query)) for result in fused]
+    scored.sort(key=lambda item: (-item[1]["score"], item[0].chunk.id))
+    chosen: list[tuple[HybridSearchResult, dict[str, Any]]] = []
     per_file: dict[str, int] = {}
     docs = 0
-    for result in ordered:
-        if score(result) <= 0:
+    for result, parts in scored:
+        if parts["score"] <= 0:
             continue
         path = _path(result.chunk)
         if per_file.get(path, 0) >= PER_FILE_LIMIT:
@@ -237,14 +404,37 @@ def rerank(fused: Sequence[HybridSearchResult]) -> list[HybridSearchResult]:
                 continue
             docs += 1
         per_file[path] = per_file.get(path, 0) + 1
-        chosen.append(result)
+        chosen.append((result, parts))
         if len(chosen) >= LANE_LIMIT:
             break
     return chosen
 
 
+def candidates(
+    vector_hits: Sequence[SearchChunk], fts_hits: Sequence[SearchChunk], header_hits: Sequence[SearchChunk]
+) -> list[HybridSearchResult]:
+    """RRF of the vector and FTS lists, plus header-only hits at zero RRF (identity match ranks them)."""
+    vector_scores = {chunk.id: chunk.score for chunk in vector_hits}
+    fts_scores = {chunk.id: chunk.score for chunk in fts_hits}
+    fused = rrf_fuse((vector_hits, fts_hits))
+    seen = {result.chunk.id for result in fused}
+    for chunk in header_hits:
+        if chunk.id not in seen:
+            seen.add(chunk.id)
+            fused.append(HybridSearchResult(chunk, 0.0))
+    return [
+        HybridSearchResult(
+            result.chunk,
+            result.rrf_score,
+            vector_score=vector_scores.get(result.chunk.id),
+            fts_score=fts_scores.get(result.chunk.id),
+        )
+        for result in fused
+    ]
+
+
 def retrieve_code(question: str) -> CodeRetrieval:
-    """Vector, FTS, and header lists over github_chunks, fused and reranked to eight chunks."""
+    """Vector, FTS, and header lists over github_chunks, ranked to eight chunks."""
     if asks_for_recent_pulls(question):
         pulls = recent_pulls_answer(github_pull_rows())
         return CodeRetrieval(status="pulls", pulls=pulls)
@@ -252,18 +442,9 @@ def retrieve_code(question: str) -> CodeRetrieval:
     vector_hits = github_vector_search(vector, VECTOR_LIMIT, GITHUB_LANE_KINDS)
     fts_hits = github_fts_search(question, FTS_LIMIT, GITHUB_LANE_KINDS)
     header_hits = github_header_search(question, HEADER_LIMIT, GITHUB_LANE_KINDS)
-    vector_scores = {chunk.id: chunk.score for chunk in vector_hits}
-    fts_scores = {chunk.id: chunk.score for chunk in fts_hits}
-    fused = [
-        HybridSearchResult(
-            result.chunk,
-            result.rrf_score,
-            vector_score=vector_scores.get(result.chunk.id),
-            fts_score=fts_scores.get(result.chunk.id),
-        )
-        for result in rrf_fuse((vector_hits, fts_hits, header_hits))
-    ]
-    chosen = rerank(fused)
+    query = LaneQuery.build(question, LaneVocabulary.from_rows(github_identity_rows(GITHUB_LANE_KINDS)))
+    ranked = rerank(candidates(vector_hits, fts_hits, header_hits), query)
+    chosen = [result for result, _ in ranked]
     top_cosine = max(
         (result.vector_score for result in chosen if result.vector_score is not None), default=None
     )
@@ -275,6 +456,7 @@ def retrieve_code(question: str) -> CodeRetrieval:
         header_ids=tuple(chunk.id for chunk in header_hits),
         top_cosine=top_cosine,
         overlap=overlap,
+        ranking=tuple(parts for _, parts in ranked),
     )
 
 

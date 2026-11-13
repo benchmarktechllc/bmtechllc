@@ -489,6 +489,7 @@ def test_code_retrieval_record_and_replay_run_offline(monkeypatch: pytest.Monkey
     for name in ("github_vector_search", "github_fts_search", "github_header_search"):
         monkeypatch.setattr(github_answers, name, lambda _q, limit, _kinds: lane[:limit])
     monkeypatch.setattr(github_answers, "github_pull_rows", lambda: [])
+    monkeypatch.setattr(github_answers, "github_identity_rows", lambda _kinds: [(c.metadata["path"], c.metadata["symbol"], c.metadata["header_words"]) for c in lane])
     drafts = iter([AnswerResponse(status="answered", answer="sync_board", confidence=0.8, citations=[Citation(source_file=lane[0].source_file, chunk_id=lane[0].id, content_sha256="d" * 64, quote="not in the chunk")])])
     monkeypatch.setattr(github_answers, "call_llm_structured", lambda **_k: next(drafts, None) or AnswerResponse(status="no_relevant_information", answer="No.", confidence=0.0, citations=[]))
 
