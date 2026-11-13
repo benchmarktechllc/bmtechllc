@@ -39,7 +39,7 @@ benchmark-acceptance = "benchmark_cli.acceptance:main"
 [tool.pytest.ini_options]
 addopts = "-m 'not integration_live'"
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = [".", "src"]
 markers = [
   "unit: deterministic isolated tests",
   "integration: tests requiring a local PostgreSQL service",
