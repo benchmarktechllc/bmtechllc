@@ -658,14 +658,16 @@ def test_lane_retries_once_then_uses_the_pointer_for_a_where_question() -> None:
 
 
 @pytest.mark.unit
-def test_pointer_needs_a_where_question_and_a_header_match() -> None:
+def test_pointer_needs_a_where_question_and_a_strong_identity_match() -> None:
     chunk = _github_chunk()
-    strong = CodeRetrieval("accepted", (chunk,), (chunk.id,), 0.6, 2)
+    strong = CodeRetrieval("accepted", (chunk,), (chunk.id,), 0.6, 2, ranking=({"lexical": 1.0},))
     assert pointer_answer("where is the trello sync code", strong) is not None
     assert pointer_answer("what does trello sync do", strong) is None
-    assert pointer_answer("where is the kiosk code", strong) is None
-    other_top = CodeRetrieval("accepted", (chunk,), (999,), 0.6, 2)
-    assert pointer_answer("where is the trello sync code", other_top) is None
+    assert pointer_answer("which workflow runs trello sync", strong) is None
+    weak = CodeRetrieval("accepted", (chunk,), (chunk.id,), 0.6, 2, ranking=({"lexical": 0.73},))
+    assert pointer_answer("where is the kiosk code", weak) is None
+    assert pointer_answer("where is the kiosk code", weak, cited_id=chunk.id) is not None
+    assert pointer_answer("where is the kiosk code", weak, cited_id=999) is None
 
 
 @pytest.mark.unit

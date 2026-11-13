@@ -178,7 +178,6 @@ DOC_LIMIT = 2
 KIND_WEIGHTS = {"code": 1.0, "config": 1.0, "workflow": 1.0, "doc": 0.5}
 HOME_PROJECT = "projects/internal-tools/benchmark-cli-tool"
 ROOT_DIRS = frozenset({".github"})  # top-level directories that belong to no single project
-POINTER_MIN_HEADER_TOKENS = 2
 # Identity match (path, symbol, defined names) is added to RRF in RRF units: a chunk whose
 # identity covers every question term earns as much as two first-place votes.
 LEXICAL_WEIGHT = 2.0 / (RRF_K + 1)
@@ -196,7 +195,6 @@ _EXTRA_STOPWORDS = "is be been being can could should would will we our us i my 
 _PROJECT_GENERIC = frozenset({"tool", "tools", "app", "project", "src"})
 
 _POINTER_QUESTION = re.compile(r"\bwhere\b|\bwhich\s+(file|workflow|module|function|script)\b", re.IGNORECASE)
-_TOKEN = re.compile(r"[a-z0-9]+")
 _STOPWORDS = frozenset(
     "a an and are as at by do does for from how in is it of on or the to what when where which who "
     "with use uses used this that".split()
@@ -525,12 +523,42 @@ def draft_code_answer(messages: list[dict[str, Any]]) -> AnswerResponse | None:
         return None
 
 
+MIN_SALVAGE_CHARS = 20
+_ESCAPES = {"\\n": "\n", "\\t": "\t", '\\"': '"'}
+
+
+def _unescape(quote: str) -> str:
+    """Undo JSON escapes the model copied from the chunk payload (``\\n``, ``\\t``, ``\\"``)."""
+    for escaped, plain in _ESCAPES.items():
+        quote = quote.replace(escaped, plain)
+    return quote
+
+
+def _find_quote(quote: str, ordered: Sequence[SearchChunk]) -> tuple[SearchChunk, str] | None:
+    from .agent import _exact_quote_variant
+
+    for chunk in ordered:
+        exact = _exact_quote_variant(quote, chunk.chunk_text)
+        if exact is not None and exact.strip():
+            return chunk, exact
+    return None
+
+
+def _verbatim_line(quote: str, chunk: SearchChunk) -> str | None:
+    """The longest quote line (at least 20 non-space characters) found verbatim in ``chunk``."""
+    lines = [line.strip() for line in quote.splitlines()]
+    kept = [
+        line
+        for line in lines
+        if len("".join(line.split())) >= MIN_SALVAGE_CHARS and line in chunk.chunk_text
+    ]
+    return max(kept, key=len, default=None)
+
+
 def validate_code_answer(
     response: AnswerResponse | None, chunks: Sequence[SearchChunk]
 ) -> tuple[AnswerResponse | None, list[str]]:
     """Lane-local checks. Returns the cleaned answer or None, plus every rejection reason."""
-    from .agent import _exact_quote_variant
-
     reasons: list[str] = []
     if response is None:
         return None, ["no draft"]
@@ -544,12 +572,12 @@ def validate_code_answer(
             reasons.append(f"citation {citation.chunk_id} is not a lane chunk")
             continue
         ordered = [cited, *(chunk for chunk in chunks if chunk.id != cited.id)]
-        match: tuple[SearchChunk, str] | None = None
-        for chunk in ordered:
-            exact = _exact_quote_variant(citation.quote, chunk.chunk_text)
-            if exact is not None and exact.strip():
-                match = (chunk, exact)
-                break
+        match = _find_quote(citation.quote, ordered) or _find_quote(_unescape(citation.quote), ordered)
+        if match is None:
+            line = _verbatim_line(_unescape(citation.quote), cited)
+            if line is not None:
+                reasons.append(f"quote for {citation.chunk_id} kept one verbatim line")
+                match = (cited, line)
         if match is None:
             reasons.append(f"quote for {citation.chunk_id} matches no lane chunk")
             continue
@@ -581,43 +609,82 @@ def validate_code_answer(
     return response.model_copy(update={"answer": answer, "citations": citations}), reasons
 
 
-def _question_tokens(question: str) -> set[str]:
-    return {token for token in _TOKEN.findall(question.casefold()) if token not in _STOPWORDS and len(token) > 1}
+POINTER_MIN_LEXICAL = 0.8
+_NAMED_KIND = (
+    ("workflow", re.compile(r"\b(workflows?|cron|schedul\w*)\b", re.IGNORECASE)),
+    ("config", re.compile(r"\b(migrations?|config|configuration)\b", re.IGNORECASE)),
+)
 
 
-def pointer_answer(question: str, retrieval: CodeRetrieval) -> AnswerResponse | None:
-    """A deterministic "closest match" for where/which-file questions with a strong header hit."""
-    if not _POINTER_QUESTION.search(question) or not retrieval.chunks or not retrieval.header_ids:
+def _named_kind(question: str) -> str | None:
+    """``workflow`` or ``config`` when the question names that kind of file, else None."""
+    return next((kind for kind, pattern in _NAMED_KIND if pattern.search(question)), None)
+
+
+def _lexical(retrieval: CodeRetrieval, index: int) -> float:
+    ranking = retrieval.ranking
+    return float(ranking[index].get("lexical") or 0.0) if index < len(ranking) else 0.0
+
+
+def _strong_index(retrieval: CodeRetrieval, kind: str) -> int | None:
+    """Rank of the first lane chunk of ``kind`` whose identity covers the question (lexical >= 0.8)."""
+    for index, chunk in enumerate(retrieval.chunks):
+        if _kind(chunk) == kind and _lexical(retrieval, index) >= POINTER_MIN_LEXICAL:
+            return index
+    return None
+
+
+def _pointer(chunk: SearchChunk) -> tuple[str, Citation] | None:
+    """The "Closest match" path line and its first-line citation."""
+    first_line = chunk.chunk_text.splitlines()[0].strip() if chunk.chunk_text.strip() else ""
+    if not chunk.content_sha256 or not first_line:
         return None
-    top = retrieval.chunks[0]
-    if retrieval.header_ids[0] != top.id:
-        return None
-    header = set(str((top.metadata or {}).get("header_words") or "").split())
-    if len(_question_tokens(question) & header) < POINTER_MIN_HEADER_TOKENS:
-        return None
-    if not top.content_sha256:
-        return None
-    first_line = top.chunk_text.splitlines()[0].strip() if top.chunk_text.strip() else ""
-    if not first_line:
-        return None
-    metadata = top.metadata or {}
+    metadata = chunk.metadata or {}
     symbol = str(metadata.get("symbol") or "")
     label = f" ({symbol})" if symbol else ""
-    answer = (
-        f"Closest match: `{_path(top)}` lines {metadata.get('start_line')}–{metadata.get('end_line')}{label}"
+    line = f"Closest match: `{_path(chunk)}` lines {metadata.get('start_line')}–{metadata.get('end_line')}{label}"
+    citation = Citation(
+        source_file=chunk.source_file, chunk_id=chunk.id, content_sha256=chunk.content_sha256, quote=first_line
     )
-    return AnswerResponse(
-        status="answered",
-        answer=answer,
-        confidence=0.4,
-        citations=[
-            Citation(
-                source_file=top.source_file,
-                chunk_id=top.id,
-                content_sha256=top.content_sha256,
-                quote=first_line,
-            )
-        ],
+    return line, citation
+
+
+def pointer_answer(question: str, retrieval: CodeRetrieval, cited_id: int | None = None) -> AnswerResponse | None:
+    """A deterministic "closest match" for where/which-file questions.
+
+    The target is the lane chunk a failed draft cited, else the first chunk of the wanted kind
+    whose identity covers the question. Otherwise None."""
+    if not _POINTER_QUESTION.search(question) or not retrieval.chunks:
+        return None
+    lane = {chunk.id: chunk for chunk in retrieval.chunks}
+    target = lane.get(cited_id) if cited_id is not None else None
+    if target is None:
+        index = _strong_index(retrieval, _named_kind(question) or "code")
+        target = None if index is None else retrieval.chunks[index]
+    pointer = None if target is None else _pointer(target)
+    if pointer is None:
+        return None
+    line, citation = pointer
+    return AnswerResponse(status="answered", answer=line, confidence=0.4, citations=[citation])
+
+
+def prefer_source(question: str, response: AnswerResponse, retrieval: CodeRetrieval) -> AnswerResponse:
+    """Lead with a strong code chunk when a kind-free pointer answer cites only workflows or config."""
+    if not _POINTER_QUESTION.search(question) or _named_kind(question) is not None:
+        return response
+    rank = {chunk.id: index for index, chunk in enumerate(retrieval.chunks)}
+    cited = [rank[citation.chunk_id] for citation in response.citations if citation.chunk_id in rank]
+    if not cited or any(_kind(retrieval.chunks[index]) == "code" for index in cited):
+        return response
+    index = _strong_index(retrieval, "code")
+    if index is None or index >= min(cited):
+        return response
+    pointer = _pointer(retrieval.chunks[index])
+    if pointer is None:
+        return response
+    line, citation = pointer
+    return response.model_copy(
+        update={"answer": f"{line}\n\n{response.answer}", "citations": [citation, *response.citations]}
     )
 
 
@@ -638,15 +705,28 @@ def answer_from_retrieval(
     first = draft(messages)
     checked, reasons = validate_code_answer(first, retrieval.chunks)
     attempts = 1
+    drafts = [first]
     if checked is None and first is not None and first.status == "answered":
         retry_messages = [*messages, {"role": "system", "content": CODE_RETRY_PROMPT + "\n" + "\n".join(reasons)}]
         second = draft(retry_messages)
+        drafts.append(second)
         attempts = 2
         checked, retry_reasons = validate_code_answer(second, retrieval.chunks)
         reasons = [*reasons, *(f"retry: {item}" for item in retry_reasons)]
     if checked is not None:
+        checked = prefer_source(question, checked, retrieval)
         return CodeAnswer(append_github_links(checked, evidence), "code_answered", attempts, tuple(reasons))
-    pointer = pointer_answer(question, retrieval)
+    cited_id = next(
+        (
+            citation.chunk_id
+            for item in drafts
+            if item is not None and item.status == "answered"
+            for citation in item.citations
+            if citation.chunk_id in evidence
+        ),
+        None,
+    )
+    pointer = pointer_answer(question, retrieval, cited_id)
     if pointer is not None:
         return CodeAnswer(append_github_links(pointer, evidence), "code_pointer", attempts, tuple(reasons))
     return CodeAnswer(_no_information(), "code_abstained", attempts, tuple(reasons))
