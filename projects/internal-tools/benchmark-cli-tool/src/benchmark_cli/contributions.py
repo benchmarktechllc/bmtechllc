@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import re
+from dataclasses import dataclass
 from datetime import datetime
 
 from .ingestion.clean import redact_secrets
@@ -202,26 +203,188 @@ def _saved_body(chunk_text: str) -> tuple[str, str]:
     return body or quote, quote
 
 
-def contribution_answer(question: str, results: object) -> object | None:
-    """Use a saved answer only when its question matches the one just asked.
+# Second tier: same question signature (type, synonym classes, remaining words in
+# order) plus a low cosine floor. The floor is only a backstop; the signature decides.
+PARAPHRASE_MIN_SIMILARITY = 0.40
 
-    Matching is exact after normalization, or a question-to-question cosine of
-    at least ``QUESTION_MATCH_SIMILARITY``. Chunk rank is not a match. No model call.
+_COUNT_PHRASE = re.compile(
+    r"\bhow (?:many|big|large)\b|\b(?:number|count|size) of\b|\bhead ?count\b|\b(?:team|staff) size\b"
+)
+_COUNT_IMPLIES_PEOPLE = re.compile(r"\bhead ?count\b|\b(?:team|staff) size\b")
+_POLITE = re.compile(
+    r"^(?:(?:hey|hi|hello|ok|okay|so|please|quick question)[,:!]?\s+)+"
+    r"|\b(?:(?:can|could) you (?:please )?tell me|do you know|tell me|remind me)\b"
+)
+_FILLER = re.compile(
+    r"\b(?:are|is) there\b|\bthere (?:are|is)\b|\bright now\b|\bat the moment\b|\bat present\b"
+    r"|\bas of (?:now|today)\b|\bthese days\b|\bin total\b"
+)
+_QTYPE = {
+    "who": "who", "whom": "who", "whose": "who", "what": "what", "which": "what",
+    "when": "when", "where": "where", "why": "why", "how": "how",
+}  # fmt: skip
+_YES_NO = frozenset("is are am do does did can could will would should has have had any".split())
+_COMPANY = frozenset("bmtech benchmark benchmarktech we our us company".split())
+_PEOPLE = frozenset(
+    "employee employees people person persons staff staffer staffers member members teammate "
+    "teammates worker workers headcount ppl folks colleagues coworkers personnel".split()
+)
+_EMPLOYED = frozenset("work works working employ employs employed".split())
+_STOP = frozenset(
+    "a an the is are am do does have has got at in on of for to with by currently current now "
+    "today presently total altogether exactly please".split()
+)
+_COUNT_WORDS = frozenset("what which how many big large".split())
+_TYPO_TARGETS = {
+    "company": ("bmtech", "benchmarktech"),
+    "people": ("employee", "employees", "people", "members", "headcount", "teammates"),
+}
+_NOT_TYPOS = frozenset("employer employers employed".split())
+
+
+def _typo_of(token: str, word: str) -> bool:
+    """One edit or one adjacent swap, same first letter, five letters or more."""
+    if len(token) < 5 or token[0] != word[0] or token in _NOT_TYPOS or abs(len(token) - len(word)) > 1:
+        return False
+    if len(token) == len(word):
+        diff = [i for i, (a, b) in enumerate(zip(token, word, strict=True)) if a != b]
+        if len(diff) == 1:
+            return True
+        return (
+            len(diff) == 2
+            and diff[1] == diff[0] + 1
+            and token[diff[0]] == word[diff[1]]
+            and token[diff[1]] == word[diff[0]]
+        )
+    short, long_ = (token, word) if len(token) < len(word) else (word, token)
+    return any(long_[:i] + long_[i + 1 :] == short for i in range(len(long_)))
+
+
+def _token_class(token: str, qtype: str) -> str:
+    if token in _STOP or token in _COMPANY:
+        return "drop"
+    if token in _PEOPLE or (qtype == "count" and token == "team"):
+        return "people"
+    if token in _EMPLOYED:
+        return "employed"
+    for name, words in _TYPO_TARGETS.items():
+        if any(_typo_of(token, word) for word in words):
+            return "drop" if name == "company" else name
+    return "term"
+
+
+def question_signature(text: str) -> tuple[str, frozenset[str], tuple[str, ...]] | None:
+    """Question type, synonym classes, and the remaining words in order.
+
+    Unknown words stay terms, so an extra word (a scope, a tense, a different noun)
+    always blocks a match. Company words are dropped: company scope is the default.
     """
-    from .models import AnswerResponse, Citation
+    folded = text.casefold().replace("\u2019", "'").replace("\u2018", "'")
+    folded = re.sub(r"\b(what|who|how|where|when|why)'s\b", r"\1 is", folded)
+    folded = re.sub(r"'s\b", "", folded)
+    folded = re.sub(r"\bbm[\s-]tech\b|\bbench ?mark[\s-]?tech\b", "bmtech", folded)
+    folded = _POLITE.sub(" ", folded)
+    classes: set[str] = set()
+    qtype = None
+    if _COUNT_PHRASE.search(folded):
+        qtype = "count"
+        if _COUNT_IMPLIES_PEOPLE.search(folded):
+            classes.add("people")
+        folded = _COUNT_PHRASE.sub(" ", folded)
+    folded = _FILLER.sub(" ", folded)
+    tokens = re.findall(r"#?[a-z0-9]+(?:[-_][a-z0-9]+)*", folded)
+    if qtype is None:
+        for index, token in enumerate(tokens):
+            if token in _QTYPE or token in _YES_NO:
+                qtype = _QTYPE.get(token, "yes_no")
+                del tokens[index]
+                break
+    if qtype is None:
+        return None
+    terms: list[str] = []
+    employed: list[str] = []
+    for token in tokens:
+        if qtype == "count" and token in _COUNT_WORDS:
+            continue
+        kind = _token_class(token, qtype)
+        if kind == "drop":
+            continue
+        if kind == "people":
+            classes.add("people")
+        elif kind == "employed":
+            employed.append(token)
+        else:
+            plural = len(token) > 4 and token.endswith("s") and not token.endswith("ss")
+            terms.append(token[:-1] if plural else token)
+    if not (qtype == "count" and "people" in classes):
+        terms.extend(employed)  # "work" is filler only in a headcount question
+    return (qtype, frozenset(classes), tuple(terms))
 
+
+def same_question(asked: str, saved: str) -> bool:
+    left, right = question_signature(asked), question_signature(saved)
+    return left is not None and left == right and bool(left[1] or left[2])
+
+
+@dataclass(frozen=True, slots=True)
+class ContributionMatch:
+    response: object  # AnswerResponse
+    tier: str  # "exact" | "paraphrase"
+    chunk_id: int
+    similarity: float | None  # None for a normalised-equal match
+
+
+def contribution_match(
+    question: str, results: object, *, allow_paraphrase: bool = False
+) -> ContributionMatch | None:
+    """Pick a saved answer whose question matches the one just asked. No model call.
+
+    Tier 1 (``exact``): equal after normalization, or a question-to-question cosine of
+    at least ``QUESTION_MATCH_SIMILARITY``. Tier 2 (``paraphrase``, only when
+    ``allow_paraphrase``): equal ``question_signature`` and a cosine of at least
+    ``PARAPHRASE_MIN_SIMILARITY``. Any tier-1 match wins. Chunk rank is not a match.
+    The similarity calls are the same, in the same order, as tier 1 alone.
+    """
     hits = [result for result in results or () if _is_contribution(result)]
     if not hits:
         return None
     asked = normalize_question(question)
-    matched = []
+    exact: list[tuple[object, float | None]] = []
+    loose: list[tuple[object, float | None]] = []
     for hit in hits:
         saved = _stored_question(hit)
-        if normalize_question(saved) == asked or question_similarity(question, saved) >= QUESTION_MATCH_SIMILARITY:
-            matched.append(hit)
+        if normalize_question(saved) == asked:
+            exact.append((hit, None))
+            continue
+        similarity = question_similarity(question, saved)
+        if similarity >= QUESTION_MATCH_SIMILARITY:
+            exact.append((hit, similarity))
+        elif (
+            allow_paraphrase
+            and similarity >= PARAPHRASE_MIN_SIMILARITY
+            and same_question(question, saved)
+        ):
+            loose.append((hit, similarity))
+    tier, matched = ("exact", exact) if exact else ("paraphrase", loose)
     if not matched:
         return None
-    chosen = max(matched, key=lambda hit: (_when(hit), hit.chunk.id))
+    chosen, similarity = max(matched, key=lambda item: (_when(item[0]), item[0].chunk.id))
+    response = _saved_response(chosen)
+    if response is None:
+        return None
+    return ContributionMatch(response, tier, chosen.chunk.id, similarity)
+
+
+def contribution_answer(question: str, results: object) -> object | None:
+    """Use a saved answer only when its question matches the one just asked (tier 1 only)."""
+    match = contribution_match(question, results)
+    return None if match is None else match.response
+
+
+def _saved_response(chosen: object) -> object | None:
+    """The saved answer, attributed and quoted, as a response with one citation."""
+    from .models import AnswerResponse, Citation
+
     metadata = chosen.chunk.metadata or {}
     name = str(metadata.get("author_name") or "a teammate")
     when = str(metadata.get("date") or _when(chosen))[:10]

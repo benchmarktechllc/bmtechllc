@@ -10,7 +10,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from typing import Any
 
-from .contributions import contribution_answer
+from .contributions import contribution_match
 from .github_answers import answer_code_question, is_code_question
 from .grounding import (
     ANSWER_PATH_REVISION,
@@ -963,10 +963,26 @@ def run_agent(
                 for result in decision.results
             ),
         )
-    contributed = contribution_answer(question, () if decision is None else decision.results)
-    if contributed is not None:
-        _log_retrieval("user_contributed", decision)
-        return _finish(contributed, outcome="user_contributed", synthesis_attempts=0)
+    starter = " ".join((thread_question or "").split())
+    paraphrase_ok = (
+        not plan.person
+        and (not starter or starter == raw_question)
+        and not asks_for_core_team(question)
+        and not asks_for_synced_channels(question)
+        and not asks_for_portal_link(question)
+        and not asks_for_trello_board_link(question)
+        and requested_trello_list(question) is None
+        and bare_list_name(question) is None
+        and not board_question(question, thread_question)
+        and not is_code_question(question)
+    )
+    match = contribution_match(
+        question, () if decision is None else decision.results, allow_paraphrase=paraphrase_ok
+    )
+    if match is not None:
+        outcome = "user_contributed" if match.tier == "exact" else "user_contributed_paraphrase"
+        _log_retrieval(outcome, decision)
+        return _finish(match.response, outcome=outcome, synthesis_attempts=0)
     if asks_for_synced_channels(question):
         try:
             channels = _synced_channels()
