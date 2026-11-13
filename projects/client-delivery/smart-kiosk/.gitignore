@@ -1,5 +1,7 @@
 node_modules/
 dist/
+.vite/
+apps/kiosk-client/src/assets/menu-figma-card-*.png
 coverage/
 playwright-report/
 test-results/

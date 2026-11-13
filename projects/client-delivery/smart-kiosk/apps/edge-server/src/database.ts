@@ -161,6 +161,26 @@ const schema = `
     queue_status TEXT NOT NULL,
     queued_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS kiosk_events (
+    event_id TEXT PRIMARY KEY,
+    store_id TEXT NOT NULL REFERENCES stores(store_id),
+    terminal_id TEXT NOT NULL REFERENCES kiosk_terminals(terminal_id),
+    event_type TEXT NOT NULL,
+    context_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS kiosk_events_by_type_time ON kiosk_events(event_type, created_at);
+  CREATE TABLE IF NOT EXISTS staff_audit_log (
+    audit_id TEXT PRIMARY KEY,
+    store_id TEXT NOT NULL REFERENCES stores(store_id),
+    actor_id TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS staff_audit_log_by_time ON staff_audit_log(created_at DESC);
 `;
 
 export function openDatabase(path: string): DatabaseSync {
@@ -189,6 +209,28 @@ function ensureAdditiveColumns(db: DatabaseSync): void {
   if (!orderColumns.some((column) => column.name === 'discount_amount_minor')) {
     db.exec('ALTER TABLE orders ADD COLUMN discount_amount_minor INTEGER NOT NULL DEFAULT 0');
   }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS kiosk_events (
+      event_id TEXT PRIMARY KEY,
+      store_id TEXT NOT NULL REFERENCES stores(store_id),
+      terminal_id TEXT NOT NULL REFERENCES kiosk_terminals(terminal_id),
+      event_type TEXT NOT NULL,
+      context_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS kiosk_events_by_type_time ON kiosk_events(event_type, created_at);
+    CREATE TABLE IF NOT EXISTS staff_audit_log (
+      audit_id TEXT PRIMARY KEY,
+      store_id TEXT NOT NULL REFERENCES stores(store_id),
+      actor_id TEXT NOT NULL,
+      action_type TEXT NOT NULL,
+      target_type TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      details_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS staff_audit_log_by_time ON staff_audit_log(created_at DESC);
+  `);
 }
 
 function seedDatabase(db: DatabaseSync): void {
@@ -204,10 +246,11 @@ function seedDatabase(db: DatabaseSync): void {
   ).run('register-kiosk-01', 'store-demo-001', 'REGISTER_KIOSK_01');
 
   const categories = [
-    ['category-breakfast', 'Breakfast', 1],
-    ['category-burgers', 'Burgers', 2],
-    ['category-sides', 'Sides', 3],
-    ['category-drinks', 'Drinks', 4]
+    ['category-burgers', 'Burgers', 1],
+    ['category-sides', 'Sides', 2],
+    ['category-shakes', 'Shakes', 3],
+    ['category-drinks', 'Sodas', 4],
+    ['category-pizzas', 'Pizzas', 5]
   ];
   for (const category of categories) {
     db.prepare(
@@ -215,17 +258,59 @@ function seedDatabase(db: DatabaseSync): void {
     ).run(...category);
   }
 
+  for (const category of categories) {
+    db.prepare('UPDATE menu_categories SET category_name = ?, display_order = ? WHERE category_id = ?').run(category[1]!, category[2]!, category[0]!);
+  }
+
   db.prepare('UPDATE menu_items SET category_id = ? WHERE menu_item_id = ?').run('category-burgers', 'item-burger');
 
   const items = [
-    ['item-breakfast-wrap', 'category-breakfast', 'Breakfast Wrap', 'BRK-WRAP', 650],
     ['item-burger', 'category-burgers', 'Classic Burger', 'LUNCH-BURGER', 825],
     ['item-truffle-burger', 'category-burgers', 'Truffle Bistro Burger', 'BURGER-TRUFFLE', 1650],
     ['item-double-smash-burger', 'category-burgers', 'Double Smash Burger', 'BURGER-DOUBLE', 1295],
+    ['item-bacon-bbq-burger', 'category-burgers', 'Bacon BBQ Burger', 'BURGER-BACON-BBQ', 1095],
+    ['item-jalapeno-pepper-jack-burger', 'category-burgers', 'Jalapeño Pepper Jack Burger', 'BURGER-JALAPENO-JACK', 1075],
+    ['item-mushroom-swiss-burger', 'category-burgers', 'Mushroom Swiss Burger', 'BURGER-MUSHROOM-SWISS', 1125],
     ['item-fries', 'category-sides', 'Seasoned Fries', 'SIDE-FRIES', 325],
+    ['item-onion-rings', 'category-sides', 'Crispy Onion Rings', 'SIDE-ONION-RINGS', 425],
+    ['item-loaded-cheese-fries', 'category-sides', 'Loaded Cheese Fries', 'SIDE-LOADED-FRIES', 595],
+    ['item-sweet-potato-fries', 'category-sides', 'Sweet Potato Fries', 'SIDE-SWEET-POTATO', 395],
+    ['item-fried-pickles', 'category-sides', 'Fried Pickles', 'SIDE-FRIED-PICKLES', 475],
+    ['item-mozzarella-sticks', 'category-sides', 'Mozzarella Sticks', 'SIDE-MOZZARELLA', 525],
+    ['item-mac-cheese-bites', 'category-sides', 'Mac & Cheese Bites', 'SIDE-MAC-BITES', 495],
+    ['item-chili-cheese-fries', 'category-sides', 'Chili Cheese Fries', 'SIDE-CHILI-FRIES', 625],
+    ['item-garlic-parmesan-tots', 'category-sides', 'Garlic Parmesan Tots', 'SIDE-GARLIC-TOTS', 475],
+    ['item-house-side-salad', 'category-sides', 'House Side Salad', 'SIDE-HOUSE-SALAD', 450],
+    ['item-vanilla-bean-shake', 'category-shakes', 'Vanilla Bean Shake', 'SHAKE-VANILLA', 575],
+    ['item-chocolate-malt-shake', 'category-shakes', 'Chocolate Malt Shake', 'SHAKE-CHOCOLATE-MALT', 625],
+    ['item-strawberry-shake', 'category-shakes', 'Strawberry Shake', 'SHAKE-STRAWBERRY', 575],
+    ['item-cookies-cream-shake', 'category-shakes', 'Cookies & Cream Shake', 'SHAKE-COOKIES-CREAM', 625],
+    ['item-salted-caramel-shake', 'category-shakes', 'Salted Caramel Shake', 'SHAKE-SALTED-CARAMEL', 625],
+    ['item-peanut-butter-shake', 'category-shakes', 'Peanut Butter Shake', 'SHAKE-PEANUT-BUTTER', 625],
+    ['item-banana-shake', 'category-shakes', 'Banana Shake', 'SHAKE-BANANA', 575],
+    ['item-coffee-shake', 'category-shakes', 'Coffee Shake', 'SHAKE-COFFEE', 625],
+    ['item-oreo-espresso-shake', 'category-shakes', 'Oreo Espresso Shake', 'SHAKE-OREO-ESPRESSO', 675],
+    ['item-seasonal-shake', 'category-shakes', 'Seasonal Shake', 'SHAKE-SEASONAL', 625],
     ['item-cola', 'category-drinks', 'Cola', 'DRINK-COLA', 250],
     ['item-lemonade', 'category-drinks', 'Fresh Lemonade', 'DRINK-LEMONADE', 325],
-    ['item-iced-tea', 'category-drinks', 'Iced Tea', 'DRINK-TEA', 275]
+    ['item-iced-tea', 'category-drinks', 'Iced Tea', 'DRINK-TEA', 275],
+    ['item-diet-cola', 'category-drinks', 'Diet Cola', 'DRINK-DIET-COLA', 250],
+    ['item-root-beer', 'category-drinks', 'Root Beer', 'DRINK-ROOT-BEER', 275],
+    ['item-orange-soda', 'category-drinks', 'Orange Soda', 'DRINK-ORANGE', 275],
+    ['item-ginger-ale', 'category-drinks', 'Ginger Ale', 'DRINK-GINGER-ALE', 275],
+    ['item-sparkling-water', 'category-drinks', 'Sparkling Water', 'DRINK-SPARKLING-WATER', 225],
+    ['item-cold-brew', 'category-drinks', 'Cold Brew', 'DRINK-COLD-BREW', 350],
+    ['item-bottled-water', 'category-drinks', 'Bottled Water', 'DRINK-BOTTLED-WATER', 200],
+    ['item-margherita-pizza', 'category-pizzas', 'Margherita Pizza', 'PIZZA-MARGHERITA', 1195],
+    ['item-pepperoni-pizza', 'category-pizzas', 'Pepperoni Pizza', 'PIZZA-PEPPERONI', 1295],
+    ['item-hot-honey-pizza', 'category-pizzas', 'Hot Honey Pizza', 'PIZZA-HOT-HONEY', 1395],
+    ['item-mushroom-truffle-pizza', 'category-pizzas', 'Mushroom Truffle Pizza', 'PIZZA-MUSHROOM-TRUFFLE', 1495],
+    ['item-bbq-chicken-pizza', 'category-pizzas', 'BBQ Chicken Pizza', 'PIZZA-BBQ-CHICKEN', 1395],
+    ['item-four-cheese-pizza', 'category-pizzas', 'Four Cheese Pizza', 'PIZZA-FOUR-CHEESE', 1295],
+    ['item-veggie-supreme-pizza', 'category-pizzas', 'Veggie Supreme Pizza', 'PIZZA-VEGGIE-SUPREME', 1395],
+    ['item-meat-lovers-pizza', 'category-pizzas', 'Meat Lovers Pizza', 'PIZZA-MEAT-LOVERS', 1495],
+    ['item-hawaiian-pizza', 'category-pizzas', 'Hawaiian Pizza', 'PIZZA-HAWAIIAN', 1345],
+    ['item-white-garlic-pizza', 'category-pizzas', 'White Garlic Pizza', 'PIZZA-WHITE-GARLIC', 1295]
   ];
   for (const item of items) {
     db.prepare(
@@ -254,38 +339,34 @@ function seedDatabase(db: DatabaseSync): void {
   db.prepare(
     'INSERT OR IGNORE INTO menu_item_modifier_groups (menu_item_id, modifier_group_id, display_order, min_selections, max_selections) VALUES (?, ?, ?, ?, ?)'
   ).run('item-truffle-burger', 'group-truffle-size', 1, 0, 1);
-  for (const menuItemId of ['item-burger', 'item-double-smash-burger']) {
+  for (const menuItemId of [
+    'item-burger',
+    'item-double-smash-burger',
+    'item-bacon-bbq-burger',
+    'item-jalapeno-pepper-jack-burger',
+    'item-mushroom-swiss-burger'
+  ]) {
     db.prepare(
       'INSERT OR IGNORE INTO menu_item_modifier_groups (menu_item_id, modifier_group_id, display_order, min_selections, max_selections) VALUES (?, ?, ?, ?, ?)'
     ).run(menuItemId, 'group-truffle-size', 1, 0, 1);
   }
 
-  const schedules = [
-    ['schedule-breakfast', 'Breakfast', '00:00', '10:59'],
-    ['schedule-lunch', 'Lunch', '11:00', '23:59']
-  ];
+  const schedules = [['schedule-lunch', 'Lunch', '00:00', '23:59']];
   for (const schedule of schedules) {
     db.prepare(
       'INSERT OR IGNORE INTO menu_schedules (schedule_id, store_id, schedule_name, start_time, end_time) VALUES (?, ?, ?, ?, ?)'
     ).run(schedule[0]!, 'store-demo-001', schedule[1]!, schedule[2]!, schedule[3]!);
   }
-  for (const mapping of [
-    ['schedule-breakfast', 'item-breakfast-wrap'],
-    ['schedule-breakfast', 'item-fries'],
-    ['schedule-breakfast', 'item-burger'],
-    ['schedule-breakfast', 'item-truffle-burger'],
-    ['schedule-breakfast', 'item-double-smash-burger'],
-    ['schedule-breakfast', 'item-cola'],
-    ['schedule-breakfast', 'item-lemonade'],
-    ['schedule-breakfast', 'item-iced-tea'],
-    ['schedule-lunch', 'item-burger'],
-    ['schedule-lunch', 'item-truffle-burger'],
-    ['schedule-lunch', 'item-double-smash-burger'],
-    ['schedule-lunch', 'item-fries'],
-    ['schedule-lunch', 'item-cola'],
-    ['schedule-lunch', 'item-lemonade'],
-    ['schedule-lunch', 'item-iced-tea']
-  ]) {
-    db.prepare('INSERT OR IGNORE INTO menu_item_schedule (schedule_id, menu_item_id) VALUES (?, ?)').run(...mapping);
+  const allMenuItemIds = items.map(([menuItemId]) => String(menuItemId));
+  for (const scheduleId of ['schedule-lunch']) {
+    for (const menuItemId of allMenuItemIds) {
+      db.prepare('INSERT OR IGNORE INTO menu_item_schedule (schedule_id, menu_item_id) VALUES (?, ?)').run(scheduleId, menuItemId);
+    }
   }
+
+  // Preserve historical order references while removing legacy Breakfast data
+  // from all current menu and staff views on already-initialized databases.
+  db.prepare('UPDATE menu_items SET is_active = 0 WHERE menu_item_id = ?').run('item-breakfast-wrap');
+  db.prepare('UPDATE menu_categories SET is_active = 0 WHERE category_id = ?').run('category-breakfast');
+  db.prepare('UPDATE menu_schedules SET is_active = 0 WHERE schedule_id = ?').run('schedule-breakfast');
 }

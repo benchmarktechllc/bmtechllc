@@ -9,9 +9,12 @@ describe('KioskService', () => {
 
     const menu = service.getMenu('schedule-lunch');
 
-    expect(menu.categories.map((category) => category.category_name)).toEqual(['Burgers', 'Sides', 'Drinks']);
-    expect(menu.items.filter((item) => item.category_id === 'category-burgers')).toHaveLength(3);
-    expect(menu.items.filter((item) => item.category_id === 'category-drinks')).toHaveLength(3);
+    expect(menu.categories.map((category) => category.category_name)).toEqual(['Burgers', 'Sides', 'Shakes', 'Sodas', 'Pizzas']);
+    expect(menu.items.filter((item) => item.category_id === 'category-burgers')).toHaveLength(6);
+    expect(menu.items.filter((item) => item.category_id === 'category-sides')).toHaveLength(10);
+    expect(menu.items.filter((item) => item.category_id === 'category-shakes')).toHaveLength(10);
+    expect(menu.items.filter((item) => item.category_id === 'category-drinks')).toHaveLength(10);
+    expect(menu.items.filter((item) => item.category_id === 'category-pizzas')).toHaveLength(10);
     database.close();
   });
 
@@ -24,6 +27,57 @@ describe('KioskService', () => {
     });
 
     expect(quote.totalAmountMinor).toBe(2050);
+    database.close();
+  });
+
+  it('lets staff add and fully edit a menu item', () => {
+    const database = openDatabase(':memory:');
+    const service = new KioskService(database);
+
+    const created = service.createMenuItem({
+      categoryId: 'category-sides',
+      itemName: 'Crispy Tater Tots',
+      sku: 'SIDE-TOTS-CRISPY',
+      basePriceMinor: 475,
+      isAvailable: true
+    });
+    service.updateMenuItem(created.menuItemId, {
+      categoryId: 'category-sides',
+      itemName: 'Crispy Tater Tots with Herbs',
+      sku: 'SIDE-TOTS-HERB',
+      basePriceMinor: 525,
+      isAvailable: false
+    });
+
+    const item = service.getStaffOverview().menuItems.find((candidate) => candidate.menu_item_id === created.menuItemId);
+    expect(item).toMatchObject({
+      item_name: 'Crispy Tater Tots with Herbs',
+      sku: 'SIDE-TOTS-HERB',
+      base_price_minor: 525,
+      is_available: 0,
+      category_id: 'category-sides'
+    });
+    database.close();
+  });
+
+  it('returns sales, payment, device, and audit analytics for staff', () => {
+    const database = openDatabase(':memory:');
+    const service = new KioskService(database);
+    service.recordKioskEvent('order_started');
+    const order = service.createOrder({
+      idempotencyKey: '0cc65150-cba4-40dc-ab35-571e57af20c9',
+      orderType: 'TAKE_OUT',
+      items: [{ menuItemId: 'item-fries', quantity: 1, modifiers: [] }]
+    });
+    service.startMockPayment(order.transaction_id, 'APPROVED');
+    service.setItemAvailability('item-fries', false);
+
+    const overview = service.getStaffOverview();
+    expect(overview.analytics.salesToday).toMatchObject({ orderCount: 1, revenueMinor: 325, averageOrderMinor: 325 });
+    expect(overview.analytics.paymentOutcomes).toContainEqual({ status: 'APPROVED', count: 1 });
+    expect(overview.analytics.funnel).toContainEqual({ event_type: 'order_started', count: 1 });
+    expect(overview.deviceHealth).toMatchObject({ network: 'ONLINE', paymentTerminal: 'MOCK_READY' });
+    expect(overview.auditLog[0]).toMatchObject({ action_type: 'MENU_ITEM_UNAVAILABLE', target_id: 'item-fries' });
     database.close();
   });
 

@@ -2,10 +2,12 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { resolve } from 'node:path';
 import cors from '@fastify/cors';
 import Fastify from 'fastify';
+import { z } from 'zod';
 import {
   createOrderRequestSchema,
   quoteRequestSchema,
   staffItemAvailabilityRequestSchema,
+  staffMenuItemRequestSchema,
   staffItemPriceRequestSchema,
   startPaymentRequestSchema
 } from '@smart-kiosk/shared';
@@ -20,6 +22,10 @@ const service = new KioskService(openDatabase(databasePath), {
 });
 const staffAccessToken = process.env.STAFF_ACCESS_TOKEN
   ?? (process.env.NODE_ENV === 'production' ? undefined : 'dev-staff-token');
+const kioskEventSchema = z.object({
+  eventType: z.enum(['order_started', 'item_added', 'upsell_viewed', 'upsell_added', 'checkout_viewed', 'payment_started']),
+  context: z.record(z.string(), z.unknown()).optional()
+});
 
 await app.register(cors, { origin: process.env.KIOSK_ORIGIN ?? 'http://localhost:5173' });
 
@@ -50,6 +56,12 @@ app.get('/ready', async (_request, reply) => {
 app.get('/v1/menu', async (request) => {
   const query = request.query as { scheduleId?: string };
   return service.getMenu(query.scheduleId);
+});
+
+app.post('/v1/telemetry/events', async (request, reply) => {
+  const parsed = kioskEventSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'INVALID_EVENT', details: parsed.error.flatten() });
+  return reply.code(202).send(service.recordKioskEvent(parsed.data.eventType, parsed.data.context));
 });
 
 app.post('/v1/quotes', async (request, reply) => {
@@ -127,11 +139,34 @@ app.post('/v1/staff/menu-items/:menuItemId/price', async (request, reply) => {
   }
 });
 
+app.post('/v1/staff/menu-items', async (request, reply) => {
+  if (!isStaffAuthorized(request.headers['x-staff-token'])) return reply.code(401).send({ error: 'STAFF_AUTH_REQUIRED' });
+  const parsed = staffMenuItemRequestSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'INVALID_MENU_ITEM', details: parsed.error.flatten() });
+  try {
+    return reply.code(201).send(service.createMenuItem(parsed.data));
+  } catch (error) {
+    return reply.code(409).send({ error: 'MENU_ITEM_CREATE_REJECTED', message: error instanceof Error ? error.message : 'Unable to add menu item' });
+  }
+});
+
+app.put('/v1/staff/menu-items/:menuItemId', async (request, reply) => {
+  if (!isStaffAuthorized(request.headers['x-staff-token'])) return reply.code(401).send({ error: 'STAFF_AUTH_REQUIRED' });
+  const parsed = staffMenuItemRequestSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'INVALID_MENU_ITEM', details: parsed.error.flatten() });
+  const { menuItemId } = request.params as { menuItemId: string };
+  try {
+    return service.updateMenuItem(menuItemId, parsed.data);
+  } catch (error) {
+    return reply.code(409).send({ error: 'MENU_ITEM_UPDATE_REJECTED', message: error instanceof Error ? error.message : 'Unable to update menu item' });
+  }
+});
+
 app.post('/v1/staff/orders/:transactionId/cancel', async (request, reply) => {
   if (!isStaffAuthorized(request.headers['x-staff-token'])) return reply.code(401).send({ error: 'STAFF_AUTH_REQUIRED' });
   const { transactionId } = request.params as { transactionId: string };
   try {
-    return service.cancelOrder(transactionId);
+    return service.cancelOrder(transactionId, 'staff-console');
   } catch (error) {
     return reply.code(409).send({ error: 'CANCEL_REJECTED', message: error instanceof Error ? error.message : 'Unable to cancel order' });
   }

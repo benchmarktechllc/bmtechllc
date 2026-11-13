@@ -64,6 +64,14 @@ export const staffItemPriceRequestSchema = z.object({
   basePriceMinor: moneySchema
 });
 
+export const staffMenuItemRequestSchema = z.object({
+  categoryId: z.string().trim().min(1).max(80),
+  itemName: z.string().trim().min(1).max(80),
+  sku: z.string().trim().toUpperCase().regex(/^[A-Z0-9][A-Z0-9-]{1,47}$/),
+  basePriceMinor: moneySchema,
+  isAvailable: z.boolean()
+});
+
 export type CartLine = z.infer<typeof cartLineSchema>;
 export type QuoteRequest = z.infer<typeof quoteRequestSchema>;
 export type CreateOrderRequest = z.infer<typeof createOrderRequestSchema>;
@@ -71,6 +79,7 @@ export type PaymentScenario = z.infer<typeof paymentScenarioSchema>;
 export type PaymentStatus = z.infer<typeof paymentStatusSchema>;
 export type StaffItemAvailabilityRequest = z.infer<typeof staffItemAvailabilityRequestSchema>;
 export type StaffItemPriceRequest = z.infer<typeof staffItemPriceRequestSchema>;
+export type StaffMenuItemRequest = z.infer<typeof staffMenuItemRequestSchema>;
 
 export interface PricedModifier {
   modifierId: string;

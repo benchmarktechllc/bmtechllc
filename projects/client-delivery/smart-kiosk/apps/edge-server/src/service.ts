@@ -8,7 +8,8 @@ import type {
   PaymentStatus,
   PricedLine,
   PricedModifier,
-  QuoteRequest
+  QuoteRequest,
+  StaffMenuItemRequest
 } from '@smart-kiosk/shared';
 
 const storeId = process.env.STORE_ID ?? 'store-demo-001';
@@ -150,6 +151,7 @@ export class KioskService {
     }
     const createdOrder = this.getOrder(transactionId);
     if (!createdOrder) throw new Error('Created order could not be read');
+    this.recordKioskEvent('order_created', { transactionId, totalAmountMinor: quote.totalAmountMinor });
     return createdOrder;
   }
 
@@ -194,16 +196,18 @@ export class KioskService {
       this.db.exec('ROLLBACK');
       throw error;
     }
+    this.recordKioskEvent('payment_result', { transactionId, scenario, paymentStatus });
     return this.getOrder(transactionId);
   }
 
-  cancelOrder(transactionId: string) {
+  cancelOrder(transactionId: string, actorId = 'kiosk') {
     const order = this.getOrder(transactionId);
     if (!order) throw new Error('Order not found');
     if (order.order_status !== 'AWAITING_PAYMENT') throw new Error('Order can no longer be cancelled');
 
     this.db.prepare("UPDATE orders SET order_status = 'CANCELLED', updated_at = ? WHERE transaction_id = ?")
       .run(new Date().toISOString(), transactionId);
+    if (actorId !== 'kiosk') this.recordStaffAudit(actorId, 'ORDER_CANCELLED', 'order', transactionId, {});
     return this.getOrder(transactionId);
   }
 
@@ -233,27 +237,90 @@ export class KioskService {
        ORDER BY i.item_name`
     ).all(storeId) as Array<{ menu_item_id: string; item_name: string }>;
     const menuItems = this.db.prepare(
-      `SELECT i.menu_item_id, i.item_name, i.base_price_minor,
+      `SELECT i.menu_item_id, i.item_name, i.sku, i.base_price_minor, c.category_id, c.category_name,
        CASE WHEN EXISTS (
          SELECT 1 FROM store_item_availability_overrides o
          WHERE o.store_id = ? AND o.menu_item_id = i.menu_item_id
            AND o.cleared_at IS NULL AND o.is_available = 0
        ) THEN 0 ELSE 1 END AS is_available
-       FROM menu_items i WHERE i.is_active = 1 ORDER BY i.item_name`
+       FROM menu_items i JOIN menu_categories c ON c.category_id = i.category_id
+       WHERE i.is_active = 1 AND c.is_active = 1 ORDER BY c.display_order, i.item_name`
     ).all(storeId) as Array<{ menu_item_id: string; item_name: string; base_price_minor: number; is_available: number }>;
     const recentOrders = this.db.prepare(
-      `SELECT transaction_id, order_status, total_amount_minor, created_at
-       FROM orders ORDER BY created_at DESC LIMIT 10`
-    ).all() as Array<{ transaction_id: string; order_status: string; total_amount_minor: number; created_at: string }>;
+      `SELECT o.transaction_id, o.order_status, o.total_amount_minor, o.created_at,
+       COUNT(oi.order_item_id) AS item_count,
+       (SELECT payment_status FROM payments p WHERE p.transaction_id = o.transaction_id ORDER BY attempt_number DESC LIMIT 1) AS payment_status
+       FROM orders o LEFT JOIN order_items oi ON oi.transaction_id = o.transaction_id
+       GROUP BY o.transaction_id
+       ORDER BY o.created_at DESC LIMIT 10`
+    ).all() as Array<{ transaction_id: string; order_status: string; total_amount_minor: number; created_at: string; item_count: number; payment_status?: string }>;
+
+    const salesToday = this.db.prepare(
+      `SELECT COUNT(*) AS order_count, COALESCE(SUM(total_amount_minor), 0) AS revenue_minor,
+       COALESCE(SUM(discount_amount_minor), 0) AS discount_minor
+       FROM orders WHERE order_status = 'COMPLETED' AND created_at >= date('now')`
+    ).get() as { order_count: number; revenue_minor: number; discount_minor: number };
+    const paymentOutcomes = this.db.prepare(
+      `SELECT payment_status AS status, COUNT(*) AS count FROM payments
+       WHERE created_at >= date('now') GROUP BY payment_status ORDER BY payment_status`
+    ).all() as Array<{ status: string; count: number }>;
+    const topItems = this.db.prepare(
+      `SELECT oi.menu_item_id, oi.item_name_snapshot AS item_name, SUM(oi.quantity) AS quantity,
+       SUM(oi.line_total_minor) AS revenue_minor
+       FROM order_items oi JOIN orders o ON o.transaction_id = oi.transaction_id
+       WHERE o.order_status = 'COMPLETED' AND o.created_at >= date('now')
+       GROUP BY oi.menu_item_id, oi.item_name_snapshot ORDER BY quantity DESC, revenue_minor DESC LIMIT 5`
+    ).all() as Array<{ menu_item_id: string; item_name: string; quantity: number; revenue_minor: number }>;
+    const categorySales = this.db.prepare(
+      `SELECT c.category_name, SUM(oi.quantity) AS quantity, SUM(oi.line_total_minor) AS revenue_minor
+       FROM order_items oi JOIN orders o ON o.transaction_id = oi.transaction_id
+       JOIN menu_items i ON i.menu_item_id = oi.menu_item_id JOIN menu_categories c ON c.category_id = i.category_id
+       WHERE o.order_status = 'COMPLETED' AND o.created_at >= date('now')
+       GROUP BY c.category_id, c.category_name ORDER BY revenue_minor DESC`
+    ).all() as Array<{ category_name: string; quantity: number; revenue_minor: number }>;
+    const funnel = this.db.prepare(
+      `SELECT event_type, COUNT(*) AS count FROM kiosk_events WHERE created_at >= date('now')
+       GROUP BY event_type ORDER BY event_type`
+    ).all() as Array<{ event_type: string; count: number }>;
+    const auditLog = this.db.prepare(
+      `SELECT actor_id, action_type, target_type, target_id, details_json, created_at
+       FROM staff_audit_log ORDER BY created_at DESC LIMIT 8`
+    ).all() as Array<{ actor_id: string; action_type: string; target_type: string; target_id: string; details_json: string; created_at: string }>;
+    const lastEvent = this.db.prepare('SELECT created_at FROM kiosk_events ORDER BY created_at DESC LIMIT 1').get() as { created_at?: string } | undefined;
+    const paymentAttempts = paymentOutcomes.reduce((sum, outcome) => sum + outcome.count, 0);
+    const approvals = paymentOutcomes.find((outcome) => outcome.status === 'APPROVED')?.count ?? 0;
+    const pendingDispatches = dispatchStatusCounts.find((outcome) => outcome.status === 'PENDING')?.count ?? 0;
 
     return {
       generatedAt: new Date().toISOString(),
       integrationMode: 'mock' as const,
+      staffIdentity: { actorId: 'staff-console', role: 'manager' },
       orderStatusCounts,
       dispatchStatusCounts,
       unavailableItems,
       menuItems,
-      recentOrders
+      recentOrders,
+      analytics: {
+        salesToday: {
+          orderCount: salesToday.order_count,
+          revenueMinor: salesToday.revenue_minor,
+          discountMinor: salesToday.discount_minor,
+          averageOrderMinor: salesToday.order_count ? Math.round(salesToday.revenue_minor / salesToday.order_count) : 0
+        },
+        paymentApprovalRate: paymentAttempts ? Math.round(approvals * 100 / paymentAttempts) : 0,
+        paymentOutcomes,
+        topItems,
+        categorySales,
+        funnel
+      },
+      deviceHealth: {
+        network: 'ONLINE',
+        paymentTerminal: 'MOCK_READY',
+        printer: 'MOCK_READY',
+        dispatch: pendingDispatches > 0 ? 'ATTENTION' : 'HEALTHY',
+        lastActivityAt: lastEvent?.created_at ?? null
+      },
+      auditLog
     };
   }
 
@@ -278,6 +345,7 @@ export class KioskService {
       ).run(randomUUID(), storeId, menuItemId);
     }
 
+    this.recordStaffAudit('staff-console', isAvailable ? 'MENU_ITEM_RESTORED' : 'MENU_ITEM_UNAVAILABLE', 'menu_item', menuItemId, { itemName: item.item_name });
     return { menuItemId: item.menu_item_id, itemName: item.item_name, isAvailable };
   }
 
@@ -285,12 +353,77 @@ export class KioskService {
     const item = this.db.prepare('SELECT menu_item_id, item_name FROM menu_items WHERE menu_item_id = ?').get(menuItemId) as MenuRow | undefined;
     if (!item) throw new Error('Menu item not found');
     this.db.prepare('UPDATE menu_items SET base_price_minor = ? WHERE menu_item_id = ?').run(basePriceMinor, menuItemId);
+    this.recordStaffAudit('staff-console', 'MENU_ITEM_PRICE_UPDATED', 'menu_item', menuItemId, { itemName: item.item_name, basePriceMinor });
     return { menuItemId: item.menu_item_id, itemName: item.item_name, basePriceMinor };
+  }
+
+  createMenuItem(input: StaffMenuItemRequest) {
+    const category = this.db.prepare(
+      'SELECT category_id, category_name FROM menu_categories WHERE category_id = ? AND is_active = 1'
+    ).get(input.categoryId) as { category_id: string; category_name: string } | undefined;
+    if (!category) throw new Error('Select an active menu category.');
+    if (this.db.prepare('SELECT 1 FROM menu_items WHERE sku = ?').get(input.sku)) throw new Error('That SKU is already in use.');
+
+    const menuItemId = `item-${randomUUID()}`;
+    this.db.prepare(
+      'INSERT INTO menu_items (menu_item_id, category_id, item_name, sku, base_price_minor) VALUES (?, ?, ?, ?, ?)'
+    ).run(menuItemId, input.categoryId, input.itemName, input.sku, input.basePriceMinor);
+    this.db.prepare('INSERT OR IGNORE INTO menu_item_schedule (schedule_id, menu_item_id) VALUES (?, ?)').run('schedule-lunch', menuItemId);
+    this.writeItemAvailability(menuItemId, input.isAvailable);
+    this.recordStaffAudit('staff-console', 'MENU_ITEM_CREATED', 'menu_item', menuItemId, { ...input, categoryName: category.category_name });
+    return { menuItemId, ...input };
+  }
+
+  updateMenuItem(menuItemId: string, input: StaffMenuItemRequest) {
+    const item = this.db.prepare(
+      'SELECT menu_item_id, item_name FROM menu_items WHERE menu_item_id = ? AND is_active = 1'
+    ).get(menuItemId) as MenuRow | undefined;
+    if (!item) throw new Error('Menu item not found.');
+    const category = this.db.prepare(
+      'SELECT category_id, category_name FROM menu_categories WHERE category_id = ? AND is_active = 1'
+    ).get(input.categoryId) as { category_id: string; category_name: string } | undefined;
+    if (!category) throw new Error('Select an active menu category.');
+    if (this.db.prepare('SELECT 1 FROM menu_items WHERE sku = ? AND menu_item_id <> ?').get(input.sku, menuItemId)) throw new Error('That SKU is already in use.');
+
+    this.db.prepare(
+      'UPDATE menu_items SET category_id = ?, item_name = ?, sku = ?, base_price_minor = ? WHERE menu_item_id = ?'
+    ).run(input.categoryId, input.itemName, input.sku, input.basePriceMinor, menuItemId);
+    this.db.prepare('INSERT OR IGNORE INTO menu_item_schedule (schedule_id, menu_item_id) VALUES (?, ?)').run('schedule-lunch', menuItemId);
+    this.writeItemAvailability(menuItemId, input.isAvailable);
+    this.recordStaffAudit('staff-console', 'MENU_ITEM_UPDATED', 'menu_item', menuItemId, { previousItemName: item.item_name, ...input, categoryName: category.category_name });
+    return { menuItemId, ...input };
+  }
+
+  recordKioskEvent(eventType: string, context: Record<string, unknown> = {}) {
+    const now = new Date().toISOString();
+    this.db.prepare(
+      'INSERT INTO kiosk_events (event_id, store_id, terminal_id, event_type, context_json, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(randomUUID(), storeId, terminalId, eventType, JSON.stringify(context), now);
+    return { eventType, recordedAt: now };
   }
 
   isReady(): boolean {
     this.db.prepare('SELECT 1 as ready').get();
     return true;
+  }
+
+  private writeItemAvailability(menuItemId: string, isAvailable: boolean): void {
+    const now = new Date().toISOString();
+    const activeOverride = this.db.prepare(
+      'SELECT override_id FROM store_item_availability_overrides WHERE store_id = ? AND menu_item_id = ? AND cleared_at IS NULL'
+    ).get(storeId, menuItemId) as { override_id: string } | undefined;
+
+    if (isAvailable) {
+      this.db.prepare(
+        'UPDATE store_item_availability_overrides SET cleared_at = ? WHERE store_id = ? AND menu_item_id = ? AND cleared_at IS NULL'
+      ).run(now, storeId, menuItemId);
+    } else if (activeOverride) {
+      this.db.prepare('UPDATE store_item_availability_overrides SET is_available = 0 WHERE override_id = ?').run(activeOverride.override_id);
+    } else {
+      this.db.prepare(
+        'INSERT INTO store_item_availability_overrides (override_id, store_id, menu_item_id, is_available, cleared_at) VALUES (?, ?, ?, 0, NULL)'
+      ).run(randomUUID(), storeId, menuItemId);
+    }
   }
 
   private priceLine(line: CartLine): PricedLine {
@@ -352,6 +485,12 @@ export class KioskService {
         'INSERT INTO integration_dispatches (dispatch_id, transaction_id, destination_type, destination_id, idempotency_key, payload_json, dispatch_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
       )
       .run(randomUUID(), transactionId, destinationType, destinationId, `${transactionId}:${destinationType}`, JSON.stringify({ transactionId, order, simulated: true }), 'PENDING', now);
+  }
+
+  private recordStaffAudit(actorId: string, actionType: string, targetType: string, targetId: string, details: Record<string, unknown>): void {
+    this.db.prepare(
+      'INSERT INTO staff_audit_log (audit_id, store_id, actor_id, action_type, target_type, target_id, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(randomUUID(), storeId, actorId, actionType, targetType, targetId, JSON.stringify(details), new Date().toISOString());
   }
 
   private currentScheduleId(schedules: Array<Record<string, unknown>>): string {

@@ -1,26 +1,44 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { CartLine, OrderQuote, PaymentScenario } from '@smart-kiosk/shared';
-import attractBackground from './assets/attract-background.webp';
-import breakfastWrapImage from './assets/menu-breakfast-wrap.jpg';
-import classicBurgerImage from './assets/menu-classic-burger.jpg';
-import truffleBurgerImage from './assets/menu-truffle-burger.webp';
-import doubleSmashBurgerImage from './assets/menu-double-smash-burger.webp';
-import friesImage from './assets/menu-fries.jpg';
-import colaImage from './assets/menu-cola.webp';
-import lemonadeImage from './assets/menu-lemonade.jpg';
-import icedTeaImage from './assets/menu-iced-tea.webp';
-import menuAddIcon from './assets/menu-icon-add.svg';
-import menuBurgerIcon from './assets/menu-icon-burger.svg';
-import menuDrinkIcon from './assets/menu-icon-drink.svg';
-import menuFriesIcon from './assets/menu-icon-fries.svg';
-import customizeBurgerImage from './assets/customize-burger.webp';
+import attractAnvilBackground from './assets/attract-anvil-background.webp';
+import attractAnvilLockup from './assets/attract-anvil-lockup.svg';
+import attractTouchIcon from './assets/attract-touch.svg';
+import menuFigmaCardOne from './assets/optimized/menu-figma-card-1.webp';
+import menuFigmaCardTwo from './assets/optimized/menu-figma-card-2.webp';
+import menuFigmaCardThree from './assets/optimized/menu-figma-card-3.webp';
+import menuFigmaCategoryActive from './assets/menu-figma-category-active.svg';
+import menuFigmaCategoryInactive from './assets/menu-figma-category.svg';
+import menuFigmaBurgerCategory from './assets/menu-figma-category-burger.svg';
+import menuFigmaFriesCategory from './assets/menu-figma-category-fries.svg';
+import menuFigmaCupCategory from './assets/menu-figma-category-cup.svg';
+import menuFigmaCanCategory from './assets/menu-figma-category-can.svg';
+import menuFigmaPizzaCategory from './assets/menu-figma-category-pizza.svg';
+import menuFigmaAddBackground from './assets/menu-figma-add-bg.svg';
+import menuFigmaAddIcon from './assets/menu-figma-add.svg';
+import menuFigmaCartDivider from './assets/menu-figma-cart-divider.svg';
+import menuFigmaCartPlus from './assets/menu-figma-cart-plus.svg';
+import menuFigmaCartMinus from './assets/menu-figma-cart-minus.svg';
+import menuFigmaMenuDivider from './assets/menu-figma-menu-divider.svg';
+import classicBurgerImage from './assets/optimized/menu-classic-burger.webp';
+import truffleBurgerImage from './assets/optimized/menu-truffle-burger.webp';
+import doubleSmashBurgerImage from './assets/optimized/menu-double-smash-burger.webp';
+import baconBbqBurgerImage from './assets/optimized/bacon-bbq-burger.webp';
+import jalapenoPepperJackBurgerImage from './assets/optimized/jalapeno-pepper-jack-burger.webp';
+import mushroomSwissBurgerImage from './assets/optimized/mushroom-swiss-burger.webp';
+import friesImage from './assets/optimized/menu-fries.webp';
+import shakeImage from './assets/optimized/menu-shake.webp';
+import pizzaImage from './assets/optimized/menu-pizza.webp';
+import colaImage from './assets/optimized/menu-cola.webp';
+import lemonadeImage from './assets/optimized/menu-lemonade.webp';
+import icedTeaImage from './assets/optimized/menu-iced-tea.webp';
+import customizeBurgerImage from './assets/optimized/customize-burger.webp';
 import customizeCloseIcon from './assets/customize-close.svg';
 import customizeMinusIcon from './assets/customize-minus.svg';
 import customizePlusIcon from './assets/customize-plus.svg';
-import upsellSodaImage from './assets/upsell-soda.webp';
-import upsellFriesImage from './assets/upsell-fries.webp';
+import upsellSodaImage from './assets/optimized/upsell-soda.webp';
+import upsellFriesImage from './assets/optimized/upsell-fries.webp';
 import upsellAddIcon from './assets/upsell-add.svg';
-import checkoutItemImage from './assets/checkout-item.webp';
+import checkoutItemImage from './assets/optimized/checkout-item.webp';
 import checkoutDivider from './assets/checkout-divider.svg';
 import checkoutContactless from './assets/checkout-contactless.svg';
 
@@ -54,31 +72,68 @@ type StaffOverview = {
   orderStatusCounts: Array<{ status: string; count: number }>;
   dispatchStatusCounts: Array<{ status: string; count: number }>;
   unavailableItems: Array<{ menu_item_id: string; item_name: string }>;
-  menuItems: Array<{ menu_item_id: string; item_name: string; base_price_minor: number; is_available: number }>;
-  recentOrders: Array<{ transaction_id: string; order_status: string; total_amount_minor: number; created_at: string }>;
+  menuItems: Array<{ menu_item_id: string; item_name: string; sku: string; base_price_minor: number; is_available: number; category_id: string; category_name: string }>;
+  recentOrders: Array<{ transaction_id: string; order_status: string; total_amount_minor: number; created_at: string; item_count: number; payment_status?: string }>;
+  staffIdentity: { actorId: string; role: string };
+  analytics: {
+    salesToday: { orderCount: number; revenueMinor: number; discountMinor: number; averageOrderMinor: number };
+    paymentApprovalRate: number;
+    paymentOutcomes: Array<{ status: string; count: number }>;
+    topItems: Array<{ menu_item_id: string; item_name: string; quantity: number; revenue_minor: number }>;
+    categorySales: Array<{ category_name: string; quantity: number; revenue_minor: number }>;
+    funnel: Array<{ event_type: string; count: number }>;
+  };
+  deviceHealth: { network: string; paymentTerminal: string; printer: string; dispatch: string; lastActivityAt: string | null };
+  auditLog: Array<{ actor_id: string; action_type: string; target_type: string; target_id: string; details_json: string; created_at: string }>;
 };
+type StaffMenuItem = StaffOverview['menuItems'][number];
+type MenuItemDraft = { itemName: string; categoryId: string; sku: string; price: string; isAvailable: boolean };
 
 const menuItemImages: Record<string, string> = {
-  'item-breakfast-wrap': breakfastWrapImage,
   'item-burger': classicBurgerImage,
   'item-truffle-burger': truffleBurgerImage,
   'item-double-smash-burger': doubleSmashBurgerImage,
+  'item-bacon-bbq-burger': baconBbqBurgerImage,
+  'item-jalapeno-pepper-jack-burger': jalapenoPepperJackBurgerImage,
+  'item-mushroom-swiss-burger': mushroomSwissBurgerImage,
   'item-fries': friesImage,
   'item-cola': colaImage,
   'item-lemonade': lemonadeImage,
   'item-iced-tea': icedTeaImage
 };
 
+const categoryImages: Record<string, string> = {
+  'category-sides': friesImage,
+  'category-shakes': shakeImage,
+  'category-drinks': colaImage,
+  'category-pizzas': pizzaImage
+};
+
+const menuFigmaItemImages: Record<string, string> = {
+  'item-burger': menuFigmaCardOne,
+  'item-truffle-burger': menuFigmaCardTwo,
+  'item-double-smash-burger': menuFigmaCardThree,
+};
+
 const menuItemDescriptions: Record<string, string> = {
-  'item-breakfast-wrap': 'Eggs, cheddar, roasted peppers, and potatoes wrapped in a warm tortilla.',
   'item-burger': 'Beef patty, lettuce, tomato, onion, and house sauce on a toasted bun.',
   'item-truffle-burger': 'Wagyu beef patty, wild mushroom ragout, gruyere cheese, truffle aioli.',
   'item-double-smash-burger': 'Two smashed beef patties, cheddar, pickles, onion, and burger sauce.',
+  'item-bacon-bbq-burger': 'Beef patty, cheddar, crisp bacon, onion rings, and smoky barbecue sauce.',
+  'item-jalapeno-pepper-jack-burger': 'Beef patty, pepper jack, jalapeños, caramelized onions, and crisp lettuce.',
+  'item-mushroom-swiss-burger': 'Beef patty, melted Swiss, sautéed wild mushrooms, caramelized onions, and arugula.',
   'item-fries': 'Crisp golden fries tossed with sea salt and our signature seasoning.',
   'item-cola': 'Chilled fountain cola served over ice.',
   'item-lemonade': 'Fresh-squeezed lemonade with bright citrus and a touch of sweetness.',
   'item-iced-tea': 'Fresh-brewed iced tea with lemon.'
 };
+
+function menuImage(menuItemId: string, categoryId?: string, fallback = classicBurgerImage): string {
+  return menuFigmaItemImages[menuItemId]
+    ?? menuItemImages[menuItemId]
+    ?? (categoryId ? categoryImages[categoryId] : undefined)
+    ?? fallback;
+}
 
 const formatMoney = (amount: number, currency = 'USD') =>
   new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(amount / 100);
@@ -133,7 +188,10 @@ function StaffConsole() {
   const [error, setError] = useState<string>();
   const [isLoading, setIsLoading] = useState(false);
   const [refreshVersion, setRefreshVersion] = useState(0);
-  const [priceEdits, setPriceEdits] = useState<Record<string, string>>({});
+  const [menuPages, setMenuPages] = useState<Record<string, number>>({});
+  const [selectedMenuCategoryId, setSelectedMenuCategoryId] = useState<string>();
+  const [itemEditor, setItemEditor] = useState<StaffMenuItem | null | undefined>();
+  const [itemDraft, setItemDraft] = useState<MenuItemDraft>({ itemName: '', categoryId: '', sku: '', price: '', isAvailable: true });
 
   useEffect(() => {
     if (!accessToken) return;
@@ -182,31 +240,6 @@ function StaffConsole() {
     }
   }
 
-  async function updatePrice(item: StaffOverview['menuItems'][number]) {
-    const enteredPrice = Number(priceEdits[item.menu_item_id] ?? (item.base_price_minor / 100).toFixed(2));
-    const basePriceMinor = Math.round(enteredPrice * 100);
-    if (!Number.isFinite(enteredPrice) || enteredPrice < 0) return setError('Enter a valid non-negative price.');
-    setIsLoading(true);
-    setError(undefined);
-    try {
-      const response = await fetch(`${edgeUrl}/v1/staff/menu-items/${item.menu_item_id}/price`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-staff-token': accessToken },
-        body: JSON.stringify({ basePriceMinor })
-      });
-      if (!response.ok) throw new Error('Unable to update item price.');
-      setPriceEdits((current) => {
-        const next = { ...current };
-        delete next[item.menu_item_id];
-        return next;
-      });
-      setRefreshVersion((current) => current + 1);
-    } catch (updateError) {
-      setError(updateError instanceof Error ? updateError.message : 'Unable to update item price.');
-      setIsLoading(false);
-    }
-  }
-
   async function cancelAwaitingOrder(transactionId: string) {
     setIsLoading(true);
     setError(undefined);
@@ -225,6 +258,71 @@ function StaffConsole() {
 
   const awaitingPayment = overview?.orderStatusCounts.find(({ status }) => status === 'AWAITING_PAYMENT')?.count ?? 0;
   const pendingDispatches = overview?.dispatchStatusCounts.find(({ status }) => status === 'PENDING')?.count ?? 0;
+  const analytics = overview?.analytics;
+  const funnelCount = (eventType: string) => analytics?.funnel.find((event) => event.event_type === eventType)?.count ?? 0;
+  const menuCategories = overview?.menuItems.reduce<Array<{ categoryId: string; categoryName: string; items: StaffOverview['menuItems'] }>>((groups, item) => {
+    const group = groups.find((candidate) => candidate.categoryId === item.category_id);
+    if (group) group.items.push(item);
+    else groups.push({ categoryId: item.category_id, categoryName: item.category_name, items: [item] });
+    return groups;
+  }, []) ?? [];
+  const selectedMenuCategory = menuCategories.find((category) => category.categoryId === selectedMenuCategoryId) ?? menuCategories[0];
+
+  function openNewItemEditor() {
+    setItemDraft({
+      itemName: '',
+      categoryId: selectedMenuCategory?.categoryId ?? menuCategories[0]?.categoryId ?? '',
+      sku: '',
+      price: '',
+      isAvailable: true
+    });
+    setItemEditor(null);
+  }
+
+  function openItemEditor(item: StaffMenuItem) {
+    setItemDraft({
+      itemName: item.item_name,
+      categoryId: item.category_id,
+      sku: item.sku,
+      price: (item.base_price_minor / 100).toFixed(2),
+      isAvailable: item.is_available === 1
+    });
+    setItemEditor(item);
+  }
+
+  async function saveMenuItem(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const enteredPrice = Number(itemDraft.price);
+    if (!Number.isFinite(enteredPrice) || enteredPrice < 0) return setError('Enter a valid non-negative price.');
+    if (!itemDraft.categoryId) return setError('Select a category.');
+    setIsLoading(true);
+    setError(undefined);
+    const isEditing = Boolean(itemEditor);
+    const endpoint = isEditing ? `${edgeUrl}/v1/staff/menu-items/${itemEditor?.menu_item_id}` : `${edgeUrl}/v1/staff/menu-items`;
+    try {
+      const response = await fetch(endpoint, {
+        method: isEditing ? 'PUT' : 'POST',
+        headers: { 'content-type': 'application/json', 'x-staff-token': accessToken },
+        body: JSON.stringify({
+          categoryId: itemDraft.categoryId,
+          itemName: itemDraft.itemName,
+          sku: itemDraft.sku,
+          basePriceMinor: Math.round(enteredPrice * 100),
+          isAvailable: itemDraft.isAvailable
+        })
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => undefined) as { message?: string } | undefined;
+        throw new Error(body?.message ?? `Unable to ${isEditing ? 'update' : 'add'} menu item.`);
+      }
+      setSelectedMenuCategoryId(itemDraft.categoryId);
+      setItemEditor(undefined);
+      setRefreshVersion((current) => current + 1);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Unable to save menu item.');
+      setIsLoading(false);
+    }
+  }
 
   if (!accessToken) {
     return (
@@ -263,31 +361,119 @@ function StaffConsole() {
         <article><span>Pending dispatches</span><strong>{pendingDispatches}</strong></article>
         <article><span>Unavailable items</span><strong>{overview?.unavailableItems.length ?? 0}</strong></article>
       </section>
+      <section className="staff-console__stats staff-console__stats--analytics" aria-label="Today's sales">
+        <article><span>Sales today</span><strong>{formatMoney(analytics?.salesToday.revenueMinor ?? 0)}</strong></article>
+        <article><span>Completed orders</span><strong>{analytics?.salesToday.orderCount ?? 0}</strong></article>
+        <article><span>Average order</span><strong>{formatMoney(analytics?.salesToday.averageOrderMinor ?? 0)}</strong></article>
+        <article><span>Payment approval</span><strong>{analytics ? `${analytics.paymentApprovalRate}%` : '—'}</strong></article>
+      </section>
+      <section className="staff-console__analytics-grid" aria-label="Kiosk analytics">
+        <article className="staff-console__panel">
+          <div className="staff-console__panel-heading"><h2>Conversion funnel</h2><span>Today’s kiosk interactions.</span></div>
+          <dl className="staff-console__metric-list">
+            <div><dt>Order started</dt><dd>{funnelCount('order_started')}</dd></div>
+            <div><dt>Items added</dt><dd>{funnelCount('item_added')}</dd></div>
+            <div><dt>Upsell viewed</dt><dd>{funnelCount('upsell_viewed')}</dd></div>
+            <div><dt>Checkout viewed</dt><dd>{funnelCount('checkout_viewed')}</dd></div>
+            <div><dt>Payment started</dt><dd>{funnelCount('payment_started')}</dd></div>
+          </dl>
+        </article>
+        <article className="staff-console__panel">
+          <div className="staff-console__panel-heading"><h2>Device health</h2><span>Mock adapter status until hardware is connected.</span></div>
+          <dl className="staff-console__metric-list">
+            <div><dt>Network</dt><dd>{overview?.deviceHealth.network ?? '—'}</dd></div>
+            <div><dt>Payment terminal</dt><dd>{overview?.deviceHealth.paymentTerminal.replace('_', ' ') ?? '—'}</dd></div>
+            <div><dt>Receipt printer</dt><dd>{overview?.deviceHealth.printer.replace('_', ' ') ?? '—'}</dd></div>
+            <div><dt>Dispatch</dt><dd>{overview?.deviceHealth.dispatch ?? '—'}</dd></div>
+          </dl>
+        </article>
+        <article className="staff-console__panel">
+          <div className="staff-console__panel-heading"><h2>Top items</h2><span>Completed sales today.</span></div>
+          <dl className="staff-console__metric-list">
+            {analytics?.topItems.length ? analytics.topItems.map((item) => <div key={item.menu_item_id}><dt>{item.item_name} · {item.quantity}</dt><dd>{formatMoney(item.revenue_minor)}</dd></div>) : <p>No completed sales yet.</p>}
+          </dl>
+        </article>
+        <article className="staff-console__panel">
+          <div className="staff-console__panel-heading"><h2>Payment outcomes</h2><span>Attempts recorded today.</span></div>
+          <dl className="staff-console__metric-list">
+            {analytics?.paymentOutcomes.length ? analytics.paymentOutcomes.map((outcome) => <div key={outcome.status}><dt>{outcome.status.replaceAll('_', ' ')}</dt><dd>{outcome.count}</dd></div>) : <p>No payment attempts yet.</p>}
+          </dl>
+        </article>
+      </section>
       <section className="staff-console__panel">
-        <div className="staff-console__panel-heading"><h2>Menu availability</h2><span>Hide sold-out items from the kiosk immediately.</span></div>
-        <div className="staff-console__menu-items">
-          {overview?.menuItems.map((item) => (
-            <article key={item.menu_item_id}>
-              <div><strong>{item.item_name}</strong><span>{formatMoney(item.base_price_minor)}</span></div>
-              <div className="staff-console__item-actions">
-                <label>
-                  <span className="sr-only">Price for {item.item_name}</span>
-                  <input
-                    type="number"
-                    min="0"
-                    step="0.01"
-                    inputMode="decimal"
-                    value={priceEdits[item.menu_item_id] ?? (item.base_price_minor / 100).toFixed(2)}
-                    onChange={(event) => setPriceEdits((current) => ({ ...current, [item.menu_item_id]: event.target.value }))}
-                  />
-                </label>
-                <button type="button" disabled={isLoading} onClick={() => void updatePrice(item)}>Save price</button>
-                <button type="button" disabled={isLoading} onClick={() => void setAvailability(item)}>
-                  {item.is_available ? 'Mark unavailable' : 'Restore item'}
-                </button>
+        <div className="staff-console__panel-heading staff-console__panel-heading--actions">
+          <div><h2>Menu management</h2><span>Update item details or hide sold-out items from the kiosk.</span></div>
+          <button className="staff-console__add-item" type="button" disabled={isLoading || !overview} onClick={openNewItemEditor}>Add menu item</button>
+        </div>
+        {overview ? <>
+          <nav className="staff-console__menu-category-tabs" aria-label="Menu availability categories">
+            {menuCategories.map((category) => {
+              const isSelected = category.categoryId === selectedMenuCategory?.categoryId;
+              return <button key={category.categoryId} type="button" className={isSelected ? 'is-selected' : ''} aria-pressed={isSelected} onClick={() => setSelectedMenuCategoryId(category.categoryId)}>{category.categoryName}</button>;
+            })}
+          </nav>
+          {selectedMenuCategory && (() => {
+          const category = selectedMenuCategory;
+          const pageSize = 8;
+          const pageCount = Math.max(1, Math.ceil(category.items.length / pageSize));
+          const page = Math.min(menuPages[category.categoryId] ?? 0, pageCount - 1);
+          const items = category.items.slice(page * pageSize, (page + 1) * pageSize);
+          return (
+            <section className="staff-console__menu-category" key={category.categoryId} aria-labelledby={`staff-category-${category.categoryId}`}>
+              <header><h3 id={`staff-category-${category.categoryId}`}>{category.categoryName}</h3><span>{category.items.length} items</span></header>
+              <div className="staff-console__menu-items">
+                {items.map((item) => (
+                  <article key={item.menu_item_id}>
+                    <div><strong>{item.item_name}</strong><span>{item.sku} · {formatMoney(item.base_price_minor)}</span></div>
+                    <div className="staff-console__item-actions">
+                      <button type="button" disabled={isLoading} onClick={() => openItemEditor(item)}>Edit item</button>
+                      <button type="button" disabled={isLoading} onClick={() => void setAvailability(item)}>
+                        {item.is_available ? 'Mark unavailable' : 'Restore item'}
+                      </button>
+                    </div>
+                  </article>
+                ))}
               </div>
+              {pageCount > 1 && <footer className="staff-console__pagination">
+                <button type="button" disabled={page === 0} onClick={() => setMenuPages((current) => ({ ...current, [category.categoryId]: page - 1 }))}>Previous</button>
+                <span>Page {page + 1} of {pageCount}</span>
+                <button type="button" disabled={page >= pageCount - 1} onClick={() => setMenuPages((current) => ({ ...current, [category.categoryId]: page + 1 }))}>Next</button>
+              </footer>}
+            </section>
+          );
+          })()}
+        </> : <p className="staff-console__empty">Loading menu items…</p>}
+      </section>
+      {itemEditor !== undefined && <section className="staff-console__editor-backdrop" role="presentation">
+        <form className="staff-console__item-editor" onSubmit={(event) => void saveMenuItem(event)} role="dialog" aria-modal="true" aria-labelledby="staff-item-editor-title">
+          <header>
+            <div><p>Menu management</p><h2 id="staff-item-editor-title">{itemEditor ? 'Edit menu item' : 'Add menu item'}</h2></div>
+            <button type="button" aria-label="Close item editor" disabled={isLoading} onClick={() => setItemEditor(undefined)}>×</button>
+          </header>
+          <div className="staff-console__editor-fields">
+            <label>Item name<input required maxLength={80} value={itemDraft.itemName} onChange={(event) => setItemDraft((current) => ({ ...current, itemName: event.target.value }))} /></label>
+            <label>Category<select value={itemDraft.categoryId} onChange={(event) => setItemDraft((current) => ({ ...current, categoryId: event.target.value }))}>{menuCategories.map((category) => <option key={category.categoryId} value={category.categoryId}>{category.categoryName}</option>)}</select></label>
+            <label>SKU<input required pattern="[A-Za-z0-9][A-Za-z0-9-]{1,47}" title="Use letters, numbers, and hyphens." maxLength={48} value={itemDraft.sku} onChange={(event) => setItemDraft((current) => ({ ...current, sku: event.target.value.toUpperCase() }))} /></label>
+            <label>Price (USD)<input required type="number" min="0" step="0.01" inputMode="decimal" value={itemDraft.price} onChange={(event) => setItemDraft((current) => ({ ...current, price: event.target.value }))} /></label>
+          </div>
+          <fieldset className="staff-console__availability-choice">
+            <legend>Kiosk availability</legend>
+            <button type="button" className={itemDraft.isAvailable ? 'is-selected' : ''} aria-pressed={itemDraft.isAvailable} onClick={() => setItemDraft((current) => ({ ...current, isAvailable: true }))}>Available now</button>
+            <button type="button" className={!itemDraft.isAvailable ? 'is-selected' : ''} aria-pressed={!itemDraft.isAvailable} onClick={() => setItemDraft((current) => ({ ...current, isAvailable: false }))}>Hidden / sold out</button>
+          </fieldset>
+          <footer><button type="button" disabled={isLoading} onClick={() => setItemEditor(undefined)}>Cancel</button><button type="submit" disabled={isLoading}>{isLoading ? 'Saving…' : itemEditor ? 'Save changes' : 'Add item'}</button></footer>
+        </form>
+      </section>}
+      <section className="staff-console__panel">
+        <div className="staff-console__panel-heading"><h2>Staff activity</h2><span>Recent audited operations by {overview?.staffIdentity.role ?? 'staff'} role.</span></div>
+        <div className="staff-console__audit-log">
+          {overview?.auditLog.length ? overview.auditLog.map((entry) => (
+            <article key={`${entry.created_at}-${entry.target_id}-${entry.action_type}`}>
+              <strong>{entry.action_type.replaceAll('_', ' ')}</strong>
+              <span>{entry.target_id}</span>
+              <time dateTime={entry.created_at}>{new Date(entry.created_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time>
             </article>
-          )) ?? <p>Loading menu items…</p>}
+          )) : <p>No staff changes recorded yet.</p>}
         </div>
       </section>
       <section className="staff-console__panel">
@@ -333,6 +519,7 @@ function KioskApp() {
   const [promotionCode, setPromotionCode] = useState(restoredOrder.promotionCode);
   const [quote, setQuote] = useState<OrderQuote>();
   const [activeCategory, setActiveCategory] = useState<string>();
+  const [activeCategoryKey, setActiveCategoryKey] = useState('burgers');
   const [message, setMessage] = useState('Loading local menu…');
   const [notice, setNotice] = useState<Notice>();
   const [order, setOrder] = useState<Order>();
@@ -367,6 +554,15 @@ function KioskApp() {
       window.removeEventListener('online', onOnline);
     };
   }, []);
+
+  useEffect(() => {
+    if (!notice) return undefined;
+    const dismissalTimer = window.setTimeout(
+      () => setNotice(undefined),
+      notice.tone === 'error' ? 6_000 : 4_000
+    );
+    return () => window.clearTimeout(dismissalTimer);
+  }, [notice]);
 
   useEffect(() => {
     if (cart.length === 0) {
@@ -434,6 +630,15 @@ function KioskApp() {
     };
   }, [confirmedOrder, isAttracting]);
 
+  useEffect(() => {
+    if (!customization) return undefined;
+    const dismissOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setCustomization(undefined);
+    };
+    window.addEventListener('keydown', dismissOnEscape);
+    return () => window.removeEventListener('keydown', dismissOnEscape);
+  }, [customization]);
+
   const visibleItems = useMemo(
     () => menu?.items.filter((item) => !activeCategory || item.category_id === activeCategory) ?? [],
     [activeCategory, menu]
@@ -446,13 +651,15 @@ function KioskApp() {
       ?? 'category-burgers';
 
     return [
-      { categoryId: burgerCategory, icon: menuBurgerIcon, label: 'Burgers' },
-      { categoryId: findCategory(/side/i)?.category_id ?? 'category-sides', icon: menuFriesIcon, label: 'Sides' },
-      { categoryId: findCategory(/drink/i)?.category_id ?? 'category-drinks', icon: menuDrinkIcon, label: 'Drinks' }
+      { key: 'burgers', categoryId: burgerCategory, icon: menuFigmaBurgerCategory, label: 'Burgers' },
+      { key: 'sides', categoryId: findCategory(/side/i)?.category_id ?? 'category-sides', icon: menuFigmaFriesCategory, label: 'Sides' },
+      { key: 'shakes', categoryId: findCategory(/shake/i)?.category_id ?? 'category-shakes', icon: menuFigmaCupCategory, label: 'Shakes' },
+      { key: 'sodas', categoryId: findCategory(/soda|drink/i)?.category_id ?? 'category-drinks', icon: menuFigmaCanCategory, label: 'Sodas' },
+      { key: 'pizzas', categoryId: findCategory(/pizza/i)?.category_id ?? 'category-pizzas', icon: menuFigmaPizzaCategory, label: 'Pizzas' }
     ];
   }, [menu]);
 
-  const activeCategoryLabel = categoryNavigation.find((category) => category.categoryId === activeCategory)?.label
+  const activeCategoryLabel = categoryNavigation.find((category) => category.key === activeCategoryKey)?.label
     ?? menu?.categories.find((category) => category.category_id === activeCategory)?.category_name
     ?? 'Menu';
 
@@ -479,6 +686,7 @@ function KioskApp() {
           ?? data.categories.find((category) => /burger|lunch/i.test(category.category_name))?.category_id
           ?? 'category-burgers'
       );
+      setActiveCategoryKey('burgers');
       setIsUpselling(false);
       setIsCheckingOut(false);
       setConfirmedOrder(undefined);
@@ -506,12 +714,21 @@ function KioskApp() {
     });
   }
 
+  function recordKioskEvent(eventType: 'order_started' | 'item_added' | 'upsell_viewed' | 'upsell_added' | 'checkout_viewed' | 'payment_started', context: Record<string, unknown> = {}) {
+    void fetch(`${edgeUrl}/v1/telemetry/events`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ eventType, context })
+    }).catch(() => undefined);
+  }
+
   function addCustomization() {
     if (!customization) return;
     const line = customizationLine(customization);
     setCart((current) => mergeCartLine(current, line));
     setMessage('Added to cart');
     setNotice({ tone: 'info', message: `${customization.item.item_name} added to your order.` });
+    recordKioskEvent('item_added', { menuItemId: customization.item.menu_item_id, quantity: customization.quantity });
     setCustomization(undefined);
   }
 
@@ -529,6 +746,8 @@ function KioskApp() {
     setCart((current) => mergeCartLine(current, { menuItemId, quantity: 1, modifiers: [] }));
     setMessage(`${itemName} added to cart`);
     setNotice({ tone: 'info', message: `${itemName} added to your order.` });
+    recordKioskEvent('item_added', { menuItemId });
+    recordKioskEvent('upsell_added', { menuItemId });
   }
 
   function continueToCheckout() {
@@ -536,6 +755,7 @@ function KioskApp() {
     setIsCheckingOut(true);
     setPaymentResult(undefined);
     setNotice(undefined);
+    recordKioskEvent('checkout_viewed');
   }
 
   async function cancelCheckout() {
@@ -572,6 +792,7 @@ function KioskApp() {
     if (items.length === 0) return;
     setIsProcessing('checkout');
     setNotice(undefined);
+    recordKioskEvent('payment_started', { itemCount: items.reduce((sum, item) => sum + item.quantity, 0) });
     try {
       const response = await fetch(`${edgeUrl}/v1/orders`, {
         method: 'POST',
@@ -651,12 +872,16 @@ function KioskApp() {
         <button
           type="button"
           className="attract-screen__start"
-          onClick={() => setIsAttracting(false)}
+          onClick={() => { recordKioskEvent('order_started'); setIsAttracting(false); }}
           aria-label="Start your order"
         >
-          <img className="attract-screen__background" src={attractBackground} alt="" />
+          <img className="attract-screen__background" src={attractAnvilBackground} alt="" />
           <span className="attract-screen__shade" aria-hidden="true" />
-          <span className="attract-screen__prompt">Tap Screen Start Order</span>
+          <img className="attract-screen__lockup" src={attractAnvilLockup} alt="" aria-hidden="true" />
+          <span className="attract-screen__prompt" aria-hidden="true">
+            <img src={attractTouchIcon} alt="" />
+            <span>Touch Screen To Start Ordering</span>
+          </span>
         </button>
       </main>
     );
@@ -672,98 +897,6 @@ function KioskApp() {
           <button type="button" onClick={startNewOrder}>Start New Order</button>
           <span className="sr-only" role="status">Order {confirmedOrder.transaction_id} completed successfully.</span>
         </section>
-      </main>
-    );
-  }
-
-  if (customization) {
-    const hasSizeOptions = customization.item.category_id === 'category-burgers';
-    const customizationImage = customization.item.menu_item_id === 'item-truffle-burger'
-      ? customizeBurgerImage
-      : menuItemImages[customization.item.menu_item_id] ?? customizeBurgerImage;
-
-    return (
-      <main className="kiosk-customization-screen">
-        <KioskOverlays notice={notice} isIdleWarning={isIdleWarning} />
-        <div className="kiosk-customization">
-          <h1>Customize Order</h1>
-          <div className="kiosk-customization__layout">
-            <article className="kiosk-customization__item-card">
-              <img className="kiosk-customization__item-image" src={customizationImage} alt={customization.item.item_name} />
-              <button
-                type="button"
-                className="kiosk-customization__close"
-                onClick={() => setCustomization(undefined)}
-                aria-label="Return to menu"
-              >
-                <img src={customizeCloseIcon} alt="" />
-              </button>
-              <div className="kiosk-customization__item-copy">
-                <h2>{customization.item.item_name}</h2>
-                <p>{menuItemDescriptions[customization.item.menu_item_id] ?? 'Made fresh to order.'}</p>
-                <span>1150 cal</span>
-              </div>
-            </article>
-            <section className="kiosk-customization__controls" aria-label={`Customize ${customization.item.item_name}`}>
-              <div className="kiosk-customization__amount-row">
-                <h2>Amount</h2>
-                <div className="kiosk-quantity-control" aria-label="Item quantity">
-                  <button
-                    type="button"
-                    onClick={() => setCustomization((current) => current && { ...current, quantity: Math.max(1, current.quantity - 1) })}
-                    aria-label="Decrease quantity"
-                    disabled={customization.quantity === 1}
-                  >
-                    <img src={customizeMinusIcon} alt="" />
-                  </button>
-                  <span>{customization.quantity}</span>
-                  <button
-                    type="button"
-                    onClick={() => setCustomization((current) => current && { ...current, quantity: Math.min(20, current.quantity + 1) })}
-                    aria-label="Increase quantity"
-                  >
-                    <span className="kiosk-quantity-control__plus" aria-hidden="true">
-                      <img src={customizePlusIcon} alt="" />
-                      <img src={customizePlusIcon} alt="" />
-                    </span>
-                  </button>
-                </div>
-              </div>
-              {hasSizeOptions && (
-                <div className="kiosk-customization__size-section">
-                  <h2>Size <em>*</em></h2>
-                  <div className="kiosk-customization__size-options">
-                    <button
-                      type="button"
-                      className={customization.size === 'single' ? 'is-selected' : ''}
-                      onClick={() => setCustomization((current) => current && { ...current, size: 'single' })}
-                      aria-pressed={customization.size === 'single'}
-                    >
-                      <span>Single</span>
-                    </button>
-                    <button
-                      type="button"
-                      className={customization.size === 'double' ? 'is-selected' : ''}
-                      onClick={() => setCustomization((current) => current && { ...current, size: 'double' })}
-                      aria-pressed={customization.size === 'double'}
-                    >
-                      <span>Double</span>
-                      <small>+ $4.00</small>
-                    </button>
-                  </div>
-                </div>
-              )}
-              <div className="kiosk-customization__actions">
-                <button type="button" className="kiosk-customization__add-more" onClick={addCustomization}>Add to Order</button>
-              </div>
-            </section>
-          </div>
-        </div>
-        {cart.length > 0 && (
-          <button type="button" className="kiosk-order-peek" onClick={() => setCustomization(undefined)}>
-            View Order · {cart.reduce((sum, line) => sum + line.quantity, 0)} items · {formatMoney(quote?.totalAmountMinor ?? 0, menu?.currencyCode)}
-          </button>
-        )}
       </main>
     );
   }
@@ -785,7 +918,7 @@ function KioskApp() {
           <div className="kiosk-checkout-summary__items">
             {cartEntries.map(({ line, index, itemName, modifiers, total: lineTotal }) => (
               <article className="kiosk-checkout-summary__item" key={`${line.menuItemId}-${index}`}>
-                <img src={checkoutItemImage} alt="" />
+                <img src={menuImage(line.menuItemId, menu?.items.find((item) => item.menu_item_id === line.menuItemId)?.category_id, checkoutItemImage)} alt="" />
                 <div>
                   <h2>{itemName}</h2>
                   <p>{modifiers.join(', ') || 'Standard'}</p>
@@ -883,39 +1016,50 @@ function KioskApp() {
   }
 
   return (
-    <main className="kiosk-menu-screen">
+    <main className="kiosk-menu-screen kiosk-menu-screen--figma">
       <KioskOverlays notice={notice} isIdleWarning={isIdleWarning} />
       <aside className="kiosk-category-nav" aria-label="Menu categories">
         {categoryNavigation.map((category) => {
-          const isActive = category.categoryId === activeCategory;
+          const isActive = category.key === activeCategoryKey;
           return (
             <button
-              key={category.label}
+              key={category.key}
               type="button"
               className={`kiosk-category-nav__button${isActive ? ' kiosk-category-nav__button--active' : ''}`}
               aria-pressed={isActive}
-              onClick={() => setActiveCategory(category.categoryId)}
+              aria-label={category.label}
+              onClick={() => {
+                setActiveCategory(category.categoryId);
+                setActiveCategoryKey(category.key);
+              }}
             >
-              <img src={category.icon} alt="" />
-              <span>{category.label}</span>
+              <span className="kiosk-category-nav__icon" aria-hidden="true">
+                <img src={isActive ? menuFigmaCategoryActive : menuFigmaCategoryInactive} alt="" />
+                {!isActive && category.key === 'burgers' ? (
+                  <span className="kiosk-category-nav__symbol kiosk-category-nav__symbol--burgers" />
+                ) : (
+                  <img className={`kiosk-category-nav__symbol kiosk-category-nav__symbol--${category.key}${isActive ? ' is-active' : ''}`} src={category.icon} alt="" />
+                )}
+              </span>
+              <span className="kiosk-category-nav__label">{category.label}</span>
             </button>
           );
         })}
+        <img className="kiosk-menu-screen__divider" src={menuFigmaMenuDivider} alt="" aria-hidden="true" />
       </aside>
       <section className="kiosk-menu-content" aria-label={`${activeCategoryLabel} menu`}>
-        <h1>{activeCategoryLabel}</h1>
         <p className="sr-only" role="status">{message}</p>
         {visibleItems.length > 0 ? (
           <div className="kiosk-menu-grid">
             {visibleItems.map((item) => (
               <article className="kiosk-menu-card" key={item.menu_item_id}>
-                <img className="kiosk-menu-card__image" src={menuItemImages[item.menu_item_id] ?? classicBurgerImage} alt={item.item_name} />
+                <img className="kiosk-menu-card__image" src={menuImage(item.menu_item_id, item.category_id)} alt={item.item_name} loading="lazy" decoding="async" />
                 <div className="kiosk-menu-card__content">
                   <h2>{item.item_name}</h2>
-                  <p>{menuItemDescriptions[item.menu_item_id] ?? 'Made fresh to order.'}</p>
                   <strong>{formatMoney(item.base_price_minor, menu?.currencyCode)}</strong>
                   <button type="button" aria-label={`Customize ${item.item_name}`} onClick={() => openCustomization(item)}>
-                    <img src={menuAddIcon} alt="" />
+                    <img src={menuFigmaAddBackground} alt="" />
+                    <img src={menuFigmaAddIcon} alt="" />
                   </button>
                 </div>
               </article>
@@ -926,10 +1070,12 @@ function KioskApp() {
         )}
       </section>
       <aside className="kiosk-cart" aria-label="Your order">
+        <img className="kiosk-cart__brand" src={attractAnvilLockup} alt="ANVIL" />
         <header className="kiosk-cart__header">
           <h2>Your Order</h2>
           <span>{cart.reduce((sum, line) => sum + line.quantity, 0)} items</span>
         </header>
+        <img className="kiosk-cart__divider" src={menuFigmaCartDivider} alt="" aria-hidden="true" />
         {cartEntries.length > 0 ? (
           <ul className="kiosk-cart__items">
             {cartEntries.map(({ line, index, itemName, modifiers, total }) => (
@@ -940,9 +1086,9 @@ function KioskApp() {
                   <span>{formatMoney(total, menu?.currencyCode)}</span>
                 </div>
                 <div className="kiosk-cart__quantity" aria-label={`Quantity for ${itemName}`}>
-                  <button type="button" onClick={() => changeCartQuantity(index, -1)} aria-label={`Remove one ${itemName}`}>−</button>
+                  <button type="button" onClick={() => changeCartQuantity(index, -1)} aria-label={`Remove one ${itemName}`}><img src={menuFigmaCartMinus} alt="" /></button>
                   <span>{line.quantity}</span>
-                  <button type="button" onClick={() => changeCartQuantity(index, 1)} aria-label={`Add one ${itemName}`}>+</button>
+                  <button type="button" onClick={() => changeCartQuantity(index, 1)} aria-label={`Add one ${itemName}`}><img src={menuFigmaCartPlus} alt="" /></button>
                 </div>
               </li>
             ))}
@@ -951,24 +1097,13 @@ function KioskApp() {
           <p className="kiosk-cart__empty">Your order is empty. Choose an item to get started.</p>
         )}
         <footer className="kiosk-cart__footer">
-          {cart.length > 0 && (
-            <label className="kiosk-cart__promo">
-              <span>Promo code</span>
-              <input
-                value={promotionCode}
-                onChange={(event) => setPromotionCode(event.target.value.toUpperCase())}
-                placeholder="Optional"
-                maxLength={32}
-                autoCapitalize="characters"
-              />
-            </label>
-          )}
+          <img className="kiosk-cart__divider" src={menuFigmaCartDivider} alt="" aria-hidden="true" />
           <div className="kiosk-cart__total">
             <span>Total</span>
             <strong>{isQuoting ? 'Updating…' : formatMoney(quote?.totalAmountMinor ?? 0, menu?.currencyCode)}</strong>
           </div>
           {!order ? (
-            <button type="button" disabled={!quote || isQuoting} onClick={() => setIsUpselling(true)}>
+            <button type="button" disabled={!quote || isQuoting} onClick={() => { recordKioskEvent('upsell_viewed'); setIsUpselling(true); }}>
               {isQuoting ? 'Updating Order…' : 'Checkout'}
             </button>
           ) : (
@@ -981,6 +1116,71 @@ function KioskApp() {
           )}
         </footer>
       </aside>
+      {customization && (
+        <section
+          className="kiosk-customization-modal"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setCustomization(undefined);
+          }}
+        >
+          <div className="kiosk-customization kiosk-customization--modal" role="dialog" aria-modal="true" aria-labelledby="customization-title">
+            <header className="kiosk-customization__modal-header">
+              <div>
+                <p>Make it yours</p>
+                <h1 id="customization-title">Customize your order</h1>
+              </div>
+              <button type="button" className="kiosk-customization__modal-close" onClick={() => setCustomization(undefined)} aria-label="Close customization">
+                <img src={customizeCloseIcon} alt="" />
+              </button>
+            </header>
+            <div className="kiosk-customization__layout">
+              <article className="kiosk-customization__item-card">
+                <img
+                  className="kiosk-customization__item-image"
+                  src={menuImage(customization.item.menu_item_id, customization.item.category_id, customizeBurgerImage)}
+                  alt={customization.item.item_name}
+                />
+                <div className="kiosk-customization__item-copy">
+                  <h2>{customization.item.item_name}</h2>
+                  <p>{menuItemDescriptions[customization.item.menu_item_id] ?? 'Made fresh to order.'}</p>
+                  <span>1150 cal</span>
+                </div>
+              </article>
+              <section className="kiosk-customization__controls" aria-label="Customization options">
+                <div className="kiosk-customization__amount-row">
+                  <h2>Amount</h2>
+                  <div className="kiosk-quantity-control" aria-label="Item amount">
+                    <button type="button" disabled={customization.quantity <= 1} onClick={() => setCustomization((current) => current ? { ...current, quantity: Math.max(1, current.quantity - 1) } : current)} aria-label="Decrease amount">
+                      <img src={customizeMinusIcon} alt="" />
+                    </button>
+                    <span>{customization.quantity}</span>
+                    <button type="button" onClick={() => setCustomization((current) => current ? { ...current, quantity: Math.min(20, current.quantity + 1) } : current)} aria-label="Increase amount">
+                      <span className="kiosk-quantity-control__plus"><img src={customizePlusIcon} alt="" /><img src={customizePlusIcon} alt="" /></span>
+                    </button>
+                  </div>
+                </div>
+                {customization.item.category_id === 'category-burgers' && (
+                  <section className="kiosk-customization__size-section" aria-labelledby="burger-size-title">
+                    <h2 id="burger-size-title">Burger size</h2>
+                    <div className="kiosk-customization__size-options">
+                      <button type="button" className={customization.size === 'single' ? 'is-selected' : ''} aria-pressed={customization.size === 'single'} onClick={() => setCustomization((current) => current ? { ...current, size: 'single' } : current)}>
+                        <span>Single</span><small>1 patty</small>
+                      </button>
+                      <button type="button" className={customization.size === 'double' ? 'is-selected' : ''} aria-pressed={customization.size === 'double'} onClick={() => setCustomization((current) => current ? { ...current, size: 'double' } : current)}>
+                        <span>Double</span><small>2 patties</small>
+                      </button>
+                    </div>
+                  </section>
+                )}
+                <footer className="kiosk-customization__actions">
+                  <button type="button" className="kiosk-customization__add-more" onClick={addCustomization}>Add to Order</button>
+                </footer>
+              </section>
+            </div>
+          </div>
+        </section>
+      )}
     </main>
   );
 }
