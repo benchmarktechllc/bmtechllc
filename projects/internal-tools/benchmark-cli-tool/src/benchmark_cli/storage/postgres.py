@@ -1164,15 +1164,171 @@ def set_github_commit(repo: str, commit_sha: str) -> None:
         conn.commit()
 
 
-def github_pull_request_chunks() -> list[SearchChunk]:
-    """Indexed pull-request chunks. Callers order them by merge time."""
-    statement = """
-        SELECT id, source_file, chunk_index, chunk_text, metadata, 0.0,
-               token_count, content_sha256
-        FROM document_chunks
-        WHERE metadata ->> 'source_type' = 'github'
-          AND metadata ->> 'kind' = 'pull_request'
-    """
+GITHUB_LANE_KINDS = ("code", "config", "workflow", "doc")
+_GITHUB_COLUMNS = """
+    id, repo, path, kind, chunk_index, symbol, header_words, start_line, end_line,
+    chunk_text, token_count, content_sha256, metadata
+"""
+_OR_TSQUERY = "replace(websearch_to_tsquery('english', %s)::text, ' & ', ' | ')::tsquery"
+
+
+def _github_chunk(row: Sequence[Any], score: float) -> SearchChunk:
+    """One github_chunks row in the shape every answer path already reads."""
+    (
+        chunk_id,
+        repo,
+        path,
+        kind,
+        chunk_index,
+        symbol,
+        header_words,
+        start_line,
+        end_line,
+        chunk_text,
+        token_count,
+        content_sha256,
+        stored,
+    ) = row
+    stored = dict(stored or {})
+    metadata = {
+        "source_type": "github",
+        "repo": repo,
+        "path": path,
+        "url": str(stored.get("url") or ""),
+        "kind": kind,
+        "symbol": symbol,
+        "header_words": header_words,
+        "start_line": int(start_line),
+        "end_line": int(end_line),
+        "merged_at": stored.get("merged_at"),
+        "title": stored.get("title"),
+    }
+    return SearchChunk(
+        int(chunk_id),
+        f"github/{repo}/{path}",
+        int(chunk_index),
+        str(chunk_text),
+        metadata,
+        float(score),
+        int(token_count),
+        str(content_sha256).strip(),
+    )
+
+
+def _github_rows(statement: str, parameters: Sequence[Any]) -> list[SearchChunk]:
     with connection() as conn, conn.cursor() as cursor:
-        cursor.execute(statement)
-        return [SearchChunk(*row) for row in cursor.fetchall()]
+        cursor.execute(statement, tuple(parameters))
+        return [_github_chunk(row[:-1], row[-1]) for row in cursor.fetchall()]
+
+
+def github_vector_search(
+    query_vector: Sequence[float], limit: int, kinds: Sequence[str] = GITHUB_LANE_KINDS
+) -> list[SearchChunk]:
+    """Nearest github_chunks rows by cosine. Reads only github_chunks."""
+    if limit < 1:
+        return []
+    statement = f"""
+        SELECT {_GITHUB_COLUMNS}, 1 - (embedding <=> %s::vector) AS score
+        FROM github_chunks
+        WHERE kind = ANY(%s)
+        ORDER BY embedding <=> %s::vector, id
+        LIMIT %s
+    """
+    vector = list(query_vector)
+    return _github_rows(statement, (vector, list(kinds), vector, limit))
+
+
+def github_fts_search(
+    query: str, limit: int, kinds: Sequence[str] = GITHUB_LANE_KINDS
+) -> list[SearchChunk]:
+    """Full-text rank over header words (weight A) and code text. Same OR rewrite as fts_search."""
+    if not query.strip() or limit < 1:
+        return []
+    statement = f"""
+        WITH query AS (SELECT {_OR_TSQUERY} AS tsq)
+        SELECT {_GITHUB_COLUMNS}, ts_rank_cd(search_vector, query.tsq) AS score
+        FROM github_chunks, query
+        WHERE search_vector @@ query.tsq AND kind = ANY(%s)
+        ORDER BY score DESC, id ASC
+        LIMIT %s
+    """
+    return _github_rows(statement, (query, list(kinds), limit))
+
+
+def github_header_search(
+    query: str, limit: int, kinds: Sequence[str] = GITHUB_LANE_KINDS
+) -> list[SearchChunk]:
+    """Rank by path, symbol, and defined names only."""
+    if not query.strip() or limit < 1:
+        return []
+    statement = f"""
+        WITH query AS (SELECT {_OR_TSQUERY} AS tsq)
+        SELECT {_GITHUB_COLUMNS}, ts_rank_cd(header_vector, query.tsq) AS score
+        FROM github_chunks, query
+        WHERE header_vector @@ query.tsq AND kind = ANY(%s)
+        ORDER BY score DESC, id ASC
+        LIMIT %s
+    """
+    return _github_rows(statement, (query, list(kinds), limit))
+
+
+def github_pull_rows() -> list[SearchChunk]:
+    """Indexed pull-request chunks. Callers order them by merge time."""
+    statement = f"""
+        SELECT {_GITHUB_COLUMNS}, 0.0 AS score
+        FROM github_chunks
+        WHERE kind = 'pull_request'
+    """
+    return _github_rows(statement, ())
+
+
+def github_chunk_count() -> int:
+    """Rows in github_chunks. A missing table raises, and callers treat that as empty."""
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT count(*) FROM github_chunks")
+        return int(cursor.fetchone()[0])
+
+
+def github_indexed_paths(repo: str) -> set[str]:
+    """Paths that have at least one row in github_chunks."""
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT DISTINCT path FROM github_chunks WHERE repo = %s", (repo,))
+        return {str(row[0]) for row in cursor.fetchall()}
+
+
+def github_existing_embeddings(hashes: Sequence[str]) -> dict[str, list[float]]:
+    """Vectors already stored in github_chunks, keyed by content hash."""
+    if not hashes:
+        return {}
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT content_sha256, embedding FROM github_chunks WHERE content_sha256 = ANY(%s)",
+            (list(hashes),),
+        )
+        return {digest.strip(): embedding.to_list() for digest, embedding in cursor.fetchall()}
+
+
+def replace_github_chunks(repo: str, path: str, rows: Sequence[dict[str, Any]]) -> int:
+    """Atomically replace one file's rows in github_chunks. Embeddings are prepared first."""
+    _, _, Json = _dependencies()
+    statement = """
+        INSERT INTO github_chunks
+            (repo, path, kind, chunk_index, symbol, header_words, start_line, end_line,
+             chunk_text, content_sha256, token_count, embedding, metadata)
+        VALUES (%(repo)s, %(path)s, %(kind)s, %(chunk_index)s, %(symbol)s, %(header_words)s,
+                %(start_line)s, %(end_line)s, %(chunk_text)s, %(content_sha256)s,
+                %(token_count)s, %(embedding)s, %(metadata)s)
+    """
+    prepared = [{**row, "repo": repo, "path": path, "metadata": Json(row["metadata"])} for row in rows]
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("DELETE FROM github_chunks WHERE repo = %s AND path = %s", (repo, path))
+        if prepared:
+            cursor.executemany(statement, prepared)
+        conn.commit()
+    return len(prepared)
+
+
+def delete_github_chunks(repo: str, path: str) -> None:
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("DELETE FROM github_chunks WHERE repo = %s AND path = %s", (repo, path))
+        conn.commit()
