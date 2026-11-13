@@ -11,7 +11,7 @@ from dataclasses import replace
 from typing import Any
 
 from .contributions import contribution_answer
-from .github_answers import append_github_links, asks_for_recent_pulls, recent_pulls_answer
+from .github_answers import answer_code_question, is_code_question
 from .grounding import (
     ANSWER_PATH_REVISION,
     SyncedDiscordChannel,
@@ -77,6 +77,7 @@ from .trello_answers import (
     requested_trello_list,
     snapshot_messages,
     snapshot_payload,
+    specific_card_status,
     titles_outside_person,
     trello_board_link_answer,
 )
@@ -104,8 +105,6 @@ evidence explicitly says so. If the question asks for a named document and
 the evidence is a different page, call that page the closest related page
 and do not give it the requested document's name. Never repeat tokens,
 passwords, or private keys.
-GitHub code evidence has source_type github. Cite the file path. If you use
-a GitHub URL, copy that URL from the chunk. Do not invent one.
 Trello is the source of truth for current work and ticket status. Doing means
 currently being worked on. Prefer current structured Trello and knowledge-base
 data over old chat messages. Say when sources conflict or a chat note is dated.
@@ -204,8 +203,6 @@ def _source_label(chunk: SearchChunk) -> str:
         return "Knowledge base"
     if source_type == "transcript":
         return "Meeting transcript"
-    if source_type == "github":
-        return f"GitHub {metadata.get('path') or chunk.source_file}"
     return source_type
 
 
@@ -450,15 +447,8 @@ def _synced_channels() -> tuple[SyncedDiscordChannel, ...]:
     return tuple(channels)
 
 
-def _finish(
-    response: AnswerResponse,
-    *,
-    outcome: str,
-    synthesis_attempts: int,
-    evidence: dict[int, SearchChunk] | None = None,
-) -> AnswerResponse:
-    linked = append_github_links(response, evidence or {})
-    scrubbed = scrub_response(linked)
+def _finish(response: AnswerResponse, *, outcome: str, synthesis_attempts: int) -> AnswerResponse:
+    scrubbed = scrub_response(response)
     log_agent_diagnostic(outcome=outcome, synthesis_attempts=synthesis_attempts)
     return scrubbed
 
@@ -1003,6 +993,19 @@ def run_agent(
         decision = _with_phrase(decision, "core team")
         _log_retrieval("core_team", decision)
         return _finish(core_team_answer(decision.results), outcome="core_team", synthesis_attempts=0)
+    if (
+        is_code_question(question)
+        and not plan.person
+        and not asks_for_portal_link(question)
+        and not asks_for_trello_board_link(question)
+        and requested_trello_list(question) is None
+        and bare_list_name(question) is None
+        and not (snapshot and specific_card_status(question, snapshot) is not None)
+    ):
+        code = answer_code_question(question)  # None = lane has no candidates or is unavailable
+        if code is not None:
+            _log_retrieval(code.outcome, decision)
+            return _finish(code.response, outcome=code.outcome, synthesis_attempts=code.attempts)
     if (decision is None or decision.status != "accepted") and not snapshot:
         fallback = _deterministic_fallback(
             question, thread_question, snapshot, (), plan.person, searches
@@ -1015,22 +1018,6 @@ def run_agent(
     if asks_for_portal_link(question) and decision is not None and decision.results:
         _log_retrieval("portal_link", decision)
         return _finish(portal_link_answer(decision.results), outcome="portal_link", synthesis_attempts=0)
-    if asks_for_recent_pulls(question) and not plan.person:
-        from .trello_answers import resolve_board_list
-
-        known = sorted({str(getattr(card, "list_name", "") or "") for card in snapshot or ()})
-        if resolve_board_list(question, known) is None:
-            try:
-                from .storage.postgres import github_pull_request_chunks
-
-                pull_rows = tuple(github_pull_request_chunks())
-            except Exception:
-                logger.warning("Pull request index is unavailable.")
-                pull_rows = ()
-            pulls = recent_pulls_answer(pull_rows)
-            if pulls is not None:
-                _log_retrieval("github_pulls", decision)
-                return _finish(pulls, outcome="github_pulls", synthesis_attempts=0)
     _log_retrieval("model", decision)
 
     def _quota_reply() -> AnswerResponse:
@@ -1137,7 +1124,7 @@ def run_agent(
     completed = _complete(checked)
     if completed is not None:
         outcome = "answered" if completed == response else "answered_with_citation_normalization"
-        return _finish(completed, outcome=outcome, synthesis_attempts=1, evidence=evidence)
+        return _finish(completed, outcome=outcome, synthesis_attempts=1)
     errors = (
         _validation_errors(response, evidence, snapshot or (), plan.person)
         if response is not None
@@ -1158,7 +1145,7 @@ def run_agent(
     checked_retry = _checked(retry)
     completed_retry = _complete(checked_retry)
     if completed_retry is not None:
-        return _finish(completed_retry, outcome="answered_after_citation_retry", synthesis_attempts=2, evidence=evidence)
+        return _finish(completed_retry, outcome="answered_after_citation_retry", synthesis_attempts=2)
     fallback = _deterministic_fallback(
         question, thread_question, snapshot, tuple(evidence.values()), plan.person, searches
     )

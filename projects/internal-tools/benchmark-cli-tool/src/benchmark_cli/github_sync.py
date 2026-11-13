@@ -1,12 +1,14 @@
-"""Index the public BMTech repository into ``document_chunks``.
+"""Index the public BMTech repository into ``github_chunks``.
 
-The first index belongs on the build that knows ``source_type`` github.
-Older builds do not crash if these rows exist, but the rows can take
-retrieval slots, so wait to index until this build is the one serving Discord.
+Code chunks never enter ``document_chunks``, so indexing is safe on any build:
+older builds and every non-code question never read this table. Run it before
+or after a deploy.
 
-No new secret. A ``GITHUB_TOKEN`` or ``GH_TOKEN`` already in the environment
-is sent as a bearer token for pull-request reads. The public file tree is
-read from ``--root``.
+Files are read from a local checkout (``--root``); no token is needed for that.
+Pull requests come from the GitHub API. A ``GITHUB_TOKEN`` or ``GH_TOKEN``
+already in the environment is sent when present; without one the public API
+is used unauthenticated (60 requests an hour). ``--pulls-json`` reads a saved
+pull-request list instead, and ``--skip-pulls`` leaves indexed pulls unchanged.
 """
 
 from __future__ import annotations
@@ -18,24 +20,28 @@ import logging
 import os
 import urllib.request
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .github_files import chunk_text, render_piece, should_index, source_file_for
+from .github_files import (
+    chunk_text,
+    header_words,
+    kind_for,
+    render_chunk_text,
+    render_embed_text,
+    should_index,
+)
 from .ingestion.chunk import token_count
 from .ingestion.clean import redact_secrets
-from .ingestion.pipeline import content_hash
-from .models import ChunkMetadata
 from .providers.openai import embed_texts
 from .storage.postgres import (
-    create_indexes,
+    delete_github_chunks,
     delete_github_file,
-    delete_source,
-    existing_embeddings,
+    github_existing_embeddings,
     github_file_digests,
+    github_indexed_paths,
     initialize_database,
-    replace_source_chunks,
+    replace_github_chunks,
     set_github_commit,
     upsert_github_file,
 )
@@ -43,6 +49,7 @@ from .storage.postgres import (
 logger = logging.getLogger(__name__)
 DEFAULT_REPO = "benchmarktechllc/bmtechllc"
 _MAX_CHUNK_TOKENS = 1800
+_EMBED_BATCH = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,47 +110,47 @@ def listed_files(root: Path) -> dict[str, tuple[str, str]]:
     return found
 
 
+def row_digest(embed_text: str, stored_text: str) -> str:
+    """sha256(embed_text || chunk_text). A change to either text re-embeds."""
+    return hashlib.sha256((embed_text + stored_text).encode("utf-8")).hexdigest()
+
+
 def code_rows(repo: str, commit_sha: str, path: str, text: str) -> list[dict[str, Any]]:
-    """One stored row per chunk. The row uses the existing document_chunks columns."""
-    stamped = datetime.now(UTC).isoformat()
-    day = stamped[:10]
+    """One github_chunks row per piece, with the stored text and the embedded text."""
+    kind = kind_for(path)
     rows: list[dict[str, Any]] = []
     for piece in chunk_text(text, path):
-        rendered = _fit(
+        stored = _fit(
             redact_secrets(
-                render_piece(
-                    repo,
-                    commit_sha,
-                    path,
-                    piece.start_line,
-                    piece.end_line,
-                    piece.symbol,
-                    piece.text,
+                render_chunk_text(
+                    repo, commit_sha, path, piece.start_line, piece.end_line, piece.symbol, piece.text
                 )
             )
         )
-        if not rendered.strip():
+        embedded = _fit(redact_secrets(render_embed_text(path, kind, piece)))
+        if not stored.strip() or not embedded.strip():
             continue
-        count = token_count(rendered)
+        count = token_count(stored)
         if count < 1 or count > 2000:
             continue
-        url = rendered.splitlines()[1] if len(rendered.splitlines()) > 1 else ""
-        metadata = ChunkMetadata(
-            source_type="github",
-            date=day,
-            ingested_at=stamped,
-            section=path,
-            title=piece.symbol or path,
-            repo=repo,
-            path=path,
-            commit_sha=commit_sha,
-            url=url,
-            start_line=piece.start_line,
-            end_line=piece.end_line,
-            symbol=piece.symbol or None,
-            kind="code",
+        lines = stored.splitlines()
+        url = lines[1] if len(lines) > 1 and lines[1].startswith("https://github.com/") else ""
+        rows.append(
+            {
+                "kind": kind,
+                "chunk_index": len(rows),
+                "symbol": piece.symbol,
+                "header_words": header_words(path, piece.symbol, piece.names),
+                "start_line": piece.start_line,
+                "end_line": piece.end_line,
+                "chunk_text": stored,
+                "embed_text": embedded,
+                "content_sha256": row_digest(embedded, stored),
+                "token_count": count,
+                "embedding": [],
+                "metadata": {"url": url, "commit_sha": commit_sha, "title": piece.symbol or path},
+            }
         )
-        rows.append(_row(source_file_for(repo, path), len(rows), rendered, count, metadata))
     return rows
 
 
@@ -152,52 +159,72 @@ def pull_rows(repo: str, commit_sha: str, record: dict[str, Any]) -> list[dict[s
     number = int(record["number"])
     path = f"pulls/{number}"
     url = f"https://github.com/{repo}/pull/{number}"
+    title = str(record.get("title") or "")
     files = "\n".join(f"- {item}" for item in record.get("files") or []) or "- (no files listed)"
     merged = str(record.get("merged_at") or "")
-    text = _fit(
+    body = str(record.get("body") or "").strip()
+    stored = _fit(
         redact_secrets(
             "\n".join(
                 [
-                    f"Pull request #{number}: {record.get('title') or ''}",
+                    f"Pull request #{number}: {title}",
                     f"State: {record.get('state') or ''}",
                     f"Merged: {merged}",
                     url,
                     "Files:",
                     files,
                     "",
-                    str(record.get("body") or "").strip(),
+                    body,
                 ]
             )
             + "\n"
         )
     )
-    count = token_count(text)
+    embedded = _fit(redact_secrets(f"Pull request #{number}: {title}\nFiles:\n{files}\n\n{body}\n"))
+    count = token_count(stored)
     if count < 1 or count > 2000:
         return []
-    stamped = datetime.now(UTC).isoformat()
-    metadata = ChunkMetadata(
-        source_type="github",
-        date=(merged or stamped)[:10],
-        ingested_at=stamped,
-        section=path,
-        title=str(record.get("title") or f"#{number}"),
-        repo=repo,
-        path=path,
-        commit_sha=str(record.get("merge_sha") or commit_sha),
-        url=url,
-        start_line=1,
-        end_line=max(text.count("\n"), 1),
-        kind="pull_request",
-        merged_at=merged or None,
-    )
-    return [_row(source_file_for(repo, path), 0, text, count, metadata)]
+    return [
+        {
+            "kind": "pull_request",
+            "chunk_index": 0,
+            "symbol": "",
+            "header_words": header_words(path, "", [title]),
+            "start_line": 1,
+            "end_line": max(stored.count("\n"), 1),
+            "chunk_text": stored,
+            "embed_text": embedded,
+            "content_sha256": row_digest(embedded, stored),
+            "token_count": count,
+            "embedding": [],
+            "metadata": {
+                "url": url,
+                "merged_at": merged or None,
+                "title": title or f"#{number}",
+                "commit_sha": str(record.get("merge_sha") or commit_sha),
+            },
+        }
+    ]
 
 
-def sync_repository(root: Path, repo: str, commit_sha: str, *, pulls: list[dict[str, Any]]) -> dict[str, int]:
-    """Index changed files and the current pull-request list. Unchanged files are left alone."""
+def sync_repository(
+    root: Path,
+    repo: str,
+    commit_sha: str,
+    *,
+    pulls: list[dict[str, Any]] | None,
+    full: bool = False,
+) -> dict[str, int]:
+    """Index changed files, and pull requests when a list is given. ``None`` leaves pulls alone."""
     initialize_database()
-    stored = github_file_digests(repo)
+    recorded = github_file_digests(repo)
+    present = github_indexed_paths(repo)
+    # File state without rows (an older index wrote elsewhere) is not trusted.
+    stored = {} if full else {path: digest for path, digest in recorded.items() if path in present}
     current_files = listed_files(root)
+    for path in recorded:
+        if path not in present and path not in current_files and not path.startswith("pulls/"):
+            delete_github_file(repo, path)
     file_plan = plan_file_changes(
         {path: digest for path, digest in stored.items() if not path.startswith("pulls/")},
         {path: digest for path, (digest, _text) in current_files.items()},
@@ -205,50 +232,51 @@ def sync_repository(root: Path, repo: str, commit_sha: str, *, pulls: list[dict[
     indexed = 0
     for path in file_plan.changed:
         digest, text = current_files[path]
-        source = source_file_for(repo, path)
         rows = _with_embeddings(code_rows(repo, commit_sha, path, text))
         if rows:
-            replace_source_chunks(source, rows)
-            upsert_github_file(repo, path, source, digest)
+            replace_github_chunks(repo, path, rows)
+            upsert_github_file(repo, path, f"github/{repo}/{path}", digest)
             indexed += 1
             logger.info("indexed %s chunks=%s", path, len(rows))
         else:
-            delete_source(source)
+            delete_github_chunks(repo, path)
             delete_github_file(repo, path)
     for path in file_plan.removed:
-        delete_source(source_file_for(repo, path))
+        delete_github_chunks(repo, path)
         delete_github_file(repo, path)
         logger.info("removed %s", path)
-    pull_current: dict[str, str] = {}
-    pull_rows_by_path: dict[str, list[dict[str, Any]]] = {}
-    for record in pulls:
-        path = f"pulls/{int(record['number'])}"
-        rows = pull_rows(repo, commit_sha, record)
-        if not rows:
-            continue
-        pull_current[path] = rows[0]["content_sha256"]
-        pull_rows_by_path[path] = rows
-    pull_plan = plan_file_changes(
-        {path: digest for path, digest in stored.items() if path.startswith("pulls/")},
-        pull_current,
-    )
-    for path in pull_plan.changed:
-        rows = _with_embeddings(pull_rows_by_path[path])
-        source = source_file_for(repo, path)
-        replace_source_chunks(source, rows)
-        upsert_github_file(repo, path, source, pull_current[path])
-        logger.info("indexed %s", path)
-    for path in pull_plan.removed:
-        delete_source(source_file_for(repo, path))
-        delete_github_file(repo, path)
-        logger.info("removed %s", path)
+    pulls_indexed = 0
+    pulls_removed = 0
+    if pulls is not None:
+        pull_current: dict[str, str] = {}
+        pull_rows_by_path: dict[str, list[dict[str, Any]]] = {}
+        for record in pulls:
+            path = f"pulls/{int(record['number'])}"
+            rows = pull_rows(repo, commit_sha, record)
+            if not rows:
+                continue
+            pull_current[path] = rows[0]["content_sha256"]
+            pull_rows_by_path[path] = rows
+        pull_plan = plan_file_changes(
+            {path: digest for path, digest in stored.items() if path.startswith("pulls/")},
+            pull_current,
+        )
+        for path in pull_plan.changed:
+            replace_github_chunks(repo, path, _with_embeddings(pull_rows_by_path[path]))
+            upsert_github_file(repo, path, f"github/{repo}/{path}", pull_current[path])
+            logger.info("indexed %s", path)
+        for path in pull_plan.removed:
+            delete_github_chunks(repo, path)
+            delete_github_file(repo, path)
+            logger.info("removed %s", path)
+        pulls_indexed = len(pull_plan.changed)
+        pulls_removed = len(pull_plan.removed)
     set_github_commit(repo, commit_sha)
-    create_indexes()
     return {
         "files_indexed": indexed,
         "files_removed": len(file_plan.removed),
-        "pulls_indexed": len(pull_plan.changed),
-        "pulls_removed": len(pull_plan.removed),
+        "pulls_indexed": pulls_indexed,
+        "pulls_removed": pulls_removed,
     }
 
 
@@ -275,14 +303,18 @@ def fetch_pull_requests(repo: str, token: str | None) -> list[dict[str, Any]]:
             f"https://api.github.com/repos/{repo}/pulls/{number}/files?per_page=100",
             headers,
         )
-        paths = [str(item.get("filename") or "") for item in files if isinstance(item, dict)] if isinstance(files, list) else []
+        paths = (
+            [str(item.get("filename") or "") for item in files if isinstance(item, dict)]
+            if isinstance(files, list)
+            else []
+        )
         records.append(
             {
                 "number": number,
                 "title": str(pull.get("title") or ""),
                 "state": "merged" if pull.get("merged_at") else str(pull.get("state") or ""),
                 "merged_at": str(pull.get("merged_at") or ""),
-                "merge_sha": str(pull.get("merge_commit_sha") or "" ),
+                "merge_sha": str(pull.get("merge_commit_sha") or ""),
                 "body": str(pull.get("body") or ""),
                 "files": [path for path in paths if path],
             }
@@ -290,32 +322,20 @@ def fetch_pull_requests(repo: str, token: str | None) -> list[dict[str, Any]]:
     return records
 
 
-def _row(
-    source_file: str, index: int, text: str, count: int, metadata: ChunkMetadata
-) -> dict[str, Any]:
-    return {
-        "source_file": source_file,
-        "chunk_index": index,
-        "chunk_text": text,
-        "content_sha256": content_hash(text),
-        "token_count": count,
-        "embedding": [],
-        "metadata": metadata.as_metadata(),
-    }
-
-
 def _with_embeddings(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reuse vectors from github_chunks by content hash; embed the rest from ``embed_text``."""
     if not rows:
         return []
-    known = existing_embeddings([row["content_sha256"] for row in rows])
+    known = github_existing_embeddings([row["content_sha256"] for row in rows])
     pending = [row for row in rows if row["content_sha256"] not in known]
-    if pending:
-        vectors = embed_texts([row["chunk_text"] for row in pending])
-        for row, vector in zip(pending, vectors, strict=True):
+    for start in range(0, len(pending), _EMBED_BATCH):
+        batch = pending[start : start + _EMBED_BATCH]
+        vectors = embed_texts([row["embed_text"] for row in batch])
+        for row, vector in zip(batch, vectors, strict=True):
             known[row["content_sha256"]] = vector
     for row in rows:
         row["embedding"] = known[row["content_sha256"]]
-    return rows
+    return [{key: value for key, value in row.items() if key != "embed_text"} for row in rows]
 
 
 def _fit(text: str) -> str:
@@ -341,30 +361,44 @@ def _token() -> str | None:
     return None
 
 
+def _pulls(args: argparse.Namespace) -> list[dict[str, Any]] | None:
+    if args.pulls_json:
+        payload = json.loads(Path(args.pulls_json).read_text(encoding="utf-8"))
+        return list(payload)
+    if args.skip_pulls:
+        return None
+    try:
+        pulls = fetch_pull_requests(args.repo, _token())
+    except Exception:
+        logger.warning("Pull request list was not fetched. Indexed pulls are left unchanged.")
+        return None
+    if args.write_pulls_json:
+        Path(args.write_pulls_json).write_text(json.dumps(pulls, indent=1) + "\n", encoding="utf-8")
+    return pulls
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, required=True, help="Checkout of the public repository.")
+    parser.add_argument("--root", type=Path, required=True, help="Local checkout of the public repository.")
     parser.add_argument("--repo", default=DEFAULT_REPO)
     parser.add_argument("--sha", default="", help="Commit SHA. Defaults to HEAD of --root.")
-    parser.add_argument("--skip-pulls", action="store_true")
+    parser.add_argument("--skip-pulls", action="store_true", help="Leave indexed pull requests unchanged.")
+    parser.add_argument("--pulls-json", type=Path, help="Read the pull-request list from this file.")
+    parser.add_argument("--write-pulls-json", type=Path, help="Save the fetched pull-request list here.")
+    parser.add_argument("--full", action="store_true", help="Reindex every file, ignoring stored digests.")
     args = parser.parse_args()
     root = args.root.resolve()
     sha = args.sha.strip() or head_sha(root)
-    pulls: list[dict[str, Any]] = []
-    if not args.skip_pulls:
-        try:
-            pulls = fetch_pull_requests(args.repo, _token())
-        except Exception:
-            logger.warning("Pull request list was not fetched. File index will still run.")
-    summary = sync_repository(root, args.repo, sha, pulls=pulls)
+    summary = sync_repository(root, args.repo, sha, pulls=_pulls(args), full=args.full)
     logger.info(
-        "github sync repo=%s sha=%s files_indexed=%s files_removed=%s pulls_indexed=%s",
+        "github sync repo=%s sha=%s files_indexed=%s files_removed=%s pulls_indexed=%s pulls_removed=%s",
         args.repo,
         sha,
         summary["files_indexed"],
         summary["files_removed"],
         summary["pulls_indexed"],
+        summary["pulls_removed"],
     )
 
 

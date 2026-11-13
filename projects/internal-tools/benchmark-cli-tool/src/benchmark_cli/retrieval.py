@@ -22,7 +22,6 @@ RETRIEVAL_SOURCES = (
     "transcript",
     "policy_doc",
     "user_contributed",
-    "github",
 )
 SOURCE_ARM_LIMIT = PER_SOURCE_LIMIT
 
@@ -119,12 +118,6 @@ def apply_source_quota(
             break
         chosen.append(result)
     return chosen
-
-
-def context_limit(top_k: int) -> int:
-    """Room for every source arm. One new source does not take another's slots."""
-    per_source = max(PER_SOURCE_LIMIT, 1)
-    return max(top_k, per_source * len(RETRIEVAL_SOURCES))
 
 
 def search_docs(
@@ -321,7 +314,7 @@ def retrieve_evidence(
     ]
     per_source = max(PER_SOURCE_LIMIT, 1)
     results = tuple(
-        apply_source_quota(fused, per_source=per_source, limit=context_limit(top_k))
+        apply_source_quota(fused, per_source=per_source, limit=max(top_k, per_source * 4))
     )
     top_cosine = max(
         (result.vector_score for result in results if result.vector_score is not None),
