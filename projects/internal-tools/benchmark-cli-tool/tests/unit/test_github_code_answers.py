@@ -1043,3 +1043,135 @@ def test_retrieve_code_reports_one_score_scale_in_rank_order(monkeypatch: pytest
     for parts in found.ranking:
         expected = parts["kind_weight"] * parts["scope"] * (parts["rrf"] + github_answers.LEXICAL_WEIGHT * parts["lexical"])
         assert parts["score"] == pytest.approx(expected)
+
+
+# --------------------------------------------------------------------------- recorded lanes (DIAG-code-lane)
+
+# Retrieval and drafts recorded by ``ask_regress record``. Public-repo text only.
+_RECORDING = Path(__file__).resolve().parents[1] / "fixtures" / "replay" / "code-lane.json"
+_ANSWERED = {"code_answered", "code_pointer", "github_pulls"}
+
+
+def _recorded(case_id: str) -> tuple[str, CodeRetrieval, dict[str, Any]]:
+    from benchmark_cli.ask_regress import retrieval_from_dict
+
+    row = next(row for row in json.loads(_RECORDING.read_text())["cases"] if row["id"] == case_id)
+    return row["q"], retrieval_from_dict(row["retrieval"]), row
+
+
+def _queue(*drafts: AnswerResponse | None) -> Any:
+    pending = list(drafts)
+    return lambda _messages: pending.pop(0) if pending else pytest.fail("unexpected extra draft")
+
+
+def _lane_chunk(found: CodeRetrieval, chunk_id: int) -> SearchChunk:
+    return next(chunk for chunk in found.chunks if chunk.id == chunk_id)
+
+
+def _line_with(chunk: SearchChunk, needle: str) -> str:
+    return next(line for line in chunk.chunk_text.splitlines() if needle in line).strip()
+
+
+@pytest.mark.unit
+def test_validator_accepts_a_recorded_quote_with_literal_backslash_n() -> None:
+    _q, found, row = _recorded("migration-document-chunks")
+    draft = AnswerResponse(**row["drafts"][0])
+    assert "\\n" in draft.citations[0].quote
+    checked, _ = validate_code_answer(draft, found.chunks)
+    assert checked is not None
+    chunk = _lane_chunk(found, 1_000_001_208)
+    assert checked.citations[0].chunk_id == chunk.id
+    assert checked.citations[0].quote in chunk.chunk_text
+    assert checked.citations[0].quote.startswith("CREATE TABLE IF NOT EXISTS document_chunks (")
+
+
+@pytest.mark.unit
+def test_validator_salvages_the_longest_verbatim_line_of_the_cited_chunk_only() -> None:
+    body = (
+        "def sync_board(board_id: str) -> int:\n    cards = fetch_cards_for_board(board_id)\n"
+        "    if not cards:\n        return 0\n    return store_cards(cards)\n"
+    )
+    chunk = _github_chunk(body=body)
+    altered = "def sync_board(board_id: str) -> int:\n    cards = fetch_all_cards(board_id)\n    return store_cards(cards)"
+    checked, _ = validate_code_answer(_answer(_cite(chunk, altered)), (chunk,))
+    assert checked is not None
+    assert checked.citations[0].quote == "def sync_board(board_id: str) -> int:"
+    assert checked.citations[0].quote in chunk.chunk_text
+    short = "if not cards:\n    return -1"
+    assert validate_code_answer(_answer(_cite(chunk, short)), (chunk,))[0] is None
+    other = _github_chunk(1_000_000_060, f"{_PKG}/other.py", "def unrelated_helper_function() -> None:\n    pass\n", symbol="")
+    elsewhere = "def unrelated_helper_function() -> None:\n    invented()"
+    assert validate_code_answer(_answer(_cite(chunk, elsewhere)), (chunk, other))[0] is None
+
+
+@pytest.mark.unit
+def test_saved_match_bad_quote_then_abstain_points_at_the_cited_chunk() -> None:
+    question, found, row = _recorded("saved-match")
+    assert found.chunks[0].source_file.endswith("trello_answers.py")
+    bad = AnswerResponse(**row["drafts"][0])
+    bad = bad.model_copy(update={"citations": [bad.citations[0].model_copy(update={"quote": "Saved answers match by cosine."})]})
+    result = answer_from_retrieval(question, found, _queue(bad, _NO_INFO))
+    assert result.outcome == "code_pointer"
+    assert result.attempts == 2
+    assert result.response.citations[0].source_file.endswith("contributions.py")
+    assert result.response.answer.startswith("Closest match: `")
+    assert "trello_answers.py" not in result.response.answer
+
+
+@pytest.mark.unit
+def test_discord_sync_workflow_only_answer_leads_with_the_source_file() -> None:
+    question, found, _row = _recorded("discord-sync")
+    workflow = _lane_chunk(found, 1_000_000_013)
+    text = "Discord sync runs in the discord-ingestion workflow."
+    draft = _answer(_cite(workflow, _line_with(workflow, "benchmark-sync-discord")), text=text)
+    result = answer_from_retrieval(question, found, _queue(draft))
+    assert result.outcome == "code_answered"
+    sources = [citation.source_file for citation in result.response.citations]
+    assert sources[0].endswith("discord_sync.py")
+    assert workflow.source_file in sources
+    assert text in result.response.answer
+
+
+@pytest.mark.unit
+def test_trello_cron_workflow_answer_is_unchanged() -> None:
+    question, found, _row = _recorded("trello-cron")
+    workflow = _lane_chunk(found, 1_000_000_019)
+    text = "The Trello ingestion workflow runs it."
+    draft = _answer(_cite(workflow, _line_with(workflow, "name: Trello ingestion")), text=text)
+    result = answer_from_retrieval(question, found, _queue(draft))
+    assert result.outcome == "code_answered"
+    assert [citation.chunk_id for citation in result.response.citations] == [workflow.id]
+    assert result.response.answer.startswith(text)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("case_id", ["kiosk-database", "source-trust"])
+def test_non_pointer_lanes_still_abstain(case_id: str) -> None:
+    question, found, _row = _recorded(case_id)
+    result = answer_from_retrieval(question, found, _queue(_NO_INFO))
+    assert result.outcome == "code_abstained"
+    assert result.response.status == "no_relevant_information"
+
+
+@pytest.mark.unit
+def test_chunk_store_abstention_becomes_a_pointer_to_postgres() -> None:
+    question, found, _row = _recorded("chunk-store")
+    result = answer_from_retrieval(question, found, _queue(_NO_INFO))
+    assert result.outcome == "code_pointer"
+    assert result.response.citations[0].source_file.endswith("storage/postgres.py")
+    assert result.response.confidence == pytest.approx(0.4)
+
+
+@pytest.mark.unit
+def test_replaying_every_recorded_case_keeps_answered_citations() -> None:
+    from benchmark_cli.ask_regress import retrieval_from_dict
+
+    rows = json.loads(_RECORDING.read_text())["cases"]
+    assert len(rows) == 12
+    for row in rows:
+        drafts = [None if item is None else AnswerResponse(**item) for item in row["drafts"]]
+        result = answer_from_retrieval(row["q"], retrieval_from_dict(row["retrieval"]), _queue(*drafts))
+        if row["outcome"] in _ANSWERED:
+            cited = [citation.source_file for citation in result.response.citations]
+            assert result.outcome == row["outcome"], row["id"]
+            assert cited == row["cited"], row["id"]
