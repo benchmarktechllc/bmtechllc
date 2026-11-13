@@ -510,7 +510,16 @@ def guarded_openai(guard: OpenAIGuard) -> Iterator[OpenAIGuard]:
 
 
 class EmbeddingStore:
-    """Vectors keyed by sha256 of the embedded text."""
+    """Vectors keyed by sha256 of the embedded text.
+
+    Capture memoizes by text: the first vector the provider returns for a text is
+    recorded and returned for every later request of the same text. The OpenAI
+    embeddings endpoint is not bit-for-bit deterministic, and one capture embeds the
+    same string several times (contribution matching, the retrieval query list, the
+    same question in more than one case). Without the memo the capture ran on
+    vectors that differ from the single one it recorded, so ``check`` on the very
+    same build replayed different scores and reordered near-ties.
+    """
 
     def __init__(self, vectors: dict[str, list[float]] | None = None, *, replay: bool = False) -> None:
         self.vectors: dict[str, list[float]] = dict(vectors or {})
@@ -521,10 +530,18 @@ class EmbeddingStore:
         def embed_texts(texts: Sequence[str]) -> list[list[float]]:
             items = list(texts)
             if not self.replay:
-                vectors = original(items)
-                for text, vector in zip(items, vectors, strict=True):
-                    self.vectors[sha256_text(text)] = list(vector)
-                return vectors
+                keys = [sha256_text(text) for text in items]
+                pending: dict[str, str] = {}
+                for key, text in zip(keys, items, strict=True):
+                    if key not in self.vectors:
+                        pending.setdefault(key, text)
+                if pending:
+                    vectors = original(list(pending.values()))
+                    if len(vectors) != len(pending):
+                        raise RuntimeError("Embedding response length did not match the request.")
+                    for key, vector in zip(pending, vectors, strict=True):
+                        self.vectors[key] = list(vector)
+                return [list(self.vectors[key]) for key in keys]
             found: list[list[float]] = []
             for text in items:
                 vector = self.vectors.get(sha256_text(text))

@@ -127,6 +127,95 @@ def test_capture_store_records_vectors_by_text_hash() -> None:
 
 
 @pytest.mark.unit
+def test_capture_memoizes_repeated_texts_to_the_recorded_vector() -> None:
+    calls: list[list[str]] = []
+
+    def noisy(texts: list[str]) -> list[list[float]]:
+        calls.append(list(texts))
+        return [[float(len(text)) + 1e-5 * len(calls)] for text in texts]
+
+    store = harness.EmbeddingStore()
+    embed = store.wrap(noisy)
+    first = embed(["ab", "abc", "ab"])
+    again = embed(["abc", "ab"])
+    assert calls == [["ab", "abc"]]  # one request, duplicates folded, no second request
+    assert first == [[2.00001], [3.00001], [2.00001]] and again == [[3.00001], [2.00001]]
+    assert store.vectors[harness.sha256_text("ab")] == [2.00001]
+    embed(["new"])
+    assert calls[-1] == ["new"]  # only uncached texts reach the provider
+
+
+@pytest.mark.unit
+def test_capture_then_check_on_the_same_build_is_green_with_a_noisy_embedder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The provider returns a slightly different vector on every call for the same text, as
+    OpenAI does. Each case embeds its question more than once and two cases share a question,
+    so the capture must replay exactly the vectors it ran on."""
+    import math
+
+    from benchmark_cli import contributions, retrieval
+    from benchmark_cli.config import EMBEDDING_DIMENSIONS
+    from benchmark_cli.providers import openai as provider
+
+    requests = {"n": 0}
+
+    def create(*, model: str, input: list[str]) -> SimpleNamespace:  # noqa: A002 - SDK keyword
+        requests["n"] += 1
+        data = []
+        for text in input:
+            base = [math.sin(len(text) * (index + 1)) for index in range(EMBEDDING_DIMENSIONS)]
+            base[0] += 1e-5 * requests["n"]  # drift between requests, like the real endpoint
+            data.append(SimpleNamespace(embedding=base))
+        return SimpleNamespace(data=data, usage=SimpleNamespace(prompt_tokens=1))
+
+    fake_client = SimpleNamespace(embeddings=SimpleNamespace(create=create))
+    monkeypatch.setattr(provider, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(provider, "log_usage", lambda **_k: None)
+
+    docs = {11: [1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1), 12: [0.0, 1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 2)}
+
+    def fake_case(case: harness.Case, _plan: object) -> dict[str, object]:
+        # Different modules embed the same question, as contributions + retrieval do.
+        contributions.embed_texts([case.q])
+        vector = retrieval.embed_texts([case.q, f"{case.q} rewritten"])[0]
+        scores = {chunk_id: sum(a * b for a, b in zip(vector, doc, strict=True)) for chunk_id, doc in docs.items()}
+        ranked = sorted(scores, key=lambda chunk_id: -scores[chunk_id])
+        decision = {
+            "status": "accepted",
+            "top_cosine": max(scores.values()),
+            "overlap": 1,
+            "results": [{"id": i, "sha": "s", "source": "kb", "source_type": "kb_page", "rrf": 0.0, "vector": scores[i], "fts": 0.0} for i in ranked],
+        }
+        return {"key": case.key, "q": case.q, "starter": None, "plan": None, "retrievals": [{"args": {}, "decision": decision}], "phrase_lookups": [], "model_calls": [], "response": None, "outcome": None, "error": None}
+
+    shared = "Who runs the weekly standup?"
+    inputs = harness.PrivateInputs(
+        suite=(harness.Case("suite:0", "suite", shared), harness.Case("suite:1", "suite", "Where are the meeting notes?")),
+        names=(),
+        saved=(harness.Case("saved:0", "saved", shared),),
+        titles={},
+        baseline={},
+    )
+    monkeypatch.setattr(harness, "load_private", lambda _d: inputs)
+    monkeypatch.setattr(harness, "preflight", lambda: None)
+    monkeypatch.setattr(harness, "corpus_fingerprint", lambda: dict(_FP))
+    monkeypatch.setattr(harness, "stored_plan", lambda _case, _mode: None)
+    monkeypatch.setattr(harness, "run_offline_case", fake_case)
+    monkeypatch.setattr(harness, "classifier", lambda: None)
+
+    base_path, check_path = tmp_path / "base.json", tmp_path / "check.json"
+    assert harness.main(["capture", "--out", str(base_path), "--private-dir", str(tmp_path), "--plans", "raw"]) == 0
+    assert requests["n"] >= 2  # the provider really drifted between requests
+    monkeypatch.setattr(provider, "_get_client", lambda: pytest.fail("check makes no embedding request"))
+    assert harness.main(["check", "--baseline", str(base_path), "--out", str(check_path), "--private-dir", str(tmp_path)]) == 0
+    import json
+
+    report = json.loads(check_path.read_text())
+    assert report["green"] is True and report["embedding_misses"] == 0 and report["failed"] == []
+
+
+@pytest.mark.unit
 def test_suite_early_stop_rules() -> None:
     assert harness.suite_stop_reason(41, 15, 15) is None
     assert "mathematically" in harness.suite_stop_reason(40, 15, 15, bar=56)  # type: ignore[operator]
