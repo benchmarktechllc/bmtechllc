@@ -255,3 +255,49 @@ def test_agent_vetoes_keep_their_own_paths(monkeypatch: pytest.MonkeyPatch) -> N
     code_row = (_row(11, code_question.rstrip("?") + " exactly?"),)
     _, seen = _agent(monkeypatch, code_question, rows=code_row)
     assert seen.get("outcome") != "user_contributed_paraphrase"
+
+
+def _other_row(chunk_id: int) -> HybridSearchResult:
+    text = "Sample channel chatter with no saved answer."
+    chunk = SearchChunk(
+        chunk_id, "discord-channel-7.json", 0, text, {"source_type": "discord"}, 0.5,
+        content_sha256=hashlib.sha256(text.encode()).hexdigest(),
+    )  # fmt: skip
+    return HybridSearchResult(chunk, 0.2, vector_score=0.5, fts_score=1.0)
+
+
+def _fts(monkeypatch: pytest.MonkeyPatch, rows: tuple[HybridSearchResult, ...]) -> list[str]:
+    calls: list[str] = []
+
+    def fake(phrase: str, *, limit: int) -> list[SearchChunk]:
+        calls.append(phrase)
+        return [row.chunk for row in rows]
+
+    monkeypatch.setattr(agent, "fts_search", fake)
+    return calls
+
+
+@pytest.mark.unit
+def test_headcount_question_finds_the_saved_row_through_the_employees_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Hybrid retrieval misses the saved row; the headcount shortcut's "employees" lookup has it.
+    calls = _fts(monkeypatch, (_row(11, SAVED),))
+    response, seen = _agent(monkeypatch, "what's our headcount", rows=(_other_row(5),))
+    assert seen["outcome"] == "user_contributed_paraphrase" and "model_called" not in seen
+    assert response.citations[0].source_file == "user_contributed/7/11.md"
+    assert calls == ["employees"]
+
+
+@pytest.mark.unit
+def test_headcount_lookup_runs_once_and_only_when_hybrid_has_no_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _fts(monkeypatch, (_other_row(6),))
+    _, seen = _agent(monkeypatch, "what's our headcount", rows=(_other_row(5),))
+    assert seen["outcome"].startswith("employee_count_") and calls == ["employees"]
+    calls = _fts(monkeypatch, (_row(12, SAVED),))
+    _, seen = _agent(monkeypatch, "what's our headcount")
+    assert seen["outcome"] == "user_contributed_paraphrase" and calls == []
+    # Not a headcount question: no extra lookup, no saved answer from it.
+    calls = _fts(monkeypatch, (_row(12, SAVED),))
+    _, seen = _agent(monkeypatch, "how many people are on the team", rows=(_other_row(5),))
+    assert seen.get("outcome") != "user_contributed_paraphrase" and calls == []

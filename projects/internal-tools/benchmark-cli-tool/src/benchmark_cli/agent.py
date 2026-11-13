@@ -979,6 +979,16 @@ def run_agent(
     match = contribution_match(
         question, () if decision is None else decision.results, allow_paraphrase=paraphrase_ok
     )
+    count_decision: RetrievalDecision | None = None
+    if match is None and asks_for_employee_count(question):
+        # The headcount shortcut's own "employees" lookup, done once and reused below.
+        # Only rows it adds are matched, so a hybrid-retrieved match is unaffected.
+        count_decision = _with_phrase(decision, "employees")
+        seen = {result.chunk.id for result in (() if decision is None else decision.results)}
+        added = [result for result in count_decision.results if result.chunk.id not in seen]
+        match = contribution_match(question, added, allow_paraphrase=paraphrase_ok)
+        if match is not None:
+            decision = count_decision
     if match is not None:
         outcome = "user_contributed" if match.tier == "exact" else "user_contributed_paraphrase"
         _log_retrieval(outcome, decision)
@@ -999,7 +1009,7 @@ def run_agent(
                 synthesis_attempts=0,
             )
     if asks_for_employee_count(question):
-        decision = _with_phrase(decision, "employees")
+        decision = count_decision or _with_phrase(decision, "employees")
         results = decision.results
         stated = stated_employee_count_answer(results)
         outcome = "employee_count_stated" if stated is not None else "employee_count_uncertain"
