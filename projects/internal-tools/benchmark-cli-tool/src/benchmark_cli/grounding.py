@@ -32,7 +32,7 @@ from .storage.postgres import SearchChunk
 
 logger = logging.getLogger(__name__)
 
-ANSWER_PATH_REVISION = "2026-11-07-ask-retrieval"
+ANSWER_PATH_REVISION = "2026-11-14-ask-context-first"
 PORTAL_ACCEPTANCE_QUESTIONS = (
     "What is the link to the knowledge base portal?",
     "Where do I open the knowledge base?",

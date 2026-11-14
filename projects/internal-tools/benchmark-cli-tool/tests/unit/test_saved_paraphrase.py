@@ -205,7 +205,6 @@ def _agent(
     monkeypatch.setattr(agent, "log_agent_diagnostic", lambda **kwargs: seen.update(kwargs))
     monkeypatch.setattr(agent, "trello_card_rows", lambda: [])
     monkeypatch.setattr(agent, "understand_query", lambda *_a, **_k: QueryPlan(searches=[question], person=person))
-    monkeypatch.setattr(agent, "mentioned_person", lambda *_a, **_k: person)
     hits = rows if rows is not None else (_row(11, SAVED),)
     monkeypatch.setattr(agent, "retrieve_evidence", lambda *_a, **_k: RetrievalDecision("accepted", hits, 0.7, 2))
 
@@ -224,14 +223,14 @@ def _agent(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("question", ("how many people work at bmtech", "what's our headcount"))
-def test_agent_answers_a_paraphrase_from_the_saved_row_without_the_model(
+@pytest.mark.parametrize("question", ("how many people work at bmtech",))
+def test_agent_sends_a_paraphrase_to_the_model_instead_of_returning_the_saved_row(
     monkeypatch: pytest.MonkeyPatch, question: str
 ) -> None:
-    response, seen = _agent(monkeypatch, question)
-    assert seen["outcome"] == "user_contributed_paraphrase" and "model_called" not in seen
-    assert response.answer.startswith("According to Ada Example on 2026-01-02: ")
-    assert response.citations[0].source_file == "user_contributed/7/11.md"
+    # 0.1.12: only the exact tier returns before the model. A paraphrase is context for it.
+    _, seen = _agent(monkeypatch, question)
+    assert seen.get("outcome") not in {"user_contributed", "user_contributed_paraphrase"}
+    assert seen["model_called"] is True
 
 
 @pytest.mark.unit
@@ -246,7 +245,7 @@ def test_agent_vetoes_keep_their_own_paths(monkeypatch: pytest.MonkeyPatch) -> N
     core = (_row(11, "who's on the core team"),)
     _, seen = _agent(monkeypatch, "Who is on the core team?", rows=core)
     assert seen["outcome"] == "core_team"
-    # A named person, a distinct thread starter, and a code question never take tier 2.
+    # No path returns a paraphrase before the model, with a person, a thread, or code.
     _, seen = _agent(monkeypatch, "how many people work at bmtech", person="Sample Person")
     assert seen.get("outcome") != "user_contributed_paraphrase"
     _, seen = _agent(monkeypatch, "how many people", thread_question="Who posts in the sample channel?")
@@ -278,14 +277,14 @@ def _fts(monkeypatch: pytest.MonkeyPatch, rows: tuple[HybridSearchResult, ...]) 
 
 
 @pytest.mark.unit
-def test_headcount_question_finds_the_saved_row_through_the_employees_lookup(
+def test_headcount_question_runs_the_employees_lookup_without_a_paraphrase_shortcut(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Hybrid retrieval misses the saved row; the headcount shortcut's "employees" lookup has it.
     calls = _fts(monkeypatch, (_row(11, SAVED),))
     response, seen = _agent(monkeypatch, "what's our headcount", rows=(_other_row(5),))
-    assert seen["outcome"] == "user_contributed_paraphrase" and "model_called" not in seen
-    assert response.citations[0].source_file == "user_contributed/7/11.md"
+    # A paraphrase is no longer returned from the saved row; the headcount lane answers.
+    assert seen["outcome"].startswith("employee_count_") and "model_called" not in seen
     assert calls == ["employees"]
 
 
@@ -296,7 +295,7 @@ def test_headcount_lookup_runs_once_and_only_when_hybrid_has_no_match(monkeypatc
     assert seen["outcome"].startswith("employee_count_") and calls == ["employees"]
     calls = _fts(monkeypatch, (_row(12, SAVED),))
     _, seen = _agent(monkeypatch, "what's our headcount")
-    assert seen["outcome"] == "user_contributed_paraphrase" and calls == []
+    assert seen["outcome"].startswith("employee_count_") and calls == ["employees"]
     # Not a headcount question: no extra lookup, no saved answer from it.
     calls = _fts(monkeypatch, (_row(12, SAVED),))
     _, seen = _agent(monkeypatch, "how many people are on the team", rows=(_other_row(5),))

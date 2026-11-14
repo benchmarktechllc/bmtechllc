@@ -54,53 +54,6 @@ def test_source_quota_keeps_a_knowledge_base_hit_beside_discord() -> None:
 
 
 @pytest.mark.unit
-def test_current_work_uses_doing_cards_not_an_old_discord_excerpt(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from tests.unit.test_live_question_regressions import _as_tuple, _row
-
-    doing = (
-        _row("Doing", "Sample portal sync", "d1", 1),
-        _row("Doing", "Sample cli notes", "d2", 2),
-        _row("Doing", "Sample kiosk timeline", "d3", 3),
-        _row("Doing", "Sample board cleanup", "d4", 4),
-    )
-    discord = _chunk(
-        9,
-        "discord",
-        "I've added a few new tickets to the Trello backlog for the sample project.",
-        channel="general",
-    )
-    monkeypatch.setattr(agent, "log_agent_diagnostic", lambda **_kwargs: None)
-    monkeypatch.setattr(agent, "trello_card_rows", lambda: [_as_tuple(row) for row in doing])
-    monkeypatch.setattr(agent, "call_llm", _noop_llm)
-    monkeypatch.setattr(
-        agent,
-        "call_llm_structured",
-        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("model unavailable")),
-    )
-    monkeypatch.setattr(
-        agent,
-        "retrieve_evidence",
-        lambda *_args, **_kwargs: RetrievalDecision(
-            "accepted",
-            (HybridSearchResult(discord, 0.4, vector_score=0.9, fts_score=1.0),),
-            0.9,
-            2,
-        ),
-    )
-
-    response = agent.run_agent("What tickets are we currently working on?")
-
-    assert "Sample portal sync" in response.answer
-    assert "Sample cli notes" in response.answer
-    assert "Sample kiosk timeline" in response.answer
-    assert "Sample board cleanup" in response.answer
-    assert "I've added a few new tickets" not in response.answer
-    assert "Relevant retrieved excerpts" not in response.answer
-
-
-@pytest.mark.unit
 def test_varied_phrasings_keep_a_validated_model_answer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

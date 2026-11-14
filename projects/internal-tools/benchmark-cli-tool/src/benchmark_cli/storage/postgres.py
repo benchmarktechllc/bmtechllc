@@ -1109,6 +1109,20 @@ def meeting_summary_chunks(source_file: str) -> list[SearchChunk]:
         return [SearchChunk(*row) for row in cursor.fetchall()]
 
 
+def meeting_chunks(source_file: str) -> list[SearchChunk]:
+    """Every chunk of one meeting (Overview, Summary, each transcript chunk), in order."""
+    statement = """
+        SELECT id, source_file, chunk_index, chunk_text, metadata, 0.0 AS score,
+               NULL::integer AS token_count, content_sha256
+        FROM document_chunks
+        WHERE source_file = %s
+        ORDER BY chunk_index ASC, id ASC
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (source_file,))
+        return [SearchChunk(*row) for row in cursor.fetchall()]
+
+
 def read_doc(chunk_id: int, *, max_tokens: int = PARENT_CONTEXT_MAX_TOKENS) -> ParentContext | None:
     """Fetch the hit and a token-bounded window from its containing section.
 

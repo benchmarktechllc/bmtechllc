@@ -166,17 +166,12 @@ def _chunk(chunk_id: int, source: str, section: str, text: str = "text") -> Sear
 
 
 @pytest.mark.unit
-def test_payload_label_unchanged_outside_the_lane() -> None:
+def test_payload_label_names_the_meeting_when_title_and_date_exist() -> None:
     chunk = _chunk(1, "fireflies/aaa.md", "Summary")
-    assert agent._chunk_payload(chunk)["source_label"] == "Meeting transcript"
-    lane = agent._chunk_payload(chunk, meeting_lane=True)
-    assert lane["source_label"] == 'Meeting "Team Sync Call" on 2026-11-13, Summary'
-    plain = agent._chunk_payload(chunk)
-    assert {k: v for k, v in lane.items() if k not in {"source_label", "text"}} == {
-        k: v for k, v in plain.items() if k not in {"source_label", "text"}
-    }
+    payload = agent._chunk_payload(chunk)
+    assert payload["source_label"] == 'Meeting "Team Sync Call" on 2026-11-13, Summary'
     untitled = SearchChunk(2, "x.md", 0, "t", {"source_type": "transcript"}, 0.1, content_sha256="a" * 64)
-    assert agent._chunk_payload(untitled, meeting_lane=True)["source_label"] == "Meeting transcript"
+    assert agent._chunk_payload(untitled)["source_label"] == "Meeting transcript"
 
 
 def _citation(source: str) -> Citation:
@@ -206,76 +201,119 @@ def test_citation_unchanged_for_other_sources_and_on_lookup_failure(monkeypatch:
 
 # --------------------------------------------------------------------------- run_agent
 
+CARD = ("board", "Doing", "c1", "Task alpha", "https://example.test/c1", 900, "trello/c1.md", "e" * 64, "Task alpha card")
 
-def _install(monkeypatch: pytest.MonkeyPatch, question: str, normal: list[SearchChunk]) -> dict[str, Any]:
-    seen: dict[str, Any] = {"retrievals": [], "messages": None, "meeting_lists": 0}
+
+def _meeting_chunks(source: str, count: int = 6) -> list[SearchChunk]:
+    sections = ["Overview", "Summary"] + ["Transcript"] * (count - 2)
+    return [
+        SearchChunk(
+            index + 1,
+            source,
+            index,
+            f"Synthetic line {index + 1}",
+            {
+                "source_type": "transcript",
+                "kind": "meeting_transcript",
+                "title": "Team Sync Call",
+                "date": "2026-11-13",
+                "section": section,
+            },
+            0.0,
+            content_sha256="a" * 64,
+        )
+        for index, section in enumerate(sections)
+    ]
+
+
+def _install(
+    monkeypatch: pytest.MonkeyPatch,
+    question: str,
+    normal: list[SearchChunk],
+    drafts: list[Any] | None = None,
+    *,
+    cards: bool = False,
+) -> dict[str, Any]:
+    seen: dict[str, Any] = {"retrievals": [], "messages": None, "meeting_lists": 0, "loaded": [], "calls": []}
     monkeypatch.setattr(agent, "log_agent_diagnostic", lambda **kwargs: seen.update(kwargs))
-    monkeypatch.setattr(agent, "trello_card_rows", lambda: [])
+    monkeypatch.setattr(agent, "trello_card_rows", lambda: [CARD] if cards else [])
     monkeypatch.setattr(agent, "understand_query", lambda *_a, **_k: QueryPlan(searches=[question], person=None))
     monkeypatch.setattr(agent, "fts_search", lambda *_a, **_k: [])
-    monkeypatch.setattr(agent, "today_in_new_york", lambda: TODAY)
+    monkeypatch.setattr(agent, "today_in_new_york", lambda *_a: TODAY)
+    monkeypatch.setattr(agent, "classify_query", lambda q: None)
 
     def indexed(source_file: str | None = None) -> list[Meeting]:
         seen["meeting_lists"] += 1
         return list(MEETINGS)
 
     monkeypatch.setattr(agent, "indexed_meetings", indexed)
-    monkeypatch.setattr(
-        agent,
-        "meeting_summary_chunks",
-        lambda source: [_chunk(1, source, "Overview"), _chunk(2, source, "Summary")],
-    )
+
+    def load(source: str) -> list[SearchChunk]:
+        seen["loaded"].append(source)
+        return _meeting_chunks(source)
+
+    monkeypatch.setattr(agent, "meeting_chunks", load)
 
     def retrieve(query: str, **kwargs: Any) -> RetrievalDecision:
         seen["retrievals"].append(kwargs.get("source"))
-        if kwargs.get("source"):
-            hits = [_chunk(10 + i, kwargs["source"], "Transcript") for i in range(9)]
-        else:
-            hits = normal
+        hits = _meeting_chunks(kwargs["source"])[2:] if kwargs.get("source") else normal
         return RetrievalDecision(
-            "accepted", tuple(HybridSearchResult(c, 0.1, 0.8, 1.0) for c in hits), 0.8, 3
+            "accepted" if hits else "no_relevant_information",
+            tuple(HybridSearchResult(c, 0.1, 0.8, 1.0) for c in hits),
+            0.8,
+            3,
         )
 
     monkeypatch.setattr(agent, "retrieve_evidence", retrieve)
 
     def call_llm(**kwargs: Any) -> Any:
+        seen["tool_loop"] = True
         seen["messages"] = kwargs["messages"]
-        raise RuntimeError("stop here")
+        return type("C", (), {"choices": [type("M", (), {"message": type("X", (), {"tool_calls": None, "content": ""})()})()]})()
+
+    def synth(*, tier: str, messages: list[dict[str, Any]]) -> Any:
+        seen["calls"].append(messages)
+        if seen["messages"] is None:
+            seen["messages"] = messages
+        index = len(seen["calls"]) - 1
+        if not drafts:
+            return None
+        return drafts[min(index, len(drafts) - 1)]
 
     monkeypatch.setattr(agent, "call_llm", call_llm)
-    monkeypatch.setattr(
-        agent, "call_llm_structured", lambda **_k: (_ for _ in ()).throw(RuntimeError("stop here"))
-    )
+    monkeypatch.setattr(agent, "_synthesize_answer", synth)
     return seen
 
 
-def _retrieved(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _pack(messages: list[dict[str, Any]]) -> dict[str, Any]:
     evidence = next(m for m in messages if m["content"].startswith("Initial evidence"))
-    return json.loads(evidence["content"].split("\n", 1)[1])["retrieved"]
+    return json.loads(evidence["content"].split("\n", 1)[1])
 
 
 @pytest.mark.unit
-def test_lane_puts_the_resolved_meeting_first(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_full_meeting_is_in_the_pack_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
     question = "what were the todos from the november 13 sync call?"
     other = _chunk(50, "fireflies/zzz.md", "Transcript")
-    same_meeting = _chunk(51, "fireflies/aaa.md", "Transcript")
+    same_meeting = _chunk(3, "fireflies/aaa.md", "Transcript")
     unrelated = SearchChunk(60, "kb/page.md", 0, "x", {"source_type": "kb_page"}, 0.4, content_sha256="c" * 64)
-    seen = _install(monkeypatch, question, [same_meeting, other, unrelated])
+    seen = _install(monkeypatch, question, [same_meeting, other, unrelated], [_resp("Synthetic line 1", "x", 1)], cards=True)
     agent.run_agent(question)
-    retrieved = _retrieved(seen["messages"])
-    ids = [item["chunk_id"] for item in retrieved]
-    assert ids[:2] == [1, 2]
-    assert ids[2:8] == [10, 11, 12, 13, 14, 15]
-    assert ids[8:] == [50, 60]  # normal hits minus the resolved meeting's own chunks
-    assert retrieved[1]["source_label"] == 'Meeting "Team Sync Call" on 2026-11-13, Summary'
-    assert retrieved[-1]["source_label"] == "Knowledge base"
-    assert seen["retrievals"] == [None, "fireflies/aaa.md"]
-    lane_messages = [m for m in seen["messages"] if m["content"] == meeting_answers.MEETING_LANE_PROMPT]
-    assert len(lane_messages) == 1 and lane_messages[0]["role"] == "system"
+    pack = _pack(seen["messages"])
+    assert [item["chunk_id"] for item in pack["meeting"]] == [1, 2, 3, 4, 5, 6]
+    assert pack["meeting"][1]["source_label"] == 'Meeting "Team Sync Call" on 2026-11-13, Summary'
+    assert all(f"Synthetic line {item['chunk_id']}" in item["text"] for item in pack["meeting"])
+    assert all("content_sha256" not in item for item in pack["meeting"])
+    # The meeting's own chunks are not repeated under retrieved; other sources stay.
+    assert [item["chunk_id"] for item in pack["retrieved"]] == [50, 60]
+    assert pack["trello_board"]["cards"][0]["title"] == "Task alpha"
+    assert "person_cards" not in pack and "person_filter" not in pack
+    assert seen["loaded"] == ["fireflies/aaa.md"]
+    assert seen["retrievals"] == [None]  # no meeting-scoped retrieval when the whole meeting fits
+    assert "tool_loop" not in seen and len(seen["calls"]) == 1  # one structured call, no tool loop
 
 
 @pytest.mark.unit
-def test_lane_caps_evidence_at_twenty(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_retrieved_section_is_capped_at_twenty(monkeypatch: pytest.MonkeyPatch) -> None:
     question = "todos from the last sync call"
     normal = [
         SearchChunk(100 + i, f"kb/{i}.md", 0, "x", {"source_type": "kb_page"}, 0.4, content_sha256="c" * 64)
@@ -283,7 +321,55 @@ def test_lane_caps_evidence_at_twenty(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
     seen = _install(monkeypatch, question, normal)
     agent.run_agent(question)
-    assert len(_retrieved(seen["messages"])) == 20
+    assert len(_pack(seen["messages"])["retrieved"]) == 20
+
+
+@pytest.mark.unit
+def test_budget_mode_keeps_overview_and_summary_and_stays_under_the_cap(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import functools
+
+    from benchmark_cli import context_pack
+
+    question = "todos from the november 13 sync call"
+    big = [
+        SearchChunk(
+            index + 1,
+            "fireflies/aaa.md",
+            index,
+            " ".join(f"word{index}x{n}" for n in range(60)),
+            {"title": "Team Sync Call", "date": "2026-11-13", "section": "Overview" if index == 0 else "Summary" if index == 1 else "Transcript"},
+            0.0,
+            content_sha256="a" * 64,
+        )
+        for index in range(40)
+    ]
+    seen = _install(monkeypatch, question, [])
+    monkeypatch.setattr(agent, "meeting_chunks", lambda source: list(big))
+    monkeypatch.setattr(agent, "PACK_TOKEN_LIMIT", 3000)
+    monkeypatch.setattr(
+        agent, "budgeted_meeting_chunks", functools.partial(context_pack.budgeted_meeting_chunks, transcript_tokens=900)
+    )
+    with caplog.at_level("INFO"):
+        agent.run_agent(question)
+    pack = _pack(seen["messages"])
+    ids = [item["chunk_id"] for item in pack["meeting"]]
+    assert ids[:2] == [1, 2]
+    assert 2 < len(ids) < 40 and ids == sorted(ids)
+    assert "meeting_mode=budgeted" in caplog.text
+    assert seen["retrievals"] == [None, "fireflies/aaa.md"]
+    transcript_tokens = sum(context_pack.token_count(big[i - 1].chunk_text) for i in ids[2:])
+    assert transcript_tokens <= 900
+
+
+@pytest.mark.unit
+def test_small_meeting_logs_full_mode(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    question = "todos from the november 13 sync call"
+    _install(monkeypatch, question, [])
+    with caplog.at_level("INFO"):
+        agent.run_agent(question)
+    assert "meeting_mode=full" in caplog.text
 
 
 @pytest.mark.unit
@@ -298,35 +384,32 @@ def test_missing_date_returns_meeting_not_found_without_a_model_call(monkeypatch
 
 
 @pytest.mark.unit
-def test_meeting_question_without_a_meeting_only_gets_labels_and_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_meeting_question_without_a_resolved_meeting_adds_no_meeting_section(monkeypatch: pytest.MonkeyPatch) -> None:
     question = "who owns automating meeting notes to discord?"
     hit = _chunk(5, "fireflies/aaa.md", "Summary")
     seen = _install(monkeypatch, question, [hit])
     agent.run_agent(question)
-    assert seen["retrievals"] == [None]
-    assert _retrieved(seen["messages"])[0]["source_label"].startswith("Meeting \"Team Sync Call\"")
-    assert any(m["content"] == meeting_answers.MEETING_LANE_PROMPT for m in seen["messages"])
+    pack = _pack(seen["messages"])
+    assert pack["meeting"] == [] and seen["loaded"] == []
+    assert pack["retrieved"][0]["source_label"].startswith('Meeting "Team Sync Call"')
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("question", ["what did we decide about Fireflies?", "where is Discord message sync"])
-def test_non_meeting_questions_keep_todays_path(monkeypatch: pytest.MonkeyPatch, question: str) -> None:
+def test_non_meeting_questions_add_no_meeting_section(monkeypatch: pytest.MonkeyPatch, question: str) -> None:
     hit = _chunk(5, "fireflies/aaa.md", "Summary")
     seen = _install(monkeypatch, question, [hit])
     agent.run_agent(question)
-    assert seen["meeting_lists"] == 0
+    assert seen["meeting_lists"] == 0 and seen["loaded"] == []
     assert seen["retrievals"] == [None]
-    assert [item["source_label"] for item in _retrieved(seen["messages"])] == ["Meeting transcript"]
-    assert not any(m["content"] == meeting_answers.MEETING_LANE_PROMPT for m in seen["messages"])
+    assert _pack(seen["messages"])["meeting"] == []
     assert [m["role"] for m in seen["messages"]] == ["system", "system", "user"]
 
 
-
-
 @pytest.mark.unit
-def test_lane_prompt_covers_ownership_questions_without_inventing_owners() -> None:
-    prompt = meeting_answers.MEETING_LANE_PROMPT.lower()
-    for phrase in ("who-owns", "listed under a person", "will do it", "assigned", "proposed", "never invent an owner"):
+def test_system_prompt_covers_ownership_questions_without_inventing_owners() -> None:
+    prompt = agent.SYSTEM_PROMPT.lower()
+    for phrase in ("who-owns", "listed under a person", "volunteered", "assigned", "proposed", "never invent an owner"):
         assert phrase in prompt
 
 
@@ -397,33 +480,20 @@ def test_owner_guard() -> None:
 
 
 @pytest.mark.unit
-def test_name_check_ignores_group_phrases_only_in_the_lane() -> None:
+def test_name_check_ignores_group_phrases_only_when_a_meeting_is_loaded() -> None:
     chunk = _sum_chunk()
     ev = {7: chunk}
     answer = "The work was assigned to team members."
-    assert not agent._rejected_names(answer, ev, None, None, True)
-    assert agent._rejected_names(answer, ev, None, None)
-    assert agent._rejected_names("It was assigned to Zed Qux.", ev, None, None, True)
-    assert agent._rejected_names("It was assigned to Zed Qux.", ev, None, None)
+    assert not agent._rejected_names(answer, ev, True)
+    assert agent._rejected_names(answer, ev, False)
+    assert agent._rejected_names("It was assigned to Zed Qux.", ev, True)
+    assert agent._rejected_names("It was assigned to Zed Qux.", ev, False)
 
 
 def _run_stubbed(monkeypatch: pytest.MonkeyPatch, question: str, drafts: list[Any]) -> tuple[Any, dict[str, Any]]:
-    seen = _install(monkeypatch, question, [])
+    seen = _install(monkeypatch, question, [], drafts)
     summary = _sum_chunk("fireflies/aaa.md", 1)
-    monkeypatch.setattr(agent, "meeting_summary_chunks", lambda source: [summary])
-    calls: list[list[dict[str, Any]]] = []
-
-    def call_llm(**kwargs: Any) -> Any:
-        return type("C", (), {"choices": [type("M", (), {"message": type("X", (), {"tool_calls": None, "content": ""})()})()]})()
-
-    def synth(*, tier: str, messages: list[dict[str, Any]]) -> Any:
-        calls.append(messages)
-        return drafts[len(calls) - 1]
-
-    monkeypatch.setattr(agent, "call_llm", call_llm)
-    monkeypatch.setattr(agent, "_synthesize_answer", synth)
-    monkeypatch.setattr(agent, "classify_query", lambda q: None)
-    seen["calls"] = calls
+    monkeypatch.setattr(agent, "meeting_chunks", lambda source: [summary])
     return agent.run_agent(question), seen
 
 
@@ -433,27 +503,26 @@ def test_run_agent_accepts_a_stitched_draft_with_one_attempt(monkeypatch: pytest
         "**Alice Example**\nReview the pilot setup (00:12:00)", "Alice Example owns the pilot review.", chunk_id=1
     )
     response, seen = _run_stubbed(monkeypatch, "who owns meeting minutes on november 13 sync call", [stitched])
-    assert seen["outcome"] == "answered_with_citation_normalization"
+    assert seen["outcome"] == "answered"
     assert seen["synthesis_attempts"] == 1
     assert _quotes(response) == ["**Alice Example**", "Review the pilot setup (00:12:00)"]
 
 
 @pytest.mark.unit
-def test_lane_retry_carries_the_reason_and_non_lane_retry_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_retry_carries_the_reason_for_every_question(monkeypatch: pytest.MonkeyPatch) -> None:
     wrong = _resp("Automate structured meeting minutes (01:47:38)", "Bob Sample owns minutes.", chunk_id=1)
     good = _resp("Automate structured meeting minutes (01:47:38)", "Alice Example owns minutes.", chunk_id=1)
     response, seen = _run_stubbed(monkeypatch, "who owns meeting minutes on november 13 sync call", [wrong, good])
     assert seen["outcome"] == "answered_after_citation_retry"
+    assert response.answer == "Alice Example owns minutes."
     retry = seen["calls"][1][-1]["content"]
     assert retry.startswith(meeting_answers.MEETING_RETRY_PROMPT)
     assert "not listed under" in retry
-    assert agent.CITATION_RETRY_PROMPT.startswith("Your prior answer could not be returned")
     assert "single line" in meeting_answers.MEETING_RETRY_PROMPT
 
 
 # --------------------------------------------------------------------------- r5: lane vs Trello
 
-from benchmark_cli import trello_answers  # noqa: E402
 from benchmark_cli.meeting_answers import (  # noqa: E402
     asks_about_meeting_in_context,
     excludes_trello,
@@ -543,131 +612,107 @@ def test_r5_board_question_respects_exclusion() -> None:
     assert board_question("what are Alex's tickets")
 
 
-CARD = ("board", "Doing", "c1", "Task alpha", "https://example.test/c1", 900, "trello/c1.md", "e" * 64, "Task alpha card")
-
-
-def _person_install(monkeypatch: pytest.MonkeyPatch, question: str, thread: str | None, with_meeting: bool = True) -> dict[str, Any]:
-    seen = _install(monkeypatch, question, [])
-    monkeypatch.setattr(agent, "trello_card_rows", lambda: [CARD])
+def _person_install(
+    monkeypatch: pytest.MonkeyPatch, question: str, drafts: list[Any], *, thread: str | None = None
+) -> dict[str, Any]:
+    seen = _install(monkeypatch, question, [], drafts, cards=True)
     monkeypatch.setattr(agent, "understand_query", lambda *_a, **_k: QueryPlan(searches=[question], person="Alex"))
-    monkeypatch.setattr(agent, "mentioned_person", lambda *_a, **_k: "Alex")
-    sentinel = _resp("x")  # a recognizable ticket-list stand-in
-    sentinel = sentinel.model_copy(update={"answer": "TICKET LIST SENTINEL", "citations": []})
-    monkeypatch.setattr(agent, "person_cards_answer", lambda *_a, **_k: sentinel)
     summary = _sum_chunk("fireflies/aaa.md", 1)
-    monkeypatch.setattr(agent, "meeting_summary_chunks", lambda source: [summary])
-    monkeypatch.setattr(agent, "classify_query", lambda q: None)
+    monkeypatch.setattr(agent, "meeting_chunks", lambda source: seen["loaded"].append(source) or [summary])
     return seen
 
 
-def _stub_model(monkeypatch: pytest.MonkeyPatch, drafts: list[Any], seen: dict[str, Any]) -> None:
-    calls: list[list[dict[str, Any]]] = []
-
-    def call_llm(**kwargs: Any) -> Any:
-        seen["messages"] = kwargs["messages"]
-        return type("C", (), {"choices": [type("M", (), {"message": type("X", (), {"tool_calls": None, "content": ""})()})()]})()
-
-    def synth(*, tier: str, messages: list[dict[str, Any]]) -> Any:
-        calls.append(messages)
-        return drafts[min(len(calls), len(drafts)) - 1]
-
-    monkeypatch.setattr(agent, "call_llm", call_llm)
-    monkeypatch.setattr(agent, "_synthesize_answer", synth)
-    seen["calls"] = calls
-
-
-def _payload(messages: list[dict[str, Any]]) -> dict[str, Any]:
-    evidence = next(m for m in messages if m["content"].startswith("Initial evidence"))
-    return json.loads(evidence["content"].split("\n", 1)[1])
+def _card_cite() -> Citation:
+    return Citation(source_file="trello/c1.md", chunk_id=900, content_sha256="e" * 64, quote="Task alpha")
 
 
 @pytest.mark.unit
-def test_r5_lane_with_person_keeps_the_meeting_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_r5_person_named_meeting_answer_is_returned_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     question = "what should Alex own from yesterdays meeting?"
-    seen = _person_install(monkeypatch, question, None)
     good = _resp("Automate structured meeting minutes (01:47:38)", "Alice Example owns minutes.", chunk_id=1)
-    _stub_model(monkeypatch, [good], seen)
+    seen = _person_install(monkeypatch, question, [good])
     response = agent.run_agent(question)
     assert response.answer == "Alice Example owns minutes."
     assert {c.chunk_id for c in response.citations} == {1}
-    payload = _payload(seen["calls"][0])
-    assert not payload["trello_board"]["cards"]
-    assert not payload["person_cards"]
+    pack = _pack(seen["calls"][0])
+    assert [card["title"] for card in pack["trello_board"]["cards"]] == ["Task alpha"]  # board stays in the pack
+    assert "person_cards" not in pack and "person_filter" not in pack
 
 
 @pytest.mark.unit
-def test_r5_lane_follow_up_uses_the_parent(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_r5_follow_up_uses_the_parent_for_the_meeting(monkeypatch: pytest.MonkeyPatch) -> None:
     question = "and what about Sam?"
-    seen = _person_install(monkeypatch, question, PARENT)
     good = _resp("Automate structured meeting minutes (01:47:38)", "Alice Example owns minutes.", chunk_id=1)
-    _stub_model(monkeypatch, [good], seen)
+    seen = _person_install(monkeypatch, question, [good], thread=PARENT)
+    monkeypatch.setattr(agent, "today_in_new_york", lambda *_a: date(2026, 11, 14))
     response = agent.run_agent(question, thread_question=PARENT)
     assert response.answer == "Alice Example owns minutes."
-    assert seen["retrievals"][-1] == "fireflies/aaa.md"  # parent's "yesterdays" picked the Nov 13 meeting
+    assert seen["loaded"] == ["fireflies/aaa.md"]  # the parent's "yesterdays" picked the Nov 13 meeting
 
 
 @pytest.mark.unit
-def test_r5_exclusion_sends_no_trello_and_rejects_card_citations(monkeypatch: pytest.MonkeyPatch) -> None:
-    question = "don't look at tickets, what does Alex own?"
-    seen = _person_install(monkeypatch, question, None)
-    card_cite = Citation(source_file="trello/c1.md", chunk_id=900, content_sha256="e" * 64, quote="Task alpha card")
+def test_r5_exclusion_retries_once_then_drops_trello_citations_and_keeps_the_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    question = "don't look at tickets, what does Alex own from the november 13 meeting?"
+    both = _resp("Automate structured meeting minutes (01:47:38)", "Alex owns minutes and Task alpha.", chunk_id=1)
+    both = both.model_copy(update={"citations": [*both.citations, _card_cite()]})
+    seen = _person_install(monkeypatch, question, [both, both])
+    response = agent.run_agent(question)
+    assert len(seen["calls"]) == 2
+    assert meeting_answers.TRELLO_EXCLUDED_RETRY in seen["calls"][1][-1]["content"]
+    assert response.status == "answered"
+    assert [c.chunk_id for c in response.citations] == [1]
+    assert _pack(seen["calls"][0])["trello_board"]["cards"]  # the board was never removed from the pack
+
+
+@pytest.mark.unit
+def test_r5_exclusion_with_only_trello_citations_fails_without_a_ticket_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    question = "don't look at tickets, what does Alex own from the november 13 meeting?"
     from benchmark_cli.models import AnswerResponse
 
-    bad = AnswerResponse(status="answered", answer="Alex owns Task alpha.", confidence=0.9, citations=[card_cite])
-    _stub_model(monkeypatch, [bad, bad], seen)
+    bad = AnswerResponse(status="answered", answer="Alex owns Task alpha.", confidence=0.9, citations=[_card_cite()])
+    seen = _person_install(monkeypatch, question, [bad, bad])
     response = agent.run_agent(question)
-    assert "TICKET LIST SENTINEL" not in response.answer
     assert response.status == "no_relevant_information"
-    payload = _payload(seen["calls"][0])
-    assert not payload["trello_board"]["cards"]
-    assert not payload["person_cards"]
-    assert payload["person_filter"] is None or payload["person_filter"] == "Alex"
-    assert any(m["content"] == meeting_answers.TRELLO_EXCLUDED_PROMPT for m in seen["calls"][0])
+    assert "Task alpha" not in response.answer
+    assert seen["outcome"] == "validation_failed"
 
 
 @pytest.mark.unit
-def test_r5_lane_model_failure_gives_no_ticket_list(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_r5_model_failure_gives_no_ticket_list(monkeypatch: pytest.MonkeyPatch) -> None:
     question = "what should Alex own from yesterdays meeting?"
-    seen = _person_install(monkeypatch, question, None)
-    _stub_model(monkeypatch, [None, None], seen)
+    seen = _person_install(monkeypatch, question, [None, None])
     response = agent.run_agent(question)
     assert response.status == "no_relevant_information"
-    assert "TICKET LIST SENTINEL" not in response.answer
-    assert agent._deterministic_fallback(question, None, None, (), "Alex", (), trello_off=True) is None
+    assert "Task alpha" not in response.answer
+    assert seen["outcome"] == "validation_failed"
+    for name in ("_deterministic_fallback", "_complete", "_model_question"):
+        assert not hasattr(agent, name)
 
 
 @pytest.mark.unit
-def test_r5_lane_quota_gives_no_ticket_list(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_r5_quota_gives_the_unavailable_reply(monkeypatch: pytest.MonkeyPatch) -> None:
     question = "what should Alex own from yesterdays meeting?"
-    seen = _person_install(monkeypatch, question, None)
+    seen = _person_install(monkeypatch, question, [])
 
     def boom(**_k: Any) -> Any:
-        raise RuntimeError("rate limited")
+        raise agent.ModelQuotaError("rate limited")
 
-    monkeypatch.setattr(agent, "call_llm", boom)
-    monkeypatch.setattr(agent, "_quota_error", lambda exc: object())
+    monkeypatch.setattr(agent, "_synthesize_answer", lambda **_k: boom())
     response = agent.run_agent(question)
-    assert "TICKET LIST SENTINEL" not in response.answer
+    assert response.answer == agent.MODEL_UNAVAILABLE_REPLY
     assert seen["outcome"] == "model_quota"
 
 
 @pytest.mark.unit
-def test_r5_person_ticket_question_without_meeting_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_r5_person_ticket_question_without_meeting_returns_the_model_answer(monkeypatch: pytest.MonkeyPatch) -> None:
     question = "what tickets does Alex have?"
-    seen = _person_install(monkeypatch, question, None)
-    draft = _resp("x", "Alex has some work.", chunk_id=900, source="trello/c1.md")
-    draft = draft.model_copy(update={"citations": []})
-    _stub_model(monkeypatch, [draft], seen)
-    monkeypatch.setattr(agent, "_validated_answer", lambda response, *_a, **_k: response)
+    from benchmark_cli.models import AnswerResponse
+
+    draft = AnswerResponse(status="answered", answer="Alex has Task alpha.", confidence=0.9, citations=[_card_cite()])
+    seen = _person_install(monkeypatch, question, [draft])
     response = agent.run_agent(question)
-    assert response.answer == "TICKET LIST SENTINEL"
-    payload = _payload(seen["calls"][0])
-    assert payload["trello_board"]["cards"]
-
-
-@pytest.mark.unit
-def test_r5_non_lane_fallback_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
-    rows = trello_answers.cards_from_rows([CARD])
-    monkeypatch.setattr(agent, "person_cards_answer", lambda *_a, **_k: "OWNED")
-    assert agent._deterministic_fallback("what tickets does Alex have", None, rows, (), "Alex") == "OWNED"
-    assert agent._deterministic_fallback("what tickets does Alex have", None, rows, (), "Alex", (), True) is None
+    assert response.answer == "Alex has Task alpha."
+    assert [c.chunk_id for c in response.citations] == [900]
+    assert [card["title"] for card in _pack(seen["calls"][0])["trello_board"]["cards"]] == ["Task alpha"]

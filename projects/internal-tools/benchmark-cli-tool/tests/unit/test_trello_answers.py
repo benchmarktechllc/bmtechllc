@@ -145,66 +145,6 @@ def test_other_questions_are_not_list_lookups(question: str) -> None:
 
 
 @pytest.mark.unit
-def test_active_in_progress_lists_only_the_doing_card(
-    monkeypatch: pytest.MonkeyPatch, quiet_agent: None
-) -> None:
-    monkeypatch.setattr(agent, "trello_card_rows", lambda: [_as_tuple(row) for row in _ROWS])
-
-    response = agent.run_agent("which tickets are in active in progress state?")
-
-    assert response.status == "answered"
-    assert response.confidence == 0.8
-    assert "Notion data job" in response.answer
-    assert "https://trello.com/c/bbb" in response.answer
-    assert "Nightly Discord sync" not in response.answer
-    assert "Portal ingestion" not in response.answer
-    assert [citation.quote for citation in response.citations] == ["Card: Notion data job"]
-    rendered = response.model_dump_json()
-    assert _TOKEN not in rendered
-    assert "Secret desc" not in rendered
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize(
-    ("question", "title", "absent"),
-    (
-        ("Which tickets are in backlog?", "Nightly Discord sync", "Notion data job"),
-        ("Which Trello cards are in Doing?", "Notion data job", "Portal ingestion"),
-        ('Which cards are in the "Done" column?', "Portal ingestion", "Nightly Discord sync"),
-    ),
-)
-def test_named_lists_return_only_matching_titles(
-    monkeypatch: pytest.MonkeyPatch,
-    quiet_agent: None,
-    question: str,
-    title: str,
-    absent: str,
-) -> None:
-    monkeypatch.setattr(agent, "trello_card_rows", lambda: [_as_tuple(row) for row in _ROWS])
-
-    response = agent.run_agent(question)
-
-    assert response.status == "answered"
-    assert title in response.answer
-    assert absent not in response.answer
-    assert response.citations[0].quote == f"Card: {title}"
-
-
-@pytest.mark.unit
-def test_under_review_uses_the_named_list(
-    monkeypatch: pytest.MonkeyPatch, quiet_agent: None
-) -> None:
-    review = _row("Review", "Portal copy", "rev", 4)
-    monkeypatch.setattr(agent, "trello_card_rows", lambda: [_as_tuple(review)])
-
-    response = agent.run_agent("Which tickets are under Review?")
-
-    assert response.status == "answered"
-    assert "Portal copy" in response.answer
-    assert response.citations[0].quote == "Card: Portal copy"
-
-
-@pytest.mark.unit
 def test_unknown_list_is_explicit_and_does_not_list_cards() -> None:
     response = trello_list_answer("qa", _ROWS)
 
@@ -214,19 +154,6 @@ def test_unknown_list_is_explicit_and_does_not_list_cards() -> None:
     assert "Backlog, Doing, Done" in response.answer
     for row in _ROWS:
         assert row.title not in response.answer
-    assert response.citations == []
-
-
-@pytest.mark.unit
-def test_empty_index_says_no_cards_are_indexed(
-    monkeypatch: pytest.MonkeyPatch, quiet_agent: None
-) -> None:
-    monkeypatch.setattr(agent, "trello_card_rows", lambda: [])
-
-    response = agent.run_agent("which trello tickets are in backlog")
-
-    assert response.status == "no_relevant_information"
-    assert "No Trello cards are in the retrieval index yet" in response.answer
     assert response.citations == []
 
 

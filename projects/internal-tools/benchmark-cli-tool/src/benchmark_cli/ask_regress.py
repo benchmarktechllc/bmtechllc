@@ -222,6 +222,16 @@ def thread_question(question: str, starter: str | None) -> str | None:
     return prior
 
 
+def history_turns(question: str, starter: str | None, history: Sequence[tuple[str, str]] = ()) -> list[Any]:
+    """Turns for ``run_agent``: explicit history, else the thread starter as one user turn."""
+    from benchmark_cli.context_pack import Turn
+
+    if history:
+        return [Turn(role, text) for role, text in history]
+    prior = thread_question(question, starter)
+    return [Turn("user", prior)] if prior else []
+
+
 def build_fingerprint() -> dict[str, Any]:
     """Version plus a digest of the installed package source (this file excluded)."""
     import benchmark_cli
@@ -269,6 +279,8 @@ class Case:
     q: str
     starter: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    # Earlier turns as (role, text). Empty means the starter, if any, is the only earlier turn.
+    history: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -906,10 +918,10 @@ def run_offline_case(case: Case, plan: Any) -> dict[str, Any]:
         "attempts": None,
         "error": None,
     }
-    tq = thread_question(case.q, case.starter)
+    turns = history_turns(case.q, case.starter, case.history)
     with offline_agent(record, plan):
         try:
-            response = agent.run_agent(case.q, thread_question=tq) if tq else agent.run_agent(case.q)
+            response = agent.run_agent(case.q, history=turns) if turns else agent.run_agent(case.q)
         except EmbeddingMiss as exc:
             record["error"] = f"embedding_miss: {exc}"
         except Exception as exc:  # recorded and compared, not fatal
@@ -922,9 +934,10 @@ def run_offline_case(case: Case, plan: Any) -> dict[str, Any]:
 def stored_plan(case: Case, mode: str) -> Any:
     from benchmark_cli.query_understanding import fallback_plan, understand_query
 
+    turns = history_turns(case.q, case.starter, case.history)
     tq = thread_question(case.q, case.starter)
     if mode == "understand":
-        return understand_query(case.q, tq)
+        return understand_query(case.q, tq, history=turns)
     return fallback_plan(case.q, tq)
 
 
@@ -1545,9 +1558,19 @@ class LiveTally:
 # --------------------------------------------------------------------------- live
 
 
-def run_live_case(question: str, starter: str | None, guard: OpenAIGuard) -> dict[str, Any]:
+def run_live_case(
+    question: str,
+    starter: str | None,
+    guard: OpenAIGuard,
+    history: Sequence[tuple[str, str]] = (),
+) -> dict[str, Any]:
+    """Run one live case. A follow-up (a starter, no explicit history) runs its parent first
+    and feeds the parent's real answer back as the assistant turn."""
     from benchmark_cli import agent
 
+    if starter and not history and thread_question(question, starter):
+        parent = run_live_case(starter, None, guard)
+        history = (("user", starter), ("assistant", str(parent.get("answer") or "")))
     seen: dict[str, Any] = {}
 
     def diagnostic(**kwargs: Any) -> None:
@@ -1556,11 +1579,11 @@ def run_live_case(question: str, starter: str | None, guard: OpenAIGuard) -> dic
 
     before = guard.usage.chat_calls
     started = time.monotonic()
-    tq = thread_question(question, starter)
+    turns = history_turns(question, starter, history)
     result: dict[str, Any] = {"q": question, "starter": starter}
     with mock.patch.object(agent, "log_agent_diagnostic", diagnostic):
         try:
-            response = agent.run_agent(question, thread_question=tq) if tq else agent.run_agent(question)
+            response = agent.run_agent(question, history=turns) if turns else agent.run_agent(question)
         except Exception as exc:
             result.update({"status": "error", "answer": "", "citations": [], "error": f"{type(exc).__name__}: {exc}"[:300]})
         else:

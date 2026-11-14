@@ -1,12 +1,13 @@
-"""Meeting lane for Ask: detect meeting questions and resolve which meeting is meant.
+"""Meetings for Ask: detect meeting questions and resolve which meeting is meant.
 
-Everything here is deterministic and makes no model call. A question that
-``asks_about_meeting`` rejects keeps today's code path unchanged.
+Everything here is deterministic and makes no model call. Detection only decides whether
+the full meeting is added to the context pack; it never forces an answer.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -28,23 +29,10 @@ _MEETING_WORDS = re.compile(
     re.IGNORECASE,
 )
 
-MEETING_LANE_PROMPT = (
-    "Meeting evidence rules. Chunks labelled Meeting are from indexed meetings. "
-    "An item listed under a person in a meeting summary is that person's to-do. "
-    "Name the meeting title and its date in the answer. "
-    "A transcript records what was said; it is not a decision unless someone states one. "
-    "For who-owns or who-is-responsible questions: an action item listed under a person in a "
-    "meeting summary that covers the task, even if worded differently, answers the question. "
-    "So does a person saying in the meeting that they will do it. Name the person, cite the "
-    "summary or transcript chunk, and say whether the task was assigned (listed in the summary) "
-    "or only proposed (said in the transcript). If no person is linked to the task, say so; "
-    "never invent an owner. "
-    "For what-should-X-own or responsible-for questions, list that person's items from the "
-    "meeting's summary action items and todos, plus tasks they volunteered for in the "
-    "transcript. Cite the summary or transcript chunks."
+TRELLO_EXCLUDED_RETRY = (
+    "The conversation asked you not to use Trello tickets. Answer without citing a Trello card; "
+    "cite meeting, knowledge-base, chat, or saved-answer chunks instead."
 )
-
-TRELLO_EXCLUDED_PROMPT = "Answer only from meeting evidence; do not mention Trello tickets."
 
 _TRELLO_NEGATION = re.compile(
     r"\b(?:don'?t|do not|dont|not|without|ignore|skip|exclude)\b[^.?!\n]{0,30}"
@@ -222,6 +210,41 @@ def resolve_meeting_in_context(
     if resolution.meeting is not None or resolution.requested is not None or not parent:
         return resolution
     return resolve_meeting(parent, meetings, today)
+
+
+def _user_turns(history: Sequence[Any] | None) -> list[Any]:
+    """Earlier user turns, newest first."""
+    return [turn for turn in reversed(list(history or ())) if getattr(turn, "role", "") == "user"]
+
+
+def asks_about_meeting_in_turns(question: str, history: Sequence[Any] | None = None) -> bool:
+    """True when the message, or an earlier user turn, is about a meeting."""
+    if asks_about_meeting(question):
+        return True
+    return any(asks_about_meeting(turn.text) for turn in _user_turns(history))
+
+
+def resolve_meeting_in_turns(
+    question: str,
+    history: Sequence[Any] | None,
+    meetings: list[Meeting],
+    today: date,
+) -> MeetingResolution:
+    """The current message first, then earlier user turns newest first.
+
+    A relative date in an earlier turn ("yesterdays") resolves against the New York date
+    that turn was sent, so a follow-up posted the next day keeps the same meeting.
+    """
+    resolution = resolve_meeting(question, meetings, today)
+    if resolution.meeting is not None or resolution.requested is not None:
+        return resolution
+    for turn in _user_turns(history):
+        sent = getattr(turn, "sent_at", None)
+        day = today_in_new_york(sent) if sent is not None else today
+        resolution = resolve_meeting(turn.text, meetings, day)
+        if resolution.meeting is not None or resolution.requested is not None:
+            return resolution
+    return MeetingResolution()
 
 
 def indexed_meetings(source_file: str | None = None) -> list[Meeting]:
