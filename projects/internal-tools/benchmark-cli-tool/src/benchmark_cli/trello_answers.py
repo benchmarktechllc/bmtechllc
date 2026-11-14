@@ -14,6 +14,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 from .ingestion.clean import redact_secrets
+from .meeting_answers import excludes_trello
 from .models import AnswerResponse, Citation
 from .roster import Person, load_people, person_by_label, person_in_text, roster_payload
 from .storage.postgres import SearchChunk
@@ -756,6 +757,8 @@ def asks_for_current_work(question: str) -> bool:
 
 def board_question(question: str, thread_question: str | None = None) -> bool:
     """Whether this question, or a Trello thread follow-up, should use the card index."""
+    if excludes_trello(question, thread_question):
+        return False
     if _BOARD_OVERVIEW.search(question):
         return True
     if asks_for_current_work(question) or re.search(r"\bblocked\b", question, re.IGNORECASE):

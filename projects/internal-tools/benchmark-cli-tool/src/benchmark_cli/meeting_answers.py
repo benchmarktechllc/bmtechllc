@@ -38,7 +38,23 @@ MEETING_LANE_PROMPT = (
     "So does a person saying in the meeting that they will do it. Name the person, cite the "
     "summary or transcript chunk, and say whether the task was assigned (listed in the summary) "
     "or only proposed (said in the transcript). If no person is linked to the task, say so; "
-    "never invent an owner."
+    "never invent an owner. "
+    "For what-should-X-own or responsible-for questions, list that person's items from the "
+    "meeting's summary action items and todos, plus tasks they volunteered for in the "
+    "transcript. Cite the summary or transcript chunks."
+)
+
+TRELLO_EXCLUDED_PROMPT = "Answer only from meeting evidence; do not mention Trello tickets."
+
+_TRELLO_NEGATION = re.compile(
+    r"\b(?:don'?t|do not|dont|not|without|ignore|skip|exclude)\b[^.?!\n]{0,30}"
+    r"\b(?:tickets?|trello|cards?|board)\b",
+    re.IGNORECASE,
+)
+_ONLY_SOURCE = re.compile(
+    r"\bonly\s+(?:on|from|in|using)\s+(?:[\w']+\s+){0,3}(?:meeting|call|transcript|sync|summary)"
+    r"|\b(?:just|solely)\s+(?:the\s+)?(?:meeting|transcript)",
+    re.IGNORECASE,
 )
 
 _MONTHS = {
@@ -85,6 +101,25 @@ class MeetingResolution:
 def asks_about_meeting(question: str) -> bool:
     """True when the question is about a meeting, call, stand-up or transcript."""
     return _MEETING_WORDS.search(question or "") is not None
+
+
+def meeting_context(question: str, thread_question: str | None = None) -> str:
+    """The question plus its thread starter, or just the question when there is no distinct parent."""
+    current = " ".join((question or "").split())
+    parent = " ".join((thread_question or "").split())
+    if not parent or parent == current:
+        return current
+    return f"{current}\n{parent}"
+
+
+def asks_about_meeting_in_context(question: str, thread_question: str | None = None) -> bool:
+    return asks_about_meeting(meeting_context(question, thread_question))
+
+
+def excludes_trello(question: str, thread_question: str | None = None) -> bool:
+    """True when the question (or its thread starter) tells us to leave Trello tickets out."""
+    text = meeting_context(question, thread_question)
+    return _TRELLO_NEGATION.search(text) is not None or _ONLY_SOURCE.search(text) is not None
 
 
 def today_in_new_york(now: datetime | None = None) -> date:
@@ -176,6 +211,17 @@ def resolve_meeting(question: str, meetings: list[Meeting], today: date) -> Meet
         overlapping = [item for item in meetings if words & _title_words(item.title)]
         return MeetingResolution(_newest(overlapping) or _newest(meetings), None)
     return MeetingResolution()
+
+
+def resolve_meeting_in_context(
+    question: str, thread_question: str | None, meetings: list[Meeting], today: date
+) -> MeetingResolution:
+    """Resolve from the question first so its own date wins; fall back to the thread starter."""
+    resolution = resolve_meeting(question, meetings, today)
+    parent = " ".join((thread_question or "").split())
+    if resolution.meeting is not None or resolution.requested is not None or not parent:
+        return resolution
+    return resolve_meeting(parent, meetings, today)
 
 
 def indexed_meetings(source_file: str | None = None) -> list[Meeting]:

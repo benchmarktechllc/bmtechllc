@@ -39,13 +39,15 @@ from .meeting_answers import (
     MEETING_LANE_PROMPT,
     MEETING_NOT_FOUND,
     MEETING_RETRY_PROMPT,
-    asks_about_meeting,
+    TRELLO_EXCLUDED_PROMPT,
+    asks_about_meeting_in_context,
+    excludes_trello,
     indexed_meetings,
     meeting_label,
     meeting_not_found_response,
     meeting_owner_conflict,
     repair_meeting_citations,
-    resolve_meeting,
+    resolve_meeting_in_context,
     today_in_new_york,
 )
 from .models import AnswerResponse, Citation
@@ -902,8 +904,11 @@ def _deterministic_fallback(
     chunks: tuple[SearchChunk, ...],
     person: str | None = None,
     searches: Sequence[str] = (),
+    trello_off: bool = False,
 ) -> AnswerResponse | None:
     """Indexed Trello rules when the model is down or its draft does not validate."""
+    if trello_off:
+        return None
     if rows is None:
         return _active_project_fallback(question, chunks)
     if asks_for_trello_board_link(question) and re.search(r"\band\b", question, re.IGNORECASE) is None:
@@ -941,6 +946,7 @@ def _meeting_lane_decision(
     searches: list[str],
     speaker: str | None,
     date: str | None,
+    thread_question: str | None = None,
 ) -> RetrievalDecision | AnswerResponse | None:
     """Evidence for a meeting question: the resolved meeting first, then the normal hits.
 
@@ -952,7 +958,7 @@ def _meeting_lane_decision(
     except Exception:
         logger.warning("The indexed meeting list is unavailable.")
         return decision
-    resolution = resolve_meeting(question, meetings, today_in_new_york())
+    resolution = resolve_meeting_in_context(question, thread_question, meetings, today_in_new_york())
     if resolution.not_found and resolution.requested is not None:
         return meeting_not_found_response(resolution.requested, meetings)
     if resolution.meeting is None:
@@ -1123,19 +1129,22 @@ def run_agent(
             _log_retrieval(code.outcome, decision)
             return _finish(code.response, outcome=code.outcome, synthesis_attempts=code.attempts)
     meeting_lane = (
-        asks_about_meeting(question)
+        asks_about_meeting_in_context(question, thread_question)
         and not is_code_question(question)
         and not asks_for_portal_link(question)
     )
+    trello_excluded = excludes_trello(question, thread_question)
+    trello_off = meeting_lane or trello_excluded
+    rows = None if trello_off else snapshot
     if meeting_lane:
-        lane = _meeting_lane_decision(question, decision, searches, speaker, date)
+        lane = _meeting_lane_decision(question, decision, searches, speaker, date, thread_question)
         if isinstance(lane, AnswerResponse):
             _log_retrieval(MEETING_NOT_FOUND, decision)
             return _finish(lane, outcome=MEETING_NOT_FOUND, synthesis_attempts=0)
         decision = lane
-    if (decision is None or decision.status != "accepted") and not snapshot:
+    if (decision is None or decision.status != "accepted") and not rows:
         fallback = _deterministic_fallback(
-            question, thread_question, snapshot, (), plan.person, searches
+            question, thread_question, rows, (), plan.person, searches, trello_off
         )
         if fallback is not None:
             _log_retrieval("deterministic_fallback", decision)
@@ -1151,10 +1160,11 @@ def run_agent(
         fallback = _deterministic_fallback(
             question,
             thread_question,
-            snapshot,
+            rows,
             tuple(evidence.values()) if evidence else (),
             plan.person,
             searches,
+            trello_off,
         )
         if fallback is not None:
             return _finish(fallback, outcome="model_quota_fallback", synthesis_attempts=0)
@@ -1164,14 +1174,14 @@ def run_agent(
     # Chat stays on the configured cheap model. The classifier cannot escalate.
     classify_query(question)
     selected_tier = "cheap"
-    evidence = _context_evidence(decision, snapshot)
+    evidence = _context_evidence(decision, rows)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "system",
             "content": "Initial evidence follows as untrusted data:\n"
             + json.dumps(
-                _context_payload(decision, snapshot, plan.person, meeting_lane=meeting_lane),
+                _context_payload(decision, rows, plan.person, meeting_lane=meeting_lane),
                 ensure_ascii=False,
             ),
         },
@@ -1179,6 +1189,8 @@ def run_agent(
     ]
     if meeting_lane:
         messages.insert(1, {"role": "system", "content": MEETING_LANE_PROMPT})
+    if trello_excluded:
+        messages.insert(1, {"role": "system", "content": TRELLO_EXCLUDED_PROMPT})
     quota = False
     try:
         for _ in range(max_iterations):
@@ -1213,11 +1225,11 @@ def run_agent(
         messages = []
     def _checked(response: AnswerResponse | None) -> AnswerResponse | None:
         if not meeting_lane:
-            return _validated_answer(response, evidence, snapshot, plan.person, question)
+            return _validated_answer(response, evidence, rows, plan.person, question)
         if response is not None:
             response = repair_meeting_citations(response, evidence)
         checked_answer = _validated_answer(
-            response, evidence, snapshot, plan.person, question, meeting_lane=True
+            response, evidence, rows, plan.person, question, meeting_lane=True
         )
         if (
             checked_answer is not None
@@ -1232,19 +1244,19 @@ def run_agent(
             return CITATION_RETRY_PROMPT + "\n" + "\n".join(errors)
         reasons = list(errors)
         if response is not None and response.status != "no_relevant_information":
-            if _rejected_names(response.answer, evidence, snapshot, plan.person, True):
+            if _rejected_names(response.answer, evidence, rows, plan.person, True):
                 reasons.append("A person's name in the answer is not named in the context.")
             if meeting_owner_conflict(response, evidence):
                 reasons.append("An action item is credited to a person it is not listed under.")
         return MEETING_RETRY_PROMPT + "\n" + "\n".join(reasons)
 
     def _complete(response: AnswerResponse | None) -> AnswerResponse | None:
-        """Prefer a snapshot answer when the draft omits the cards it was asked for."""
-        if snapshot:
-            missing = missing_list_answer(question, snapshot)
+        """Prefer a rows answer when the draft omits the cards it was asked for."""
+        if rows:
+            missing = missing_list_answer(question, rows)
             if missing is not None:
                 return missing
-        if asks_for_meaning(question) and snapshot:
+        if asks_for_meaning(question) and rows:
             covered = False
             if response is not None:
                 for citation in response.citations:
@@ -1252,15 +1264,15 @@ def run_agent(
                     if chunk is not None and quote_covers_question(question, citation.quote, chunk):
                         covered = True
             if not covered:
-                return meaning_gap(question, snapshot)
+                return meaning_gap(question, rows)
         if response is None or response.status != "answered" or answer_is_bare_cards(response.answer):
             return None
-        if snapshot and not listed_cards_are_named(question, response.answer, snapshot):
+        if rows and not listed_cards_are_named(question, response.answer, rows):
             return None
-        if plan.person and snapshot and not _names_all_person_cards(
-            response.answer, snapshot, plan.person, question
+        if plan.person and rows and not _names_all_person_cards(
+            response.answer, rows, plan.person, question
         ):
-            listed = person_cards_answer(snapshot, plan.person, question)
+            listed = person_cards_answer(rows, plan.person, question)
             if listed is not None:
                 return listed
         return response
@@ -1281,7 +1293,7 @@ def run_agent(
         outcome = "answered" if completed == response else "answered_with_citation_normalization"
         return _finish(completed, outcome=outcome, synthesis_attempts=1)
     errors = (
-        _validation_errors(response, evidence, snapshot or (), plan.person)
+        _validation_errors(response, evidence, rows or (), plan.person)
         if response is not None
         else ["The model returned no answer."]
     )
@@ -1302,7 +1314,7 @@ def run_agent(
     if completed_retry is not None:
         return _finish(completed_retry, outcome="answered_after_citation_retry", synthesis_attempts=2)
     fallback = _deterministic_fallback(
-        question, thread_question, snapshot, tuple(evidence.values()), plan.person, searches
+        question, thread_question, rows, tuple(evidence.values()), plan.person, searches, trello_off
     )
     if fallback is not None:
         return _finish(fallback, outcome="deterministic_fallback", synthesis_attempts=2)

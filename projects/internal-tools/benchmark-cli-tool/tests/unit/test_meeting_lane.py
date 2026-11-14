@@ -449,3 +449,225 @@ def test_lane_retry_carries_the_reason_and_non_lane_retry_is_unchanged(monkeypat
     assert "not listed under" in retry
     assert agent.CITATION_RETRY_PROMPT.startswith("Your prior answer could not be returned")
     assert "single line" in meeting_answers.MEETING_RETRY_PROMPT
+
+
+# --------------------------------------------------------------------------- r5: lane vs Trello
+
+from benchmark_cli import trello_answers  # noqa: E402
+from benchmark_cli.meeting_answers import (  # noqa: E402
+    asks_about_meeting_in_context,
+    excludes_trello,
+    resolve_meeting_in_context,
+)
+from benchmark_cli.trello_answers import board_question  # noqa: E402
+
+PARENT = "what should Alex own from yesterdays meeting?"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "question",
+    [
+        "what should Alex own from yesterdays meeting?",
+        "based on the Weekly Sync Test transcript, what is Alex responsible for?",
+        "don't look at tickets, what did Alex agree to in the meeting",
+    ],
+)
+def test_r5_phrasings_enter_the_lane(question: str) -> None:
+    assert asks_about_meeting(question)
+
+
+@pytest.mark.unit
+def test_r5_yesterday_resolves_alone_and_from_the_parent() -> None:
+    today = date(2026, 11, 14)
+    assert parse_requested_date("what should Alex own from yesterdays meeting", today) == date(2026, 11, 13)
+    resolution = resolve_meeting_in_context("and what about Sam?", PARENT, MEETINGS, today)
+    assert resolution.meeting == SYNC
+
+
+@pytest.mark.unit
+def test_r5_follow_up_date_wins_over_the_parent() -> None:
+    resolution = resolve_meeting_in_context(
+        "and on november 10?", PARENT, MEETINGS, date(2026, 11, 14)
+    )
+    assert resolution.meeting == PLANNING
+    missing = resolve_meeting_in_context("and on november 2?", PARENT, MEETINGS, date(2026, 11, 14))
+    assert missing.meeting is None and missing.requested == date(2026, 11, 2)
+
+
+@pytest.mark.unit
+def test_r5_follow_up_lane_needs_a_meeting_parent() -> None:
+    assert asks_about_meeting_in_context("and what about Sam?", PARENT)
+    assert not asks_about_meeting_in_context("and what about Sam?", "what tickets does Alex have")
+    assert not asks_about_meeting_in_context("and what about Sam?", None)
+    assert asks_about_meeting_in_context("summarize the meeting", None)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "text",
+    [
+        "where is Discord message sync",
+        "what did we decide about Fireflies?",
+        "sync",
+        "call",
+        "fireflies",
+        "fathom",
+    ],
+)
+def test_r5_negatives_stay_negative_in_context(text: str) -> None:
+    assert not asks_about_meeting(text)
+    assert not asks_about_meeting_in_context(text, "what tickets does Alex have")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "text",
+    ["don't look at tickets", "based only on the transcript", "only on yesterdays meeting", "ignore the trello board"],
+)
+def test_r5_excludes_trello_true(text: str) -> None:
+    assert excludes_trello(text)
+    assert excludes_trello("and Sam?", text)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("text", ["what tickets does Alex have", "what is on the board", "Alex's cards"])
+def test_r5_excludes_trello_false(text: str) -> None:
+    assert not excludes_trello(text)
+    assert not excludes_trello(text, "what tickets does Sam have")
+
+
+@pytest.mark.unit
+def test_r5_board_question_respects_exclusion() -> None:
+    assert not board_question("don't look at tickets", PARENT)
+    assert board_question("what are Alex's tickets")
+
+
+CARD = ("board", "Doing", "c1", "Task alpha", "https://example.test/c1", 900, "trello/c1.md", "e" * 64, "Task alpha card")
+
+
+def _person_install(monkeypatch: pytest.MonkeyPatch, question: str, thread: str | None, with_meeting: bool = True) -> dict[str, Any]:
+    seen = _install(monkeypatch, question, [])
+    monkeypatch.setattr(agent, "trello_card_rows", lambda: [CARD])
+    monkeypatch.setattr(agent, "understand_query", lambda *_a, **_k: QueryPlan(searches=[question], person="Alex"))
+    monkeypatch.setattr(agent, "mentioned_person", lambda *_a, **_k: "Alex")
+    sentinel = _resp("x")  # a recognizable ticket-list stand-in
+    sentinel = sentinel.model_copy(update={"answer": "TICKET LIST SENTINEL", "citations": []})
+    monkeypatch.setattr(agent, "person_cards_answer", lambda *_a, **_k: sentinel)
+    summary = _sum_chunk("fireflies/aaa.md", 1)
+    monkeypatch.setattr(agent, "meeting_summary_chunks", lambda source: [summary])
+    monkeypatch.setattr(agent, "classify_query", lambda q: None)
+    return seen
+
+
+def _stub_model(monkeypatch: pytest.MonkeyPatch, drafts: list[Any], seen: dict[str, Any]) -> None:
+    calls: list[list[dict[str, Any]]] = []
+
+    def call_llm(**kwargs: Any) -> Any:
+        seen["messages"] = kwargs["messages"]
+        return type("C", (), {"choices": [type("M", (), {"message": type("X", (), {"tool_calls": None, "content": ""})()})()]})()
+
+    def synth(*, tier: str, messages: list[dict[str, Any]]) -> Any:
+        calls.append(messages)
+        return drafts[min(len(calls), len(drafts)) - 1]
+
+    monkeypatch.setattr(agent, "call_llm", call_llm)
+    monkeypatch.setattr(agent, "_synthesize_answer", synth)
+    seen["calls"] = calls
+
+
+def _payload(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    evidence = next(m for m in messages if m["content"].startswith("Initial evidence"))
+    return json.loads(evidence["content"].split("\n", 1)[1])
+
+
+@pytest.mark.unit
+def test_r5_lane_with_person_keeps_the_meeting_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    question = "what should Alex own from yesterdays meeting?"
+    seen = _person_install(monkeypatch, question, None)
+    good = _resp("Automate structured meeting minutes (01:47:38)", "Alice Example owns minutes.", chunk_id=1)
+    _stub_model(monkeypatch, [good], seen)
+    response = agent.run_agent(question)
+    assert response.answer == "Alice Example owns minutes."
+    assert {c.chunk_id for c in response.citations} == {1}
+    payload = _payload(seen["calls"][0])
+    assert not payload["trello_board"]["cards"]
+    assert not payload["person_cards"]
+
+
+@pytest.mark.unit
+def test_r5_lane_follow_up_uses_the_parent(monkeypatch: pytest.MonkeyPatch) -> None:
+    question = "and what about Sam?"
+    seen = _person_install(monkeypatch, question, PARENT)
+    good = _resp("Automate structured meeting minutes (01:47:38)", "Alice Example owns minutes.", chunk_id=1)
+    _stub_model(monkeypatch, [good], seen)
+    response = agent.run_agent(question, thread_question=PARENT)
+    assert response.answer == "Alice Example owns minutes."
+    assert seen["retrievals"][-1] == "fireflies/aaa.md"  # parent's "yesterdays" picked the Nov 13 meeting
+
+
+@pytest.mark.unit
+def test_r5_exclusion_sends_no_trello_and_rejects_card_citations(monkeypatch: pytest.MonkeyPatch) -> None:
+    question = "don't look at tickets, what does Alex own?"
+    seen = _person_install(monkeypatch, question, None)
+    card_cite = Citation(source_file="trello/c1.md", chunk_id=900, content_sha256="e" * 64, quote="Task alpha card")
+    from benchmark_cli.models import AnswerResponse
+
+    bad = AnswerResponse(status="answered", answer="Alex owns Task alpha.", confidence=0.9, citations=[card_cite])
+    _stub_model(monkeypatch, [bad, bad], seen)
+    response = agent.run_agent(question)
+    assert "TICKET LIST SENTINEL" not in response.answer
+    assert response.status == "no_relevant_information"
+    payload = _payload(seen["calls"][0])
+    assert not payload["trello_board"]["cards"]
+    assert not payload["person_cards"]
+    assert payload["person_filter"] is None or payload["person_filter"] == "Alex"
+    assert any(m["content"] == meeting_answers.TRELLO_EXCLUDED_PROMPT for m in seen["calls"][0])
+
+
+@pytest.mark.unit
+def test_r5_lane_model_failure_gives_no_ticket_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    question = "what should Alex own from yesterdays meeting?"
+    seen = _person_install(monkeypatch, question, None)
+    _stub_model(monkeypatch, [None, None], seen)
+    response = agent.run_agent(question)
+    assert response.status == "no_relevant_information"
+    assert "TICKET LIST SENTINEL" not in response.answer
+    assert agent._deterministic_fallback(question, None, None, (), "Alex", (), trello_off=True) is None
+
+
+@pytest.mark.unit
+def test_r5_lane_quota_gives_no_ticket_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    question = "what should Alex own from yesterdays meeting?"
+    seen = _person_install(monkeypatch, question, None)
+
+    def boom(**_k: Any) -> Any:
+        raise RuntimeError("rate limited")
+
+    monkeypatch.setattr(agent, "call_llm", boom)
+    monkeypatch.setattr(agent, "_quota_error", lambda exc: object())
+    response = agent.run_agent(question)
+    assert "TICKET LIST SENTINEL" not in response.answer
+    assert seen["outcome"] == "model_quota"
+
+
+@pytest.mark.unit
+def test_r5_person_ticket_question_without_meeting_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    question = "what tickets does Alex have?"
+    seen = _person_install(monkeypatch, question, None)
+    draft = _resp("x", "Alex has some work.", chunk_id=900, source="trello/c1.md")
+    draft = draft.model_copy(update={"citations": []})
+    _stub_model(monkeypatch, [draft], seen)
+    monkeypatch.setattr(agent, "_validated_answer", lambda response, *_a, **_k: response)
+    response = agent.run_agent(question)
+    assert response.answer == "TICKET LIST SENTINEL"
+    payload = _payload(seen["calls"][0])
+    assert payload["trello_board"]["cards"]
+
+
+@pytest.mark.unit
+def test_r5_non_lane_fallback_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = trello_answers.cards_from_rows([CARD])
+    monkeypatch.setattr(agent, "person_cards_answer", lambda *_a, **_k: "OWNED")
+    assert agent._deterministic_fallback("what tickets does Alex have", None, rows, (), "Alex") == "OWNED"
+    assert agent._deterministic_fallback("what tickets does Alex have", None, rows, (), "Alex", (), True) is None
