@@ -225,3 +225,104 @@ def meeting_for_source(source_file: str) -> Meeting | None:
     except Exception:
         return None
     return found[0] if found else None
+
+
+MEETING_RETRY_PROMPT = (
+    "Your prior answer was rejected. Fix only the problems listed, then answer again from the "
+    "supplied context. If the context answers the question, answer it. Cite each claim with ONE "
+    "single line copied exactly from the context: never join lines, never use ellipses, never "
+    "paraphrase a quote."
+)
+
+_QUOTE_SPLIT = re.compile(r"\n|\.\.\.|\u2026| - ")
+_BOLD_HEADER = re.compile(r"^\*\*[^*]+\*\*$")
+_ACTION_ITEMS = re.compile(r"^\W*action items?\W*$", re.IGNORECASE)
+MIN_FRAGMENT_CHARACTERS = 12
+
+
+def _is_meeting_source(source_file: str) -> bool:
+    return source_file.startswith(MEETING_SOURCE_PREFIXES)
+
+
+def _squashed(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
+def repair_meeting_citations(response: AnswerResponse, evidence: dict[int, Any]) -> AnswerResponse | None:
+    """Split a quote stitched from non-adjacent meeting lines into verbatim single-line citations.
+
+    Only ``fireflies/`` and ``fathom/`` chunks are touched. Every kept quote is an exact substring of
+    its chunk. None when a draft had citations and none survive.
+    """
+    if response.status == "no_relevant_information" or not response.citations:
+        return response
+    kept = []
+    for citation in response.citations:
+        chunk = evidence.get(citation.chunk_id)
+        if chunk is None or not _is_meeting_source(chunk.source_file) or not chunk.content_sha256:
+            kept.append(citation)
+            continue
+        text = chunk.chunk_text
+        if citation.quote in text or _squashed(citation.quote) in _squashed(text):
+            kept.append(citation)
+            continue
+        seen: set[str] = set()
+        for raw in _QUOTE_SPLIT.split(citation.quote):
+            fragment = raw.strip()
+            if fragment in seen or fragment not in text:
+                continue
+            if _BOLD_HEADER.match(fragment) or len(fragment) >= MIN_FRAGMENT_CHARACTERS:
+                seen.add(fragment)
+                kept.append(citation.model_copy(update={"quote": fragment}))
+    if not kept:
+        return None
+    return response.model_copy(update={"citations": kept})
+
+
+def action_items_by_person(text: str) -> dict[str, list[str]]:
+    """Person -> item lines from the Summary 'Action items:' block (``**Name**`` then item lines)."""
+    owners: dict[str, list[str]] = {}
+    inside = False
+    person: str | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not inside:
+            inside = bool(_ACTION_ITEMS.match(line.rstrip(":").strip()) or _ACTION_ITEMS.match(line))
+            continue
+        if not line:
+            continue
+        if line.startswith("#"):
+            break
+        if _BOLD_HEADER.match(line):
+            person = line.strip("*").strip()
+            owners.setdefault(person, [])
+        elif person is not None:
+            owners[person].append(line)
+    return owners
+
+
+def _names_person(answer: str, person: str) -> bool:
+    folded = answer.casefold()
+    words = [word for word in re.findall(r"[a-z']+", person.casefold()) if len(word) > 1]
+    return person.casefold() in folded or bool(words and words[0] in folded)
+
+
+def meeting_owner_conflict(response: AnswerResponse, evidence: dict[int, Any]) -> bool:
+    """True when a cited action-item line belongs to a person the answer does not name."""
+    for citation in response.citations:
+        chunk = evidence.get(citation.chunk_id)
+        if chunk is None or not _is_meeting_source(chunk.source_file):
+            continue
+        owners = action_items_by_person(chunk.chunk_text)
+        quote = citation.quote.strip()
+        if not quote:
+            continue
+        listed: dict[str, set[str]] = {}
+        for person, items in owners.items():
+            for item in items:
+                if item in quote or (len(quote) >= MIN_FRAGMENT_CHARACTERS and quote in item):
+                    listed.setdefault(item, set()).add(person)
+        for people in listed.values():
+            if not any(_names_person(response.answer, person) for person in people):
+                return True
+    return False

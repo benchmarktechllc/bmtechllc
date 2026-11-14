@@ -38,10 +38,13 @@ from .logging import log_agent_diagnostic
 from .meeting_answers import (
     MEETING_LANE_PROMPT,
     MEETING_NOT_FOUND,
+    MEETING_RETRY_PROMPT,
     asks_about_meeting,
     indexed_meetings,
     meeting_label,
     meeting_not_found_response,
+    meeting_owner_conflict,
+    repair_meeting_citations,
     resolve_meeting,
     today_in_new_york,
 )
@@ -727,6 +730,7 @@ def _rejected_names(
     evidence: dict[int, SearchChunk],
     rows: tuple[object, ...] | None,
     person: str | None,
+    meeting_lane: bool = False,
 ) -> bool:
     """Reject an invented person. Roster aliases and that person's own cards are known."""
     context = _known_name_text(evidence)
@@ -737,7 +741,7 @@ def _rejected_names(
             answer,
             flags=re.IGNORECASE,
         )
-        if name.casefold() not in context
+        if name.casefold() not in context and not (meeting_lane and name[0].islower())
     ]
     if not unknown:
         return False
@@ -752,6 +756,7 @@ def _validated_answer(
     rows: tuple[object, ...] | None,
     person: str | None = None,
     question: str = "",
+    meeting_lane: bool = False,
 ) -> AnswerResponse | None:
     """Keep a model answer whose citations, cards, and URLs exist. Do not rewrite it."""
     if response is None:
@@ -765,7 +770,7 @@ def _validated_answer(
         return None
     if _invented_urls(repaired.answer, evidence, rows):
         return None
-    if _rejected_names(repaired.answer, evidence, rows, person):
+    if _rejected_names(repaired.answer, evidence, rows, person, meeting_lane):
         return None
     if rows and not _citations_are_exact(repaired, evidence):
         named = citations_for_answer(
@@ -1207,7 +1212,31 @@ def run_agent(
             logger.info("The answer model is unavailable; using indexed data.")
         messages = []
     def _checked(response: AnswerResponse | None) -> AnswerResponse | None:
-        return _validated_answer(response, evidence, snapshot, plan.person, question)
+        if not meeting_lane:
+            return _validated_answer(response, evidence, snapshot, plan.person, question)
+        if response is not None:
+            response = repair_meeting_citations(response, evidence)
+        checked_answer = _validated_answer(
+            response, evidence, snapshot, plan.person, question, meeting_lane=True
+        )
+        if (
+            checked_answer is not None
+            and checked_answer.status != "no_relevant_information"
+            and meeting_owner_conflict(checked_answer, evidence)
+        ):
+            return None
+        return checked_answer
+
+    def _retry_instruction(errors: list[str]) -> str:
+        if not meeting_lane:
+            return CITATION_RETRY_PROMPT + "\n" + "\n".join(errors)
+        reasons = list(errors)
+        if response is not None and response.status != "no_relevant_information":
+            if _rejected_names(response.answer, evidence, snapshot, plan.person, True):
+                reasons.append("A person's name in the answer is not named in the context.")
+            if meeting_owner_conflict(response, evidence):
+                reasons.append("An action item is credited to a person it is not listed under.")
+        return MEETING_RETRY_PROMPT + "\n" + "\n".join(reasons)
 
     def _complete(response: AnswerResponse | None) -> AnswerResponse | None:
         """Prefer a snapshot answer when the draft omits the cards it was asked for."""
@@ -1258,7 +1287,7 @@ def run_agent(
     )
     retry_messages = [
         *messages,
-        {"role": "system", "content": CITATION_RETRY_PROMPT + "\n" + "\n".join(errors)},
+        {"role": "system", "content": _retry_instruction(errors)},
     ]
     try:
         retry = _synthesize_answer(tier=selected_tier, messages=retry_messages)

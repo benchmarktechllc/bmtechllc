@@ -328,3 +328,124 @@ def test_lane_prompt_covers_ownership_questions_without_inventing_owners() -> No
     prompt = meeting_answers.MEETING_LANE_PROMPT.lower()
     for phrase in ("who-owns", "listed under a person", "will do it", "assigned", "proposed", "never invent an owner"):
         assert phrase in prompt
+
+
+# --------------------------------------------------------------------------- r4: abstention fixes
+
+SUMMARY = (
+    "Overview:\nTeam talked about plans.\n\nAction items:\n"
+    "**Alice Example**\nAutomate structured meeting minutes (01:47:38)\nReview the pilot setup (00:12:00)\n"
+    "**Bob Sample**\nBuild the larger demo project (00:30:00)\n"
+)
+
+
+def _sum_chunk(source: str = "fireflies/aaa.md", chunk_id: int = 7, text: str = SUMMARY) -> SearchChunk:
+    return SearchChunk(chunk_id, source, 0, text, {"source_type": "fireflies"}, 0.4, content_sha256="d" * 64)
+
+
+def _resp(quote: str, answer: str = "Alice Example owns it.", chunk_id: int = 7, source: str = "fireflies/aaa.md"):
+    from benchmark_cli.models import AnswerResponse
+
+    cite = Citation(source_file=source, chunk_id=chunk_id, content_sha256="d" * 64, quote=quote)
+    return AnswerResponse(status="answered", answer=answer, confidence=0.9, citations=[cite])
+
+
+def _quotes(response: Any) -> list[str]:
+    return [c.quote for c in response.citations]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("joiner", ["\n", " - ", "...", "…"])
+def test_stitched_quote_splits_into_verbatim_citations(joiner: str) -> None:
+    chunk = _sum_chunk()
+    stitched = f"**Alice Example**{joiner}Review the pilot setup (00:12:00)"  # one line is skipped between them
+    out = meeting_answers.repair_meeting_citations(_resp(stitched), {7: chunk})
+    assert _quotes(out) == ["**Alice Example**", "Review the pilot setup (00:12:00)"]
+    assert all(q in chunk.chunk_text for q in _quotes(out))
+
+
+@pytest.mark.unit
+def test_stitched_quote_drops_absent_fragments_and_none_when_all_dropped() -> None:
+    chunk = _sum_chunk()
+    mixed = "Something never said at all\nReview the pilot setup (00:12:00)"
+    assert _quotes(meeting_answers.repair_meeting_citations(_resp(mixed), {7: chunk})) == [
+        "Review the pilot setup (00:12:00)"
+    ]
+    assert meeting_answers.repair_meeting_citations(_resp("nothing here at all\nstill nothing here"), {7: chunk}) is None
+
+
+@pytest.mark.unit
+def test_repair_leaves_verbatim_non_meeting_and_no_citation_responses_alone() -> None:
+    chunk = _sum_chunk()
+    verbatim = _resp("Review the pilot setup (00:12:00)")
+    assert _quotes(meeting_answers.repair_meeting_citations(verbatim, {7: chunk})) == _quotes(verbatim)
+    kb = SearchChunk(8, "kb/page.md", 0, "line one here\nline two here", {}, 0.4, content_sha256="d" * 64)
+    other = _resp("line one here\nnot there", chunk_id=8, source="kb/page.md")
+    assert _quotes(meeting_answers.repair_meeting_citations(other, {8: kb})) == ["line one here\nnot there"]
+
+
+@pytest.mark.unit
+def test_owner_guard() -> None:
+    chunk = _sum_chunk()
+    ev = {7: chunk}
+    item = "Automate structured meeting minutes (01:47:38)"
+    assert meeting_answers.meeting_owner_conflict(_resp(item, "Bob Sample will automate minutes."), ev)
+    assert not meeting_answers.meeting_owner_conflict(_resp(item, "Alice Example will automate minutes."), ev)
+    assert not meeting_answers.meeting_owner_conflict(_resp(item, "Alice will automate minutes."), ev)
+    plain = _sum_chunk(text="Overview:\nNo list here. Automate structured meeting minutes (01:47:38)\n")
+    assert not meeting_answers.meeting_owner_conflict(_resp(item, "Bob Sample did it."), {7: plain})
+
+
+@pytest.mark.unit
+def test_name_check_ignores_group_phrases_only_in_the_lane() -> None:
+    chunk = _sum_chunk()
+    ev = {7: chunk}
+    answer = "The work was assigned to team members."
+    assert not agent._rejected_names(answer, ev, None, None, True)
+    assert agent._rejected_names(answer, ev, None, None)
+    assert agent._rejected_names("It was assigned to Zed Qux.", ev, None, None, True)
+    assert agent._rejected_names("It was assigned to Zed Qux.", ev, None, None)
+
+
+def _run_stubbed(monkeypatch: pytest.MonkeyPatch, question: str, drafts: list[Any]) -> tuple[Any, dict[str, Any]]:
+    seen = _install(monkeypatch, question, [])
+    summary = _sum_chunk("fireflies/aaa.md", 1)
+    monkeypatch.setattr(agent, "meeting_summary_chunks", lambda source: [summary])
+    calls: list[list[dict[str, Any]]] = []
+
+    def call_llm(**kwargs: Any) -> Any:
+        return type("C", (), {"choices": [type("M", (), {"message": type("X", (), {"tool_calls": None, "content": ""})()})()]})()
+
+    def synth(*, tier: str, messages: list[dict[str, Any]]) -> Any:
+        calls.append(messages)
+        return drafts[len(calls) - 1]
+
+    monkeypatch.setattr(agent, "call_llm", call_llm)
+    monkeypatch.setattr(agent, "_synthesize_answer", synth)
+    monkeypatch.setattr(agent, "classify_query", lambda q: None)
+    seen["calls"] = calls
+    return agent.run_agent(question), seen
+
+
+@pytest.mark.unit
+def test_run_agent_accepts_a_stitched_draft_with_one_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    stitched = _resp(
+        "**Alice Example**\nReview the pilot setup (00:12:00)", "Alice Example owns the pilot review.", chunk_id=1
+    )
+    response, seen = _run_stubbed(monkeypatch, "who owns meeting minutes on november 13 sync call", [stitched])
+    assert seen["outcome"] == "answered_with_citation_normalization"
+    assert seen["synthesis_attempts"] == 1
+    assert _quotes(response) == ["**Alice Example**", "Review the pilot setup (00:12:00)"]
+
+
+@pytest.mark.unit
+def test_lane_retry_carries_the_reason_and_non_lane_retry_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    wrong = _resp("Automate structured meeting minutes (01:47:38)", "Bob Sample owns minutes.", chunk_id=1)
+    good = _resp("Automate structured meeting minutes (01:47:38)", "Alice Example owns minutes.", chunk_id=1)
+    response, seen = _run_stubbed(monkeypatch, "who owns meeting minutes on november 13 sync call", [wrong, good])
+    assert seen["outcome"] == "answered_after_citation_retry"
+    retry = seen["calls"][1][-1]["content"]
+    assert retry.startswith(meeting_answers.MEETING_RETRY_PROMPT)
+    assert "not listed under" in retry
+    assert agent.CITATION_RETRY_PROMPT.startswith("Your prior answer could not be returned")
+    assert "single line" in meeting_answers.MEETING_RETRY_PROMPT
