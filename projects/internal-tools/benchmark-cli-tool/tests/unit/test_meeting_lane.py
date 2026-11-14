@@ -321,3 +321,10 @@ def test_non_meeting_questions_keep_todays_path(monkeypatch: pytest.MonkeyPatch,
     assert [m["role"] for m in seen["messages"]] == ["system", "system", "user"]
 
 
+
+
+@pytest.mark.unit
+def test_lane_prompt_covers_ownership_questions_without_inventing_owners() -> None:
+    prompt = meeting_answers.MEETING_LANE_PROMPT.lower()
+    for phrase in ("who-owns", "listed under a person", "will do it", "assigned", "proposed", "never invent an owner"):
+        assert phrase in prompt

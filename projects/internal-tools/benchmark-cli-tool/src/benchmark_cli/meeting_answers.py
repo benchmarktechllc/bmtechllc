@@ -32,7 +32,13 @@ MEETING_LANE_PROMPT = (
     "Meeting evidence rules. Chunks labelled Meeting are from indexed meetings. "
     "An item listed under a person in a meeting summary is that person's to-do. "
     "Name the meeting title and its date in the answer. "
-    "A transcript records what was said; it is not a decision unless someone states one."
+    "A transcript records what was said; it is not a decision unless someone states one. "
+    "For who-owns or who-is-responsible questions: an action item listed under a person in a "
+    "meeting summary that covers the task, even if worded differently, answers the question. "
+    "So does a person saying in the meeting that they will do it. Name the person, cite the "
+    "summary or transcript chunk, and say whether the task was assigned (listed in the summary) "
+    "or only proposed (said in the transcript). If no person is linked to the task, say so; "
+    "never invent an owner."
 )
 
 _MONTHS = {
