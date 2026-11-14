@@ -42,6 +42,11 @@ MEETINGS = [OLDER_SYNC, PLANNING, SYNC]
         "show me the transcript",
         "what did we agree in our call yesterday",
         "weekly call agenda",
+        "what should Alex own from the last sync",
+        "what came out of the sync",
+        "what was said in standup",
+        "what did we agree on yesterday's call",
+        "what should Alex own from yesterdays meeting",
     ],
 )
 def test_detector_positives(question: str) -> None:
@@ -57,6 +62,7 @@ def test_detector_positives(question: str) -> None:
         "how many people work at bmtech",
         "call the vendor",
         "does the sync job run nightly",
+        "how often does the sync job run",
         "tell me about Fathom",
         "",
     ],
@@ -384,14 +390,13 @@ def test_missing_date_returns_meeting_not_found_without_a_model_call(monkeypatch
 
 
 @pytest.mark.unit
-def test_meeting_question_without_a_resolved_meeting_adds_no_meeting_section(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_meeting_question_without_a_date_falls_back_to_the_newest_meeting(monkeypatch: pytest.MonkeyPatch) -> None:
     question = "who owns automating meeting notes to discord?"
     hit = _chunk(5, "fireflies/aaa.md", "Summary")
     seen = _install(monkeypatch, question, [hit])
     agent.run_agent(question)
     pack = _pack(seen["messages"])
-    assert pack["meeting"] == [] and seen["loaded"] == []
-    assert pack["retrieved"][0]["source_label"].startswith('Meeting "Team Sync Call"')
+    assert pack["meeting"] and seen["loaded"] == ["fireflies/aaa.md"]
 
 
 @pytest.mark.unit
@@ -577,6 +582,9 @@ def test_r5_follow_up_lane_needs_a_meeting_parent() -> None:
     "text",
     [
         "where is Discord message sync",
+        "does the sync job run nightly",
+        "call the vendor",
+        "how often does the sync job run",
         "what did we decide about Fireflies?",
         "sync",
         "call",
@@ -667,16 +675,16 @@ def test_r5_exclusion_retries_once_then_drops_trello_citations_and_keeps_the_ans
 
 
 @pytest.mark.unit
-def test_r5_exclusion_with_only_trello_citations_fails_without_a_ticket_list(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_r5_exclusion_with_only_trello_citations_ships_the_answer_uncited(monkeypatch: pytest.MonkeyPatch) -> None:
     question = "don't look at tickets, what does Alex own from the november 13 meeting?"
     from benchmark_cli.models import AnswerResponse
 
-    bad = AnswerResponse(status="answered", answer="Alex owns Task alpha.", confidence=0.9, citations=[_card_cite()])
+    bad = AnswerResponse(status="answered", answer="Task alpha is in Doing.", confidence=0.9, citations=[_card_cite()])
     seen = _person_install(monkeypatch, question, [bad, bad])
     response = agent.run_agent(question)
-    assert response.status == "no_relevant_information"
-    assert "Task alpha" not in response.answer
-    assert seen["outcome"] == "validation_failed"
+    # Trello citations are dropped; the answer ships uncited instead of failing.
+    assert response.status == "answered" and response.citations == []
+    assert seen["outcome"] == "answered_uncited"
 
 
 @pytest.mark.unit
@@ -716,3 +724,24 @@ def test_r5_person_ticket_question_without_meeting_returns_the_model_answer(monk
     assert response.answer == "Alex has Task alpha."
     assert [c.chunk_id for c in response.citations] == [900]
     assert [card["title"] for card in _pack(seen["calls"][0])["trello_board"]["cards"]] == ["Task alpha"]
+
+
+@pytest.mark.unit
+def test_bare_the_sync_resolves_to_the_newest_title_overlapping_meeting() -> None:
+    from benchmark_cli.meeting_answers import resolve_meeting_in_turns
+
+    found = resolve_meeting_in_turns("what came out of the sync", [], MEETINGS, TODAY)
+    assert found.meeting == SYNC
+    # No title overlap: the newest meeting overall.
+    other = resolve_meeting_in_turns("what was said in standup", [], MEETINGS, TODAY)
+    assert other.meeting == SYNC
+
+
+@pytest.mark.unit
+def test_a_follow_up_with_a_meeting_parent_still_resolves_from_the_parent() -> None:
+    from benchmark_cli.context_pack import Turn
+    from benchmark_cli.meeting_answers import resolve_meeting_in_turns
+
+    history = [Turn("user", "todos from the november 6 sync call")]
+    found = resolve_meeting_in_turns("and what about Sam?", history, MEETINGS, TODAY)
+    assert found.meeting == OLDER_SYNC

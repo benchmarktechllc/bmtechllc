@@ -9,7 +9,7 @@ from typing import Any, TypeVar
 from openai import OpenAI
 from pydantic import BaseModel
 
-from .config import OPENAI_API_KEY, get_model_config
+from .config import OPENAI_API_KEY, SYNTHESIS_REASONING_EFFORT, get_model_config
 from .logging import log_usage
 
 _client: OpenAI | None = None
@@ -59,8 +59,8 @@ def _record(completion: Any, *, tier: str, component: str, started_at: float) ->
 
 
 def _chat_tier(tier: str) -> str:
-    """Chat completions stay on the cheap model. Embeddings keep their own tier."""
-    if tier == "embedding":
+    """Embeddings and answer synthesis keep their own tiers; other chat is cheap."""
+    if tier in {"embedding", "synthesis"}:
         return tier
     return "cheap"
 
@@ -96,11 +96,15 @@ def call_llm_structured(
         raise ValueError("messages must not be empty.")
     started_at = perf_counter()
     try:
-        completion = _get_client().beta.chat.completions.parse(
-            model=get_model_config(_chat_tier(tier)).model,
-            messages=list(messages),
-            response_format=response_schema,
-        )
+        model = get_model_config(_chat_tier(tier)).model
+        request: dict[str, Any] = {
+            "model": model,
+            "messages": list(messages),
+            "response_format": response_schema,
+        }
+        if model.startswith("gpt-5") and SYNTHESIS_REASONING_EFFORT:
+            request["reasoning_effort"] = SYNTHESIS_REASONING_EFFORT
+        completion = _get_client().beta.chat.completions.parse(**request)
     except Exception as exc:
         quota = _quota_error(exc)
         if quota is not None:

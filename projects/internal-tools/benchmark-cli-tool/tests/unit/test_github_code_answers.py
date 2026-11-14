@@ -403,8 +403,8 @@ def test_system_prompt_is_context_first_and_has_no_github_wording() -> None:
     prompt = agent.SYSTEM_PROMPT
     assert "github" not in prompt.casefold()
     assert "source of truth" not in prompt.casefold()
-    assert "person_filter" not in prompt and "person_cards" not in prompt
-    for section in ("trello_board", "meeting", "saved_answers", "retrieved"):
+    assert "person_filter" not in prompt
+    for section in ("trello_board", "person_cards", "meeting", "saved_answers", "retrieved"):
         assert section in prompt
 
 

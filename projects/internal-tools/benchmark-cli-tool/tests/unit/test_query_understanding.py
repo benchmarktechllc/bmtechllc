@@ -244,7 +244,8 @@ def test_person_is_a_search_hint_only_and_nothing_filters_the_pack(monkeypatch: 
     response = agent.run_agent("What tickets are assigned to Dante")
 
     evidence = json.loads(prompts[0][1]["content"].split("\n", 1)[1])
-    assert "person_filter" not in evidence and "person_cards" not in evidence
+    assert "person_filter" not in evidence
+    assert evidence["person_cards"]["person"] == "Dante Paniccia"
     assert "Dante Paniccia" in json.dumps(evidence["trello_board"]["roster"])
     assert {card["title"] for card in evidence["trello_board"]["cards"]} >= {"Ship the portal", "Kiosk MVP"}
     # The model's own answer comes back unchanged; no check swaps in a person's ticket list.

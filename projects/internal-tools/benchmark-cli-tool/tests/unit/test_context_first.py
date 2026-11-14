@@ -130,6 +130,9 @@ def _install(
     return seen
 
 
+_real_synthesize = agent._synthesize_answer
+
+
 def _pack(messages: list[dict[str, Any]]) -> dict[str, Any]:
     block = next(m for m in messages if m["content"].startswith("Initial evidence"))
     return json.loads(block["content"].split("\n", 1)[1])
@@ -354,12 +357,76 @@ def test_an_unknown_chunk_id_is_dropped_and_the_valid_citation_kept(monkeypatch:
 
 
 @pytest.mark.unit
-def test_only_unknown_chunk_ids_retry_then_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_only_unknown_chunk_ids_retry_then_ship_uncited(monkeypatch: pytest.MonkeyPatch) -> None:
     draft = _draft("Alex owns the plan.", _cite(999, "Alex owns the Task alpha plan.", "kb/page.md"))
     seen = _install(monkeypatch, [draft, draft], hits=[_kb()])
     response = agent.run_agent("who owns the plan?")
-    assert seen["outcome"] == "validation_failed" and len(seen["calls"]) == 2
-    assert response.status == "no_relevant_information"
+    assert seen["outcome"] == "answered_uncited" and len(seen["calls"]) == 2
+    assert response.status == "answered" and response.answer == "Alex owns the plan."
+    assert response.citations == []
+
+
+@pytest.mark.unit
+def test_a_paraphrased_quote_on_a_known_chunk_is_repaired_to_a_verbatim_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    text = "Unrelated opening line\nAlex owns the Task alpha plan for launch\nClosing line"
+    draft = _draft("Alex owns the plan.", _cite(7, "Alex is the owner of the Task alpha plan", "kb/page.md"))
+    seen = _install(monkeypatch, [draft], hits=[_kb(text=text)])
+    response = agent.run_agent("who owns the plan?")
+    assert [c.quote for c in response.citations] == ["Alex owns the Task alpha plan for launch"]
+    assert seen["outcome"] == "answered" and len(seen["calls"]) == 1
+
+
+@pytest.mark.unit
+def test_dangling_markers_are_stripped_from_an_uncited_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    draft = _draft("Alex owns the plan [1] and Sam reviews it [2].", _cite(999, "x", "kb/page.md"))
+    _install(monkeypatch, [draft, draft], hits=[_kb()])
+    response = agent.run_agent("who owns the plan?")
+    assert "[" not in response.answer
+
+
+@pytest.mark.unit
+def test_synthesis_uses_its_own_tier_and_the_tool_loop_stays_cheap(monkeypatch: pytest.MonkeyPatch) -> None:
+    tiers: dict[str, list[str]] = {"structured": [], "loop": []}
+    _install(monkeypatch, [], hits=[_kb()])
+    monkeypatch.setattr(agent, "_synthesize_answer", _real_synthesize)
+
+    def structured(*, tier: str, **_k: Any) -> Any:
+        tiers["structured"].append(tier)
+        return agent._DraftAnswer(
+            status="answered", answer="Alex owns the plan.", confidence=0.8,
+            citations=[agent._DraftCitation(chunk_id=7, quote="Alex owns the Task alpha plan.")],
+        )
+
+    def loop(*, tier: str, **_k: Any) -> Any:
+        tiers["loop"].append(tier)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=None, content=""))])
+
+    monkeypatch.setattr(agent, "call_llm_structured", structured)
+    monkeypatch.setattr(agent, "call_llm", loop)
+    agent.run_agent("who owns the plan?")
+    assert tiers == {"structured": ["synthesis"], "loop": ["cheap"]}
+
+
+@pytest.mark.unit
+def test_a_named_person_gets_a_person_cards_section(monkeypatch: pytest.MonkeyPatch) -> None:
+    from benchmark_cli import roster
+
+    people = (roster.Person("Alex", ("Alex",), ("Alex",)),)
+    monkeypatch.setattr(roster, "load_people", lambda: people)
+    seen = _install(monkeypatch, [_draft("Alex has Task alpha.", _cite(900, "Task alpha", "trello/c1.md"))], cards=[ALPHA, BETA])
+    monkeypatch.setattr(agent, "understand_query", lambda *_a, **_k: QueryPlan(searches=["Alex"], person="Alex"))
+    agent.run_agent("what tickets are assigned to Alex")
+    pack = _pack(seen["calls"][0])
+    assert pack["person_cards"]["person"] == "Alex"
+    assert [card["title"] for card in pack["person_cards"]["cards"]] == ["Task alpha"]
+    assert {card["title"] for card in pack["trello_board"]["cards"]} == {"Task alpha", "Task beta"}
+
+
+@pytest.mark.unit
+def test_a_question_without_a_person_has_no_person_cards_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = _install(monkeypatch, [_draft("Task alpha is in Doing.", _cite(900, "Task alpha", "trello/c1.md"))], cards=[ALPHA, BETA])
+    agent.run_agent("what is in Doing?")
+    assert "person_cards" not in _pack(seen["calls"][0])
 
 
 @pytest.mark.unit
@@ -414,7 +481,8 @@ def test_the_model_draft_schema_needs_no_hash_or_file(monkeypatch: pytest.Monkey
     parsed = _DraftAnswer(status="answered", answer="Alex.", confidence=0.7, citations=[_DraftCitation(chunk_id=7, quote="q")])
     converted = _to_answer(parsed)
     assert converted is not None and converted.citations[0].chunk_id == 7
-    assert _to_answer(_DraftAnswer(status="answered", answer="No cites.")) is None
+    uncited = _to_answer(_DraftAnswer(status="answered", answer="No cites."))
+    assert uncited is not None and uncited.status == "answered" and uncited.citations == []
     assert _to_answer(_DraftAnswer(status="no_relevant_information", answer="Unknown.", confidence=0.4)).confidence == 0.0
     monkeypatch.setattr(agent, "call_llm_structured", lambda **kw: parsed if kw["response_schema"] is _DraftAnswer else None)
     assert agent._synthesize_answer(tier="cheap", messages=[{"role": "user", "content": "q"}]) is not None
@@ -450,7 +518,7 @@ def test_exact_saved_answer_returns_before_the_model(monkeypatch: pytest.MonkeyP
 def test_a_paraphrase_reaches_the_model_with_the_saved_chunk_in_saved_answers(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(contributions, "question_similarity", lambda *_a: 0.7)
     seen = _install(monkeypatch, [_draft("Three people (per Alex).", _cite(11, "Three people.", "user_contributed/7/11.md"))], hits=[_saved(), _kb()])
-    response = agent.run_agent("how many folks work on Task alpha?")
+    response = agent.run_agent("who is on the Task alpha team?")
     assert seen.get("outcome") != "user_contributed" and len(seen["calls"]) == 1
     pack = _pack(seen["calls"][0])
     assert [item["chunk_id"] for item in pack["saved_answers"]] == [11]

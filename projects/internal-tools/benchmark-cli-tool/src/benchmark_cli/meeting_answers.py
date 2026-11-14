@@ -22,10 +22,20 @@ MEETING_NOT_FOUND = "meeting_not_found"
 MAX_LISTED_MEETINGS = 10
 
 # Bare "sync", "call", "fireflies" and "fathom" are left out on purpose: they collide
-# with code and product questions such as "where is Discord message sync".
+# with code and product questions such as "where is Discord message sync". Only the noun
+# use ("the last sync", "the call", "on the call") matches, and "the sync job" and similar
+# code phrasings are excluded by a lookahead.
+_DETERMINERS = (
+    r"previous|recent|daily|this|that"
+    r"|(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)'?s"
+)
 _MEETING_WORDS = re.compile(
     r"\b(?:meetings?|sync\s+calls?|stand-?ups?|transcripts?"
-    r"|(?:last|latest|our|team|weekly|today'?s|yesterday'?s)\s+call)\b",
+    rf"|(?:last|latest|our|team|weekly|today'?s|yesterday'?s|{_DETERMINERS})\s+call"
+    rf"|(?:the|last|latest|{_DETERMINERS}|our|team|weekly|today'?s|yesterday'?s)"
+    r"\s+(?:sync|catch-?up|check-?in)"
+    r"(?!\s+(?:jobs?|scripts?|workflows?|cron|pipeline|code|works?|runs?|fail\w*|broke\w*))"
+    r"|(?:on|in|from|during|after)\s+the\s+call)\b",
     re.IGNORECASE,
 )
 
@@ -244,6 +254,11 @@ def resolve_meeting_in_turns(
         resolution = resolve_meeting(turn.text, meetings, day)
         if resolution.meeting is not None or resolution.requested is not None:
             return resolution
+    if asks_about_meeting(question):
+        # "the sync" names no date and no recency word: fall back to the newest likely meeting.
+        words = _title_words(question)
+        overlapping = [item for item in meetings if words & _title_words(item.title)]
+        return MeetingResolution(_newest(overlapping) or _newest(meetings), None)
     return MeetingResolution()
 
 

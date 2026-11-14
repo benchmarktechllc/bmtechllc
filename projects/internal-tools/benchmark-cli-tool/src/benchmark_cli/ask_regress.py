@@ -423,8 +423,11 @@ class OpenAIGuard:
     def check_chat(self, model: Any) -> None:
         if not self.allow_chat:
             self._abort("A chat request was attempted in an offline mode.")
-        if str(model) != REQUIRED_CHAT_MODEL:
-            self._abort(f"Chat model {model!r} is not {REQUIRED_CHAT_MODEL}.")
+        from benchmark_cli.config import get_model_config
+
+        allowed = {REQUIRED_CHAT_MODEL, get_model_config("synthesis").model}
+        if str(model) not in allowed:
+            self._abort(f"Chat model {model!r} is not one of {sorted(allowed)}.")
         reason = self.budget_reason()
         if reason:
             self._abort(reason)
@@ -505,6 +508,12 @@ class OpenAIGuard:
         bucket["prompt_tokens"] += prompt
         bucket["completion_tokens"] += completion
         bucket["cost_usd"] = round(bucket["cost_usd"] + cost, 8)
+
+
+def _synthesis_model() -> str:
+    from benchmark_cli.config import get_model_config
+
+    return get_model_config("synthesis").model
 
 
 def preflight() -> None:
@@ -1768,7 +1777,7 @@ def summarize_live(report: dict[str, Any], groups: Sequence[str]) -> dict[str, A
         "suite": f"{suite_answered}/{len(suite)}",
         "suite_hijacks": hijacks,
         "suite_runs": len(report["suite_runs"]),
-        "models": REQUIRED_CHAT_MODEL,
+        "models": f"{REQUIRED_CHAT_MODEL} + {_synthesis_model()}",
     }
     complete = set(groups) >= {"saved", "names", "code", "suite"}
     passed = (

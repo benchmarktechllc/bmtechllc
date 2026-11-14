@@ -1,7 +1,7 @@
 """Chat model selection for the answer layer.
 
-Every question uses the configured cheap chat model. There is no flagship
-escalation and no second call on a larger model.
+Helper and tool-loop calls use the configured cheap chat model. Answer
+synthesis uses its own "synthesis" tier. There is no flagship escalation.
 """
 
 from __future__ import annotations

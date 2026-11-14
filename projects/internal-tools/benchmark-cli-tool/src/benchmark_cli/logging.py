@@ -148,7 +148,7 @@ def log_usage(
     flagship = calculate_cost_usd(
         get_model_config("flagship"), prompt_tokens, completion_tokens
     )
-    equivalent = flagship if tier == "cheap" and component != "embedding" else actual
+    equivalent = flagship if tier in {"cheap", "synthesis"} and component != "embedding" else actual
     _persist(
         log_path,
         _USAGE_FILENAME,

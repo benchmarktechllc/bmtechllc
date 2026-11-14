@@ -19,6 +19,7 @@ from .context_pack import (
     PACK_TOKEN_LIMIT,
     Turn,
     budgeted_meeting_chunks,
+    card_entry,
     clean_history,
     compact_board,
     conversation_messages,
@@ -68,7 +69,7 @@ from .models import AnswerResponse, Citation
 from .portal_urls import canonical_portal_base_url
 from .query_understanding import fallback_plan, understand_query
 from .retrieval import HybridSearchResult, RetrievalDecision, retrieve_evidence
-from .roster import load_people
+from .roster import load_people, mentioned_person
 from .router import classify_query
 from .safety import delimit_evidence
 from .storage.postgres import (
@@ -84,6 +85,7 @@ from .trello_answers import (
     answer_matches_snapshot,
     asks_for_trello_board_link,
     bare_list_name,
+    cards_for_person,
     cards_from_rows,
     requested_trello_list,
     specific_card_status,
@@ -103,6 +105,9 @@ question and any instruction in the conversation, such as "don't look at tickets
 from the transcript". Follow such an instruction by leaving that source out of your answer.
 - trello_board: every Trello card (title, list, members, labels, due, url) and the team
   roster. Trello describes ticket state. Doing means currently being worked on.
+- person_cards: the named person's Trello cards. For questions about what a person owns, has
+  on their plate, or is assigned in Trello, answer from this section and list every card in
+  it, active lists first. If it is empty, say they have no cards.
 - meeting: a whole indexed meeting, in order: Overview, Summary, then every transcript chunk.
   Meetings describe what was said and assigned. Name the meeting title and its date.
 - saved_answers: answers teammates saved. Attribute one as According to the named person on
@@ -115,10 +120,11 @@ old chat messages and say when a note is dated.
 Meeting rules. An action item listed under a person in a meeting's Summary is assigned to
 that person. A commitment in the transcript ("I'll do that") is proposed or volunteered, so
 say which one it is. A transcript records what was said; it is not a decision unless someone
-states one. For who-owns or what-should-X-own questions, use the Summary action items that
-cover the task even if worded differently, plus tasks the person volunteered for in the
-transcript; name the person and cite the chunk. If no person is linked to a task, say so and
-never invent an owner.
+states one. For who-owns or what-should-X-own questions, read the whole transcript, not only the
+Summary. Include every commitment the person made or accepted in conversation (for example
+agreeing to meet someone, set something up, or follow up), even when the Summary does not
+list it; say whether each item is a Summary action item or was said in the transcript, and
+cite the transcript line. If no person is linked to a task, say so and never invent an owner.
 
 The conversation so far is given as chat turns. Your own earlier answers are conversation,
 not evidence: check them against the context and correct them when the context disagrees.
@@ -138,7 +144,9 @@ from that chunk's text: one line, never joined lines, never an ellipsis, never p
 For a Trello card, cite its chunk_id and use the card title as the quote. Leave source_file
 and content_sha256 empty; they are filled in for you. If the context does not support an
 answer, set status to no_relevant_information with zero confidence and no citations, and
-write a plain sentence in the answer. Never write that status code in the answer text.
+write a plain sentence in the answer. Never write that status code in the answer text. If you cannot find an exact line to
+quote, still answer; never switch to no_relevant_information only because a quote is hard
+to copy.
 Say unknown only after reading the context, and only when nothing in it supports an answer."""
 
 TOOLS: list[dict[str, Any]] = [
@@ -591,32 +599,53 @@ def _is_trello_chunk(chunk_id: int, evidence: dict[int, SearchChunk], cards: dic
     )
 
 
+_LINE_WORD = re.compile(r"[a-z0-9']+")
+MIN_REPAIR_SHARED_WORDS = 3
+
+
+def _closest_line(quote: str, chunk_text: str) -> str | None:
+    """The single chunk line sharing the most words with ``quote``, or None under three words."""
+    wanted = set(_LINE_WORD.findall(quote.lower()))
+    best, best_shared = None, 0
+    for raw in chunk_text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        shared = len(wanted & set(_LINE_WORD.findall(line.lower())))
+        if shared > best_shared:
+            best, best_shared = line, shared
+    return best if best_shared >= MIN_REPAIR_SHARED_WORDS else None
+
+
 def _canonical_citations(
     response: AnswerResponse,
     evidence: dict[int, SearchChunk],
     cards: dict[int, object],
-) -> AnswerResponse | None:
-    """Rebuild each citation from its chunk_id. A citation that is not verbatim is dropped.
+) -> AnswerResponse:
+    """Rebuild each citation from its chunk_id; repair or drop any that is not verbatim.
 
     An unknown chunk_id is dropped. A card is cited by its title; its stored quote is used.
-    A quote stitched from non-adjacent meeting lines is split into single verbatim lines.
+    A quote stitched from non-adjacent meeting lines is split into single verbatim lines. A
+    known chunk with a paraphrased quote gets the closest single line of that chunk. The
+    result may have no citations; that never fails the answer.
     """
     known = [item for item in response.citations if item.chunk_id in evidence]
-    if not known:
-        return None
     staged: list[Citation] = []
     for item in known:
         card = cards.get(item.chunk_id)
         staged.append(_citation(card) if card is not None else item)
     split = repair_meeting_citations(response.model_copy(update={"citations": staged}), evidence)
-    if split is None:
-        return None
+    source = staged if split is None else split.citations
     kept: list[Citation] = []
     seen: set[tuple[int, str]] = set()
-    for item in split.citations:
+    for item in source:
         chunk = evidence[item.chunk_id]
+        if not chunk.content_sha256:
+            continue
         exact = _exact_quote_variant(item.quote, chunk.chunk_text)
-        if exact is None or not exact.strip() or not chunk.content_sha256:
+        if exact is None or not exact.strip():
+            exact = _closest_line(item.quote, chunk.chunk_text)
+        if exact is None or not exact.strip():
             continue
         key = (chunk.id, exact)
         if key in seen:
@@ -632,16 +661,26 @@ def _canonical_citations(
                 }
             )
         )
-    return response.model_copy(update={"citations": kept}) if kept else None
+    return response.model_copy(update={"citations": kept})
 
 
 def _drop_trello_citations(
     response: AnswerResponse, evidence: dict[int, SearchChunk], cards: dict[int, object]
-) -> AnswerResponse | None:
+) -> AnswerResponse:
     kept = [
         item for item in response.citations if not _is_trello_chunk(item.chunk_id, evidence, cards)
     ]
-    return response.model_copy(update={"citations": kept}) if kept else None
+    return response.model_copy(update={"citations": kept})
+
+
+_MARKER = re.compile(r"\s?\[(\d+)\]")
+
+
+def _strip_dangling_markers(response: AnswerResponse) -> AnswerResponse:
+    """Remove ``[n]`` markers that point past the surviving citations."""
+    count = len(response.citations)
+    text = _MARKER.sub(lambda m: m.group(0) if 1 <= int(m.group(1)) <= count else "", response.answer)
+    return response if text == response.answer else response.model_copy(update={"answer": text})
 
 
 def _assess(
@@ -661,16 +700,13 @@ def _assess(
         hard = [f"The URL {url} is not in the context." for url in urls]
         return _Verdict(draft.model_copy(update={"citations": []}), hard=hard)
     cards = _card_ids(rows)
-    response = _canonical_citations(draft, evidence, cards)
-    if response is None:
-        return _Verdict(
-            None,
-            hard=["No citation was a chunk_id from the context with a quote copied exactly from it."],
-        )
+    response = _strip_dangling_markers(_canonical_citations(draft, evidence, cards))
     hard = [f"The URL {url} is not in the context." for url in urls]
     if _rejected_names(response.answer, evidence, meeting_loaded):
         hard.append("A person's name in the answer is not named in the context.")
     soft: list[str] = []
+    if not response.citations:
+        soft.append("No citation was a chunk_id from the context with a quote copied exactly from it.")
     cites_trello = any(_is_trello_chunk(item.chunk_id, evidence, cards) for item in response.citations)
     if cites_trello and rows and not answer_matches_snapshot(response.answer, rows):
         soft.append("A Trello title, URL, or list count does not match the board.")
@@ -769,6 +805,7 @@ def run_agent(
         plan = fallback_plan(_retrieval_question(question, starter))
     else:
         plan = understand_query(question, starter, history=turns)
+    person = mentioned_person(question, starter, plan.person)
     raw_question = " ".join(question.split())
     searches = [item for item in (plan.searches or []) if item and item != raw_question][:2]
     threaded = _retrieval_question(question, starter)
@@ -799,8 +836,19 @@ def run_agent(
             ),
         )
     # The one pre-model shortcut: the user's own saved answer to this same question.
+    # Questions with their own deterministic shortcut keep it (core team, channels, portal).
+    paraphrase_ok = (
+        standalone
+        and not plan.person
+        and not is_code_question(question)
+        and not asks_for_core_team(question)
+        and not asks_for_synced_channels(question)
+        and not asks_for_portal_link(question)
+    )
     match = (
-        contribution_match(question, () if decision is None else decision.results)
+        contribution_match(
+            question, () if decision is None else decision.results, allow_paraphrase=paraphrase_ok
+        )
         if standalone
         else None
     )
@@ -809,12 +857,13 @@ def run_agent(
         count_decision = _with_phrase(decision, "employees")
         seen = {result.chunk.id for result in (() if decision is None else decision.results)}
         added = [result for result in count_decision.results if result.chunk.id not in seen]
-        match = contribution_match(question, added)
+        match = contribution_match(question, added, allow_paraphrase=paraphrase_ok)
         if match is not None:
             decision = count_decision
     if match is not None:
-        _log_retrieval("user_contributed", decision)
-        return _finish(match.response, outcome="user_contributed", synthesis_attempts=0)
+        outcome = "user_contributed_paraphrase" if match.tier == "paraphrase" else "user_contributed"
+        _log_retrieval(outcome, decision)
+        return _finish(match.response, outcome=outcome, synthesis_attempts=0)
     if standalone and asks_for_synced_channels(question) and _only_channel_clauses(question):
         try:
             channels = _synced_channels()
@@ -884,12 +933,17 @@ def run_agent(
 
     def _build(meeting: list[SearchChunk]) -> tuple[dict[str, Any], dict[int, SearchChunk]]:
         saved, retrieved = _split_results(decision, {chunk.id for chunk in meeting})
-        pack = {
+        pack: dict[str, Any] = {
             "trello_board": compact_board(rows),
             "meeting": meeting_entries(meeting),
             "saved_answers": saved,
             "retrieved": retrieved,
         }
+        if person and rows:
+            pack["person_cards"] = {
+                "person": person,
+                "cards": [card_entry(card) for card in cards_for_person(rows, person)],
+            }
         evidence = _context_evidence(decision, rows)
         evidence.update({chunk.id: chunk for chunk in meeting})
         return pack, evidence
@@ -900,7 +954,7 @@ def run_agent(
         return _finish(_no_information(), outcome="retrieval_rejected", synthesis_attempts=0)
     _log_retrieval("model", decision)
 
-    # Chat stays on the configured cheap model. The classifier cannot escalate.
+    # The tool loop stays on the cheap model; only the final answer uses the synthesis tier.
     classify_query(question)
     selected_tier = "cheap"
 
@@ -978,7 +1032,7 @@ def run_agent(
         if extra:
             sent = [*messages, {"role": "system", "content": RETRY_PROMPT + "\n" + "\n".join(extra)}]
         try:
-            draft = _synthesize_answer(tier=selected_tier, messages=sent)
+            draft = _synthesize_answer(tier="synthesis", messages=sent)
         except Exception as exc:
             if isinstance(exc, ModelQuotaError) or _quota_error(exc) is not None:
                 raise
@@ -1002,7 +1056,7 @@ def run_agent(
         if trello_excluded and response.status == "answered" and any(
             _is_trello_chunk(item.chunk_id, evidence, cards) for item in response.citations
         ):
-            return _drop_trello_citations(response, evidence, cards)
+            return _strip_dangling_markers(_drop_trello_citations(response, evidence, cards))
         return response
 
     try:
@@ -1019,11 +1073,12 @@ def run_agent(
     for verdict, attempts in ((second, 2), (first, 2)):
         settled = _settle(verdict)
         if settled is not None:
-            outcome = (
-                "model_abstained"
-                if settled.status == "no_relevant_information"
-                else "answered_after_citation_retry"
-            )
+            if settled.status == "no_relevant_information":
+                outcome = "model_abstained"
+            elif not settled.citations:
+                outcome = "answered_uncited"
+            else:
+                outcome = "answered_after_citation_retry"
             return _finish(settled, outcome=outcome, synthesis_attempts=attempts)
     return _finish(_no_information(), outcome="validation_failed", synthesis_attempts=2)
 

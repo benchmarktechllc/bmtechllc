@@ -77,6 +77,19 @@ def _due(card: TrelloCardRow) -> str | None:
     return None
 
 
+def card_entry(card: TrelloCardRow) -> dict[str, object]:
+    """One card, short: title, list, members, labels, due, url, chunk_id."""
+    return {
+        "title": card.title,
+        "list": card.list_name,
+        "members": [str(record["name"]) for record in member_records(card)],
+        "labels": _labels_of(card),
+        "due": _due(card),
+        "url": card.url,
+        "chunk_id": card.chunk_id,
+    }
+
+
 def compact_board(rows: Iterable[TrelloCardRow] | None) -> dict[str, object]:
     """Every card, short: title, list, members, labels, due, url, chunk_id, plus the roster."""
     cards = []
@@ -84,17 +97,7 @@ def compact_board(rows: Iterable[TrelloCardRow] | None) -> dict[str, object]:
     for card in _usable_cards(tuple(rows or ())):
         label = _list_label(card)
         counts[label] = counts.get(label, 0) + 1
-        cards.append(
-            {
-                "title": card.title,
-                "list": card.list_name,
-                "members": [str(record["name"]) for record in member_records(card)],
-                "labels": _labels_of(card),
-                "due": _due(card),
-                "url": card.url,
-                "chunk_id": card.chunk_id,
-            }
-        )
+        cards.append(card_entry(card))
     return {"counts": counts, "cards": cards, "roster": roster_payload()}
 
 

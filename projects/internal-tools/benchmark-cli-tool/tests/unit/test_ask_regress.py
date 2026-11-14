@@ -328,6 +328,9 @@ def test_refuses_to_write_inside_a_git_tree(tmp_path: Path) -> None:
 def test_guard_rejects_non_mini_chat_and_offline_calls() -> None:
     guard = harness.OpenAIGuard(allow_chat=True, allow_embed=True)
     guard.check_chat("gpt-4o-mini")
+    from benchmark_cli.config import get_model_config
+
+    guard.check_chat(get_model_config("synthesis").model)
     with pytest.raises(harness.HarnessAbort):
         guard.check_chat("gpt-4o")
     assert guard.violation and "gpt-4o" in guard.violation

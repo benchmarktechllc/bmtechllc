@@ -227,10 +227,9 @@ def _agent(
 def test_agent_sends_a_paraphrase_to_the_model_instead_of_returning_the_saved_row(
     monkeypatch: pytest.MonkeyPatch, question: str
 ) -> None:
-    # 0.1.12: only the exact tier returns before the model. A paraphrase is context for it.
+    # 0.1.13: a standalone non-person, non-code paraphrase returns the saved row, no model call.
     _, seen = _agent(monkeypatch, question)
-    assert seen.get("outcome") not in {"user_contributed", "user_contributed_paraphrase"}
-    assert seen["model_called"] is True
+    assert seen.get("outcome") == "user_contributed_paraphrase" and "model_called" not in seen
 
 
 @pytest.mark.unit
@@ -277,14 +276,14 @@ def _fts(monkeypatch: pytest.MonkeyPatch, rows: tuple[HybridSearchResult, ...]) 
 
 
 @pytest.mark.unit
-def test_headcount_question_runs_the_employees_lookup_without_a_paraphrase_shortcut(
+def test_headcount_question_runs_the_employees_lookup_and_returns_the_saved_paraphrase(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Hybrid retrieval misses the saved row; the headcount shortcut's "employees" lookup has it.
     calls = _fts(monkeypatch, (_row(11, SAVED),))
     response, seen = _agent(monkeypatch, "what's our headcount", rows=(_other_row(5),))
-    # A paraphrase is no longer returned from the saved row; the headcount lane answers.
-    assert seen["outcome"].startswith("employee_count_") and "model_called" not in seen
+    # The row found by the "employees" lookup is returned as a paraphrase, no model call.
+    assert seen["outcome"] == "user_contributed_paraphrase" and "model_called" not in seen
     assert calls == ["employees"]
 
 
@@ -294,8 +293,8 @@ def test_headcount_lookup_runs_once_and_only_when_hybrid_has_no_match(monkeypatc
     _, seen = _agent(monkeypatch, "what's our headcount", rows=(_other_row(5),))
     assert seen["outcome"].startswith("employee_count_") and calls == ["employees"]
     calls = _fts(monkeypatch, (_row(12, SAVED),))
-    _, seen = _agent(monkeypatch, "what's our headcount")
-    assert seen["outcome"].startswith("employee_count_") and calls == ["employees"]
+    _, seen = _agent(monkeypatch, "what's our headcount", rows=(_other_row(5),))
+    assert seen["outcome"] == "user_contributed_paraphrase" and calls == ["employees"]
     # Not a headcount question: no extra lookup, no saved answer from it.
     calls = _fts(monkeypatch, (_row(12, SAVED),))
     _, seen = _agent(monkeypatch, "how many people are on the team", rows=(_other_row(5),))
