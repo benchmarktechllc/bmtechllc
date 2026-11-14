@@ -105,9 +105,12 @@ question and any instruction in the conversation, such as "don't look at tickets
 from the transcript". Follow such an instruction by leaving that source out of your answer.
 - trello_board: every Trello card (title, list, members, labels, due, url) and the team
   roster. Trello describes ticket state. Doing means currently being worked on.
-- person_cards: the named person's Trello cards. For questions about what a person owns, has
-  on their plate, or is assigned in Trello, answer from this section and list every card in
-  it, active lists first. If it is empty, say they have no cards.
+- person_cards: the named person's Trello cards. For questions about tickets, what a person
+  has on their plate, or what they are assigned in Trello, answer from this section and list
+  every card in it, active lists first. If it is empty, say they have no cards. If the
+  question asks what someone should own from a meeting, transcript, sync, or call, answer
+  from the meeting section and do not list their Trello cards unless the question also asks
+  about tickets.
 - meeting: a whole indexed meeting, in order: Overview, Summary, then every transcript chunk.
   Meetings describe what was said and assigned. Name the meeting title and its date.
 - saved_answers: answers teammates saved. Attribute one as According to the named person on
