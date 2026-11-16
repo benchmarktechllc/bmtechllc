@@ -52,6 +52,7 @@ _NEW_YORK = ZoneInfo("America/New_York")
 _BULLET = re.compile(r"^\s*(?:[-*•–·]|\d+[.)])\s*")
 _HEADER = re.compile(r"^[\s#*_`>]*(discussion|todos?|to-dos?|to dos?)[\s:*_`]*$", re.IGNORECASE)
 _URL_LINE = re.compile(r"^\s*<?https?://\S+>?\s*$")
+_TYPOGRAPHIC_DASHES = str.maketrans({"\u2011": "-", "\u2013": "-", "\u2014": "-"})
 
 SYSTEM_PROMPT = f"""You write a Discord meeting recap from a meeting transcript.
 Output ONLY the Discord message text, with no preamble and no code fences, in exactly this shape:
@@ -72,11 +73,26 @@ Rules:
 - The first line is the date given to you, bold, exactly as provided.
 - The section headers are exactly "{_DISCUSSION}" and "{_TODOS}" with no markdown.
 - Every item starts with "• " (bullet and a space) and is one concise line.
-- Name an owner in parentheses only when the transcript or the Fireflies action items clearly
-  attribute the task to that person. Never invent names or owners. Mark optional items "optional".
 - Do not invent facts. Do not list ticket or card dumps. Do not @ anyone.
+- Use only plain ASCII hyphen-minus "-" in bullet text. Never use non-breaking hyphens, en-dashes
+  or em-dashes.
 - Stay under 1500 characters in total. If it is long, drop the least important Discussion items
   first and keep the ToDos.
+
+Discussion rules:
+- Short topic lines, not dense sentences. Each bullet is one concise phrase (roughly one clause),
+  similar in length and style to a heading, not a paragraph.
+
+ToDos rules:
+- Prefer the concrete action items that were actually agreed in the meeting. Do not invent tasks.
+- Put an owner in parentheses ONLY when someone in the spoken transcript explicitly took the item
+  or was assigned it. If no owner was clearly assigned, omit the parentheses entirely.
+- Use first names only, never full legal names or last names.
+- One agreed item is one bullet. Never give the same item to several people as separate bullets and
+  never split one item into a bullet per person. If a joint action clearly involves two named
+  people, keep it as one bullet and name both in the sentence.
+- If the Fireflies action-item list conflicts with the spoken transcript, trust the transcript.
+- Mark optional items "optional".
 - Do not write a link. It is added afterwards.
 - If there are no action items, write "• None" under {_TODOS}."""
 
@@ -201,7 +217,7 @@ def normalize_summary(
             continue
         if not section:
             continue
-        text = _bullet_text(stripped)
+        text = _bullet_text(stripped).translate(_TYPOGRAPHIC_DASHES)
         if text:
             (discussion if section == _DISCUSSION else todos).append(f"• {text}")
     title = f"**{date_title(meeting.recorded_at)}**"

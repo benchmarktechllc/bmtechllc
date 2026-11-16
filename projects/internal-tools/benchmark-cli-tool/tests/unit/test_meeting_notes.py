@@ -244,3 +244,11 @@ def test_flag_off_does_not_start_or_tick() -> None:
         store=FakeStore(None),
     )
     assert asyncio.run(poller.tick()) is None
+
+
+def test_typographic_hyphens_become_ascii() -> None:
+    raw = "Discussion\n• Non‑breaking – en — em\nToDos\n• Ship‑it (Ann)"
+    text = meeting_notes.normalize_summary(raw, meeting())
+    assert "• Non-breaking - en - em" in text
+    assert "• Ship-it (Ann)" in text
+    assert not any(c in text for c in "‑–—")
