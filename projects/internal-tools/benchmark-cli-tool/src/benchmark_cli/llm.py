@@ -60,19 +60,22 @@ def _record(completion: Any, *, tier: str, component: str, started_at: float) ->
 
 def _chat_tier(tier: str) -> str:
     """Embeddings and answer synthesis keep their own tiers; other chat is cheap."""
-    if tier in {"embedding", "synthesis"}:
+    if tier in {"embedding", "synthesis", "meeting_notes"}:
         return tier
     return "cheap"
 
 
 def call_llm(
     *, tier: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
-    component: str = "agent",
+    component: str = "agent", reasoning_effort: str = "",
 ) -> Any:
     """Call a configured model and record its token/latency/cost telemetry."""
     if not messages:
         raise ValueError("messages must not be empty.")
-    request: dict[str, Any] = {"model": get_model_config(_chat_tier(tier)).model, "messages": messages}
+    model = get_model_config(_chat_tier(tier)).model
+    request: dict[str, Any] = {"model": model, "messages": messages}
+    if reasoning_effort and model.startswith("gpt-5"):
+        request["reasoning_effort"] = reasoning_effort
     if tools is not None:
         request["tools"] = tools
     started_at = perf_counter()

@@ -289,3 +289,70 @@ def test_parse_meeting_overview_excludes_action_items() -> None:
     assert parsed is not None
     assert parsed.overview == "Short."
     assert "Bob" in parsed.summary
+
+
+def _meeting_notes_tier(env: dict[str, str]) -> list[str]:
+    import json
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        "import json; from benchmark_cli.config import get_model_config as g;"
+        "m=g('meeting_notes'); s=g('synthesis');"
+        "print(json.dumps([m.model, s.model, m.input_cost_per_million, m.output_cost_per_million]))"
+    )
+    base = {k: v for k, v in os.environ.items() if not k.startswith(("MEETING_NOTES_", "SYNTHESIS_"))}
+    out = subprocess.run(
+        [sys.executable, "-c", code], env={**base, **env}, capture_output=True, text=True, check=True
+    )
+    return json.loads(out.stdout)
+
+
+def test_meeting_notes_model_defaults_to_synthesis_model() -> None:
+    model, synthesis, inp, out = _meeting_notes_tier({})
+    assert model == synthesis
+    assert (inp, out) == (0.25, 2.0)
+    assert _meeting_notes_tier({"MEETING_NOTES_MODEL": ""})[0] == synthesis
+
+
+def test_meeting_notes_model_env_overrides_without_touching_synthesis() -> None:
+    model, synthesis, inp, out = _meeting_notes_tier(
+        {
+            "MEETING_NOTES_MODEL": "gpt-5",
+            "MEETING_NOTES_INPUT_COST_PER_MILLION": "1.25",
+            "MEETING_NOTES_OUTPUT_COST_PER_MILLION": "10",
+        }
+    )
+    assert (model, synthesis, inp, out) == ("gpt-5", "gpt-5-mini", 1.25, 10.0)
+
+
+def _capture_request(monkeypatch, model: str, effort: str) -> dict:  # type: ignore[no-untyped-def]
+    from types import SimpleNamespace
+
+    from benchmark_cli import config, llm
+
+    requests: list[dict] = []  # type: ignore[type-arg]
+
+    def create(**kwargs):  # type: ignore[no-untyped-def]
+        requests.append(kwargs)
+        message = SimpleNamespace(content="**Discussion**\n- a\n**ToDos**\n- b")
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=None)
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr(llm, "_get_client", lambda: client)
+    monkeypatch.setattr(llm, "_record", lambda *_a, **_k: None)
+    tiers = dict(config.MODEL_TIERS)
+    tiers["meeting_notes"] = config.ModelConfig(model, 0.25, 2.0)
+    monkeypatch.setattr(config, "MODEL_TIERS", tiers)
+    monkeypatch.setattr(config, "MEETING_NOTES_REASONING_EFFORT", effort)
+    meeting_notes.generate_summary(meeting(sentences=True))
+    return requests[0]
+
+
+def test_generate_summary_sends_reasoning_effort_only_for_gpt5(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    request = _capture_request(monkeypatch, "gpt-5", "low")
+    assert request["model"] == "gpt-5"
+    assert request["reasoning_effort"] == "low"
+    assert "reasoning_effort" not in _capture_request(monkeypatch, "gpt-4.1", "low")
+    assert "reasoning_effort" not in _capture_request(monkeypatch, "gpt-5", "")

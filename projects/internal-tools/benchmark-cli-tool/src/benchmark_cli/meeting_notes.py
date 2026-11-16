@@ -193,11 +193,15 @@ def build_messages(meeting: FirefliesMeeting) -> list[dict[str, Any]]:
 
 
 def generate_summary(meeting: FirefliesMeeting) -> str:
-    """One synthesis-tier call, then deterministic formatting. Returns the full message."""
+    """One meeting-notes-tier call, then deterministic formatting. Returns the full message."""
+    from .config import MEETING_NOTES_REASONING_EFFORT
     from .llm import call_llm
 
     completion = call_llm(
-        tier="synthesis", messages=build_messages(meeting), component="meeting_notes"
+        tier="meeting_notes",
+        messages=build_messages(meeting),
+        component="meeting_notes",
+        reasoning_effort=MEETING_NOTES_REASONING_EFFORT,
     )
     raw = completion.choices[0].message.content or ""
     return normalize_summary(raw, meeting)
