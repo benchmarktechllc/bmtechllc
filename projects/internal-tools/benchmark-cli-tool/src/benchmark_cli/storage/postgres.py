@@ -192,6 +192,7 @@ def initialize_database() -> None:
     apply_sql("007_fireflies_sync.sql")
     apply_sql("008_fts_url_tokens.sql")
     apply_sql("009_github_sync.sql")
+    apply_sql("010_meeting_notes.sql")
 
 
 def create_indexes() -> None:
@@ -791,6 +792,50 @@ def delete_fathom_sync_state(recording_id: str) -> None:
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute("DELETE FROM fathom_sync_state WHERE recording_id = %s", (recording_id,))
         conn.commit()
+
+
+def meeting_notes_watermark() -> datetime | None:
+    """Return the meeting-notes watermark, or None before the first enable."""
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT watermark_at FROM meeting_notes_cursor WHERE id = 1")
+        row = cursor.fetchone()
+    return None if row is None else row[0]
+
+
+def set_meeting_notes_watermark(watermark_at: datetime) -> None:
+    """Create or move the singleton meeting-notes watermark."""
+    statement = """
+        INSERT INTO meeting_notes_cursor (id, watermark_at) VALUES (1, %s)
+        ON CONFLICT (id) DO UPDATE SET watermark_at = EXCLUDED.watermark_at
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (watermark_at,))
+        conn.commit()
+
+
+def meeting_notes_posted(transcript_id: str) -> bool:
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT 1 FROM meeting_notes_posts WHERE transcript_id = %s", (transcript_id,)
+        )
+        return cursor.fetchone() is not None
+
+
+def record_meeting_notes_post(
+    transcript_id: str, channel_id: str, message_ids: Sequence[str], title: str
+) -> bool:
+    """Record a sent post. False means the primary key already existed."""
+    _, _, Json = _dependencies()
+    statement = """
+        INSERT INTO meeting_notes_posts (transcript_id, channel_id, message_ids, title)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (transcript_id) DO NOTHING
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (transcript_id, channel_id, Json(list(message_ids)), title))
+        inserted = cursor.rowcount == 1
+        conn.commit()
+    return inserted
 
 
 def fireflies_sync_states() -> dict[str, FirefliesSyncState]:

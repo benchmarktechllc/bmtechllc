@@ -60,6 +60,9 @@ class AskConfig:
 
     ask_channel_id: int
     guild_id: int | None
+    meeting_notes_enabled: bool = False
+    meeting_notes_channel_id: int | None = None
+    meeting_notes_poll_seconds: int = 600
 
 
 def parse_snowflake(value: str, *, name: str) -> int:
@@ -87,7 +90,19 @@ def load_runtime() -> tuple[str, AskConfig]:
         guild_id = parse_snowflake(guild_raw, name="DISCORD_ASK_GUILD_ID") if guild_raw else None
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    return os.environ["DISCORD_ANSWER_BOT_TOKEN"].strip(), AskConfig(channel_id, guild_id)
+    enabled = os.getenv("MEETING_NOTES_AUTOPOST", "").strip().casefold() in {"1", "true", "yes"}
+    notes_channel: int | None = None
+    notes_raw = os.getenv("MEETING_NOTES_CHANNEL_ID", "").strip()
+    if enabled and notes_raw:
+        try:
+            notes_channel = parse_snowflake(notes_raw, name="MEETING_NOTES_CHANNEL_ID")
+        except ValueError:
+            notes_channel = None
+    poll_raw = os.getenv("MEETING_NOTES_POLL_SECONDS", "").strip()
+    poll = int(poll_raw) if poll_raw.isdigit() and int(poll_raw) > 0 else 600
+    return os.environ["DISCORD_ANSWER_BOT_TOKEN"].strip(), AskConfig(
+        channel_id, guild_id, enabled, notes_channel, poll
+    )
 
 
 def gateway_intents() -> discord.Intents:
@@ -566,11 +581,21 @@ class AskClient(discord.Client):
         self._agent = agent
         self._agent_lock = asyncio.Lock()
         self.tree = app_commands.CommandTree(self)
+        self._meeting_notes_task: asyncio.Task[None] | None = None
 
     async def setup_hook(self) -> None:
         self.add_view(AddAnswerView())
         self.tree.add_command(ask_command)
         await self.sync_commands()
+        from .config import FIREFLIES_API_KEY
+        from .meeting_notes import start_meeting_notes
+
+        self._meeting_notes_task = start_meeting_notes(self, FIREFLIES_API_KEY)
+
+    async def close(self) -> None:
+        if self._meeting_notes_task is not None:
+            self._meeting_notes_task.cancel()
+        await super().close()
 
     async def sync_commands(self) -> None:
         """Register `/ask` for one guild, or globally when no guild id is set."""
