@@ -285,7 +285,7 @@ async def run_tick(
     send: Sender,
     now: datetime | None = None,
 ) -> TickResult:
-    """One poll: post ready meetings at or after the watermark and move the watermark."""
+    """One poll: post ready meetings at or after the watermark; hold it at the oldest pending one."""
     moment = as_utc(now or datetime.now(UTC))
     watermark = await asyncio.to_thread(store.watermark)
     if watermark is None:
@@ -352,10 +352,10 @@ async def run_tick(
             logger.warning("Meeting %s was already recorded as posted.", meeting.recording_id)
         posted += 1
         logger.info("Posted meeting notes for %s in %s message(s).", meeting.recording_id, len(parts))
-    new_mark = moment if held is None else max(held, watermark)
+    new_mark = watermark if held is None else max(held, watermark)
     if new_mark > watermark:
         await asyncio.to_thread(store.set_watermark, new_mark)
-    return TickResult(posted, pending, skipped, False, max(new_mark, watermark))
+    return TickResult(posted, pending, skipped, False, new_mark)
 
 
 class MeetingNotesPoller:

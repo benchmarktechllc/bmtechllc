@@ -149,13 +149,14 @@ def test_first_enable_sets_watermark_and_posts_nothing() -> None:
     assert sent == [] and client.list_calls == 0
 
 
-def test_posts_ready_meeting_once_and_advances_watermark() -> None:
+def test_posts_ready_meeting_once_and_leaves_watermark() -> None:
     ready = meeting("m1", sentences=True)
-    store = FakeStore(NOW - timedelta(days=1))
+    start = NOW - timedelta(days=1)
+    store = FakeStore(start)
     client = FakeClient([ready], {"m1": ready})
     result, sent = run(client, store)
     assert result.posted == 1 and len(sent) == 1
-    assert store.records == ["m1"] and store.mark == NOW
+    assert store.records == ["m1"] and store.mark == start
     result, sent = run(client, store)
     assert result.posted == 0 and sent == [] and client.detail_calls == ["m1"]
 
@@ -171,6 +172,15 @@ def test_older_than_watermark_is_ignored() -> None:
     client = FakeClient([old], {"old": old})
     _, sent = run(client, FakeStore(NOW - timedelta(days=1)))
     assert sent == [] and client.detail_calls == []
+
+
+def test_idle_tick_does_not_move_watermark() -> None:
+    start = NOW.replace(hour=0, minute=0)
+    store = FakeStore(start)
+    client = FakeClient([meeting("old", at=start - timedelta(hours=2), sentences=True)], {})
+    result, sent = run(client, store)
+    assert sent == [] and store.mark == start and result.watermark == start
+    assert not result.initialized
 
 
 def test_naive_datetimes_are_utc() -> None:
@@ -204,7 +214,7 @@ def test_no_sentences_holds_and_silent_does_not() -> None:
 
     store = FakeStore(start)
     result, sent = run(FakeClient([quiet], {}), store)
-    assert sent == [] and result.skipped == 1 and store.mark == NOW
+    assert sent == [] and result.skipped == 1 and store.mark == start
 
 
 def test_failed_send_is_not_recorded_and_holds() -> None:
