@@ -252,3 +252,40 @@ def test_typographic_hyphens_become_ascii() -> None:
     assert "• Non-breaking - en - em" in text
     assert "• Ship-it (Ann)" in text
     assert not any(c in text for c in "‑–—")
+
+
+def test_build_messages_excludes_fireflies_action_items() -> None:
+    from dataclasses import replace
+
+    base = meeting(sentences=True)
+    combined = "Overview text.\n\nAction items:\nBob: fix the thing"
+    loaded = replace(base, summary=combined, overview="Overview text.")
+    user = meeting_notes.build_messages(loaded)[1]["content"]
+    assert "Overview text." in user
+    assert "source of truth" in user
+    assert "Action items" not in user
+    assert "Bob: fix the thing" not in user
+    assert "Ann: We reviewed the launch." in user
+
+
+def test_build_messages_omits_hint_without_overview() -> None:
+    from dataclasses import replace
+
+    loaded = replace(meeting(sentences=True), summary="Action items:\nBob: x")
+    user = meeting_notes.build_messages(loaded)[1]["content"]
+    assert "Bob: x" not in user
+    assert "hint" not in user
+
+
+def test_parse_meeting_overview_excludes_action_items() -> None:
+    from benchmark_cli.fireflies_sync import parse_meeting
+
+    item = {
+        "id": "abc123",
+        "title": "T",
+        "summary": {"overview": "", "short_summary": "Short.", "action_items": "Bob: x"},
+    }
+    parsed = parse_meeting(item)
+    assert parsed is not None
+    assert parsed.overview == "Short."
+    assert "Bob" in parsed.summary

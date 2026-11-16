@@ -91,7 +91,10 @@ ToDos rules:
 - One agreed item is one bullet. Never give the same item to several people as separate bullets and
   never split one item into a bullet per person. If a joint action clearly involves two named
   people, keep it as one bullet and name both in the sentence.
-- If the Fireflies action-item list conflicts with the spoken transcript, trust the transcript.
+- A joint action involving two named people is one ToDo written as "X and Y to ..." using first
+  names, never two bullets.
+- Derive ToDos and owners only from the spoken transcript. Any Fireflies hint is not a source of
+  action items or owners.
 - Mark optional items "optional".
 - Do not write a link. It is added afterwards.
 - If there are no action items, write "• None" under {_TODOS}."""
@@ -176,8 +179,12 @@ def build_messages(meeting: FirefliesMeeting) -> list[dict[str, Any]]:
         f"Meeting title: {meeting.title}",
         f"Date line to use: **{date_title(meeting.recorded_at)}**",
     ]
-    if meeting.summary:
-        parts.append(f"Fireflies summary and action items:\n{meeting.summary}")
+    if meeting.overview:
+        parts.append(
+            "Optional high-level hint from Fireflies (may be wrong about details). The spoken "
+            "transcript below is the source of truth for ToDos and owners:\n"
+            f"{meeting.overview}"
+        )
     parts.append(f"Transcript:\n{transcript_text(meeting)}")
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -254,7 +261,12 @@ def _fetch_postable(
         return None, False
     if detail.silent:
         return None, True
-    loaded = replace(meeting, transcript=detail.transcript, summary=detail.summary)
+    loaded = replace(
+        meeting,
+        transcript=detail.transcript,
+        summary=detail.summary,
+        overview=detail.overview,
+    )
     if detail.live or pending_reason(loaded, sentences_known=True) is not None:
         return None, False
     return loaded, False

@@ -133,6 +133,7 @@ class FirefliesMeeting:
     live: bool
     transcript: tuple[FirefliesTurn, ...] = ()
     summary: str = ""
+    overview: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +275,7 @@ def parse_meeting(item: dict[str, Any]) -> FirefliesMeeting | None:
         live=item.get("is_live") is True,
         transcript=_turns(item),
         summary=_summary(item),
+        overview=_overview(item),
     )
 
 
@@ -506,7 +508,12 @@ def _load_content(
     detail = client.transcript(meeting.recording_id)
     if detail is None or detail.silent or detail.live:
         return None
-    loaded = replace(meeting, transcript=detail.transcript, summary=detail.summary)
+    loaded = replace(
+        meeting,
+        transcript=detail.transcript,
+        summary=detail.summary,
+        overview=detail.overview,
+    )
     if pending_reason(loaded, sentences_known=True) is not None:
         return None
     return loaded
@@ -581,6 +588,14 @@ def _summary(item: dict[str, Any]) -> str:
             actions = f"Action items:\n{actions}"
         parts.append(actions)
     return "\n\n".join(parts)
+
+
+def _overview(item: dict[str, Any]) -> str:
+    """High-level overview only: never action items or assignees."""
+    summary = item.get("summary")
+    if not isinstance(summary, dict):
+        return ""
+    return _summary_text(summary.get("overview")) or _summary_text(summary.get("short_summary"))
 
 
 def _summary_text(value: Any) -> str:
