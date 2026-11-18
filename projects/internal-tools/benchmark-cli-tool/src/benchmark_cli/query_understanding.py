@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -19,15 +20,17 @@ logger = logging.getLogger(__name__)
 _MAX_SEARCHES = 2
 _MAX_SEARCH_CHARS = 500
 
-_SYSTEM = """You rewrite a question into search strings. You do not answer the question.
-The question below is the follow-up to answer. The thread starter is context only.
-If the follow-up names a person, including a nickname, a possessive, or a typo,
-set person to that person's canonical name from the roster.
-If the follow-up does not name a person, set person to null even when the thread
-starter names someone.
-Return one or two short search strings. When the follow-up names a roster person,
-include that person's canonical name in a search string.
+_SYSTEM = """You rewrite the last message of a conversation into search strings for the
+standalone question it asks. You do not answer it. Earlier turns are context: use them to
+resolve what "that", "he", or "and what about Sam" refers to.
+Return one or two short search strings. If the message names a roster person, including a
+nickname, a possessive, or a typo, set person to that person's canonical name from the
+roster and include it in a search string. The person is a search hint only. If the message
+does not name a roster person, set person to null.
 Use only canonical names from the roster. Do not invent people."""
+
+_TURN_CHARS = 500
+_TURNS = 4
 
 
 class QueryPlan(BaseModel):
@@ -37,17 +40,26 @@ class QueryPlan(BaseModel):
     person: str | None = None
 
 
-def fallback_plan(question: str, thread_question: str | None = None) -> QueryPlan:
-    """The raw question, with no person filter. The thread is not copied in."""
-    del thread_question
+def fallback_plan(
+    question: str, thread_question: str | None = None, history: Sequence[Any] | None = None
+) -> QueryPlan:
+    """The raw question, with no person hint. The thread is not copied in."""
+    del thread_question, history
     text = " ".join(question.split()) or question.strip()
     return QueryPlan(searches=[text] if text else [], person=None)
 
 
-def _messages(question: str, thread_question: str | None) -> list[dict[str, Any]]:
+def _messages(
+    question: str, thread_question: str | None, history: Sequence[Any] | None = None
+) -> list[dict[str, Any]]:
     starter = " ".join((thread_question or "").split()) or "(none)"
-    body = {
+    recent = [
+        {"role": turn.role, "text": " ".join(turn.text.split())[:_TURN_CHARS]}
+        for turn in list(history or ())[-_TURNS:]
+    ]
+    body: dict[str, Any] = {
         "thread_starter": starter,
+        "recent_turns": recent,
         "question": question.strip(),
         "roster": roster_payload(),
     }
@@ -68,25 +80,27 @@ def _clean_searches(values: list[str]) -> list[str]:
     return cleaned
 
 
-def understand_query(question: str, thread_question: str | None = None) -> QueryPlan:
+def understand_query(
+    question: str, thread_question: str | None = None, history: Sequence[Any] | None = None
+) -> QueryPlan:
     """Ask the cheap model for searches and a person. Failure uses the raw question."""
     if not question.strip():
-        return fallback_plan(question, thread_question)
+        return fallback_plan(question, thread_question, history)
     try:
         parsed = call_llm_structured(
             tier="cheap",
-            messages=_messages(question, thread_question),
+            messages=_messages(question, thread_question, history),
             response_schema=QueryPlan,
             component="query_understanding",
         )
     except Exception:
         logger.info("Query understanding failed; searching the raw question.")
-        return fallback_plan(question, thread_question)
+        return fallback_plan(question, thread_question, history)
     if not isinstance(parsed, QueryPlan):
-        return fallback_plan(question, thread_question)
+        return fallback_plan(question, thread_question, history)
     searches = _clean_searches(parsed.searches)
     if not searches:
-        return fallback_plan(question, thread_question)
+        return fallback_plan(question, thread_question, history)
     person = person_by_label(parsed.person)
     if parsed.person and person is None:
         logger.info("Query understanding returned a person who is not on the roster.")

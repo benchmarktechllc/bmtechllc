@@ -55,6 +55,13 @@ class ModelConfig:
 CHEAP_MODEL: Final[str] = os.getenv("CHEAP_MODEL", "gpt-4o-mini")
 # Kept for cost-comparison logs only. Chat calls do not use this model.
 FLAGSHIP_MODEL: Final[str] = os.getenv("FLAGSHIP_MODEL", "gpt-4o")
+SYNTHESIS_MODEL: Final[str] = os.getenv("SYNTHESIS_MODEL", "gpt-5-mini")
+# Empty means the API default. Only sent for gpt-5 models.
+SYNTHESIS_REASONING_EFFORT: Final[str] = os.getenv("SYNTHESIS_REASONING_EFFORT", "")
+# Meeting-notes summaries. Empty/unset model falls back to SYNTHESIS_MODEL.
+MEETING_NOTES_MODEL: Final[str] = os.getenv("MEETING_NOTES_MODEL", "").strip() or SYNTHESIS_MODEL
+# Empty means the API default. Only sent for gpt-5 models.
+MEETING_NOTES_REASONING_EFFORT: Final[str] = os.getenv("MEETING_NOTES_REASONING_EFFORT", "").strip()
 MODEL_TIERS: Final[dict[str, ModelConfig]] = {
     "cheap": ModelConfig(
         CHEAP_MODEL,
@@ -65,6 +72,22 @@ MODEL_TIERS: Final[dict[str, ModelConfig]] = {
         FLAGSHIP_MODEL,
         float(os.getenv("FLAGSHIP_INPUT_COST_PER_MILLION", "2.50")),
         float(os.getenv("FLAGSHIP_OUTPUT_COST_PER_MILLION", "10.00")),
+    ),
+    "synthesis": ModelConfig(
+        SYNTHESIS_MODEL,
+        float(os.getenv("SYNTHESIS_INPUT_COST_PER_MILLION", "0.25")),
+        float(os.getenv("SYNTHESIS_OUTPUT_COST_PER_MILLION", "2.00")),
+    ),
+    "meeting_notes": ModelConfig(
+        MEETING_NOTES_MODEL,
+        float(
+            os.getenv("MEETING_NOTES_INPUT_COST_PER_MILLION")
+            or os.getenv("SYNTHESIS_INPUT_COST_PER_MILLION", "0.25")
+        ),
+        float(
+            os.getenv("MEETING_NOTES_OUTPUT_COST_PER_MILLION")
+            or os.getenv("SYNTHESIS_OUTPUT_COST_PER_MILLION", "2.00")
+        ),
     ),
     "embedding": ModelConfig(
         EMBEDDING_MODEL,

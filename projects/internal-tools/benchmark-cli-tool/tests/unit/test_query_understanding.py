@@ -197,7 +197,7 @@ def test_abstention_is_after_the_model_sees_roster_names(monkeypatch: pytest.Mon
 
 
 @pytest.mark.unit
-def test_person_filter_rejects_another_persons_card(monkeypatch: pytest.MonkeyPatch, quiet: None) -> None:
+def test_person_is_a_search_hint_only_and_nothing_filters_the_pack(monkeypatch: pytest.MonkeyPatch, quiet: None) -> None:
     from benchmark_cli import agent
     from benchmark_cli.query_understanding import QueryPlan
 
@@ -244,16 +244,16 @@ def test_person_filter_rejects_another_persons_card(monkeypatch: pytest.MonkeyPa
     response = agent.run_agent("What tickets are assigned to Dante")
 
     evidence = json.loads(prompts[0][1]["content"].split("\n", 1)[1])
-    assert evidence["person_filter"] == "Dante Paniccia"
-    assert [card["title"] for card in evidence["person_cards"]] == ["Ship the portal", "Old portal import"]
+    assert "person_filter" not in evidence
+    assert evidence["person_cards"]["person"] == "Dante Paniccia"
     assert "Dante Paniccia" in json.dumps(evidence["trello_board"]["roster"])
+    assert {card["title"] for card in evidence["trello_board"]["cards"]} >= {"Ship the portal", "Kiosk MVP"}
+    # The model's own answer comes back unchanged; no check swaps in a person's ticket list.
     assert response.status == "answered"
-    assert "Kiosk MVP" not in response.answer
-    assert "Ship the portal" in response.answer
-    assert "Old portal import" in response.answer
+    assert response.answer == _KIOSK
 
 @pytest.mark.unit
-def test_failed_model_does_not_list_someone_elses_doing_cards(monkeypatch: pytest.MonkeyPatch, quiet: None) -> None:
+def test_failed_model_gives_no_ticket_list_at_all(monkeypatch: pytest.MonkeyPatch, quiet: None) -> None:
     from benchmark_cli import agent
     from benchmark_cli.query_understanding import QueryPlan
 
@@ -287,10 +287,8 @@ def test_failed_model_does_not_list_someone_elses_doing_cards(monkeypatch: pytes
 
     response = agent.run_agent("what is Fano doing right now")
 
-    assert response.status == "answered"
-    assert "Kiosk MVP" in response.answer
-    assert "Retired kiosk notes" in response.answer
-    assert "Completed:" in response.answer
+    assert response.status == "no_relevant_information"
+    assert "Kiosk MVP" not in response.answer
     assert "Ship the portal" not in response.answer
 
 

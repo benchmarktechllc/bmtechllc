@@ -142,10 +142,11 @@ def test_agent_returns_cited_evidence_excerpts_after_two_invalid_syntheses(
 
     response = agent.run_agent("What was discussed about VM?", tier="cheap")
 
-    assert response.status == "no_relevant_information"
+    # Unusable citations are dropped; the answer still ships (uncited), never a canned refusal.
+    assert response.status == "answered"
     assert "VM performance" not in response.answer
     assert response.citations == []
-    assert diagnostics[-1][0] == "validation_failed"
+    assert diagnostics[-1][0] == "answered_uncited"
 
 
 @pytest.mark.unit

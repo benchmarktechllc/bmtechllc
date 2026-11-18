@@ -99,7 +99,7 @@ def test_add_answer_click_after_restart_opens_the_modal_from_the_referenced_mess
 
 
 @pytest.mark.unit
-def test_rate_limit_says_the_service_is_unavailable_but_trello_lists_still_answer(
+def test_rate_limit_says_the_service_is_unavailable_and_no_ticket_list_is_substituted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from tests.unit.test_live_question_regressions import _as_tuple, _row
@@ -122,8 +122,8 @@ def test_rate_limit_says_the_service_is_unavailable_but_trello_lists_still_answe
 
     listed = agent.run_agent("Which Trello cards are in Doing?")
 
-    assert "Sample portal sync" in listed.answer
-    assert "temporarily unavailable" not in listed.answer.casefold()
+    assert listed.answer == MODEL_UNAVAILABLE_REPLY
+    assert "Sample portal sync" not in listed.answer
 
     page = SearchChunk(
         8,

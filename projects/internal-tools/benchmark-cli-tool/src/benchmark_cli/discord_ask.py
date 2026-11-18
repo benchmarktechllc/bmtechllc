@@ -13,23 +13,27 @@ import inspect
 import logging
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import datetime
 
 import discord
 from discord import app_commands
 
 from .agent import MODEL_UNAVAILABLE_REPLY, run_agent
+from .context_pack import HISTORY_TURN_CHARACTERS, HISTORY_TURN_LIMIT, Turn
 from .contributions import (
     THANKS_REPLY,
     UNKNOWN_INVITE,
     is_contribution_reply,
     store_contribution,
 )
+from .meeting_answers import meeting_for_source
 from .models import AnswerResponse, Citation
 
 logger = logging.getLogger(__name__)
 
+HISTORY_FETCH_LIMIT = 20
 DISCORD_MESSAGE_LIMIT = 2000
 THREAD_NAME_LIMIT = 100
 _QUOTE_LIMIT = 300
@@ -56,6 +60,9 @@ class AskConfig:
 
     ask_channel_id: int
     guild_id: int | None
+    meeting_notes_enabled: bool = False
+    meeting_notes_channel_id: int | None = None
+    meeting_notes_poll_seconds: int = 600
 
 
 def parse_snowflake(value: str, *, name: str) -> int:
@@ -83,7 +90,19 @@ def load_runtime() -> tuple[str, AskConfig]:
         guild_id = parse_snowflake(guild_raw, name="DISCORD_ASK_GUILD_ID") if guild_raw else None
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    return os.environ["DISCORD_ANSWER_BOT_TOKEN"].strip(), AskConfig(channel_id, guild_id)
+    enabled = os.getenv("MEETING_NOTES_AUTOPOST", "").strip().casefold() in {"1", "true", "yes"}
+    notes_channel: int | None = None
+    notes_raw = os.getenv("MEETING_NOTES_CHANNEL_ID", "").strip()
+    if enabled and notes_raw:
+        try:
+            notes_channel = parse_snowflake(notes_raw, name="MEETING_NOTES_CHANNEL_ID")
+        except ValueError:
+            notes_channel = None
+    poll_raw = os.getenv("MEETING_NOTES_POLL_SECONDS", "").strip()
+    poll = int(poll_raw) if poll_raw.isdigit() and int(poll_raw) > 0 else 600
+    return os.environ["DISCORD_ANSWER_BOT_TOKEN"].strip(), AskConfig(
+        channel_id, guild_id, enabled, notes_channel, poll
+    )
 
 
 def gateway_intents() -> discord.Intents:
@@ -163,6 +182,11 @@ def _format_citation(index: int, citation: Citation) -> str:
     quote = " ".join(citation.quote.split())
     if len(quote) > _QUOTE_LIMIT:
         quote = quote[: _QUOTE_LIMIT - 1].rstrip() + "…"
+    meeting = meeting_for_source(citation.source_file)
+    if meeting is not None and meeting.title and meeting.date:
+        title = " ".join(meeting.title.split()).replace("`", "'")
+        link = f" <{meeting.url}>" if meeting.url.startswith("https://") and ">" not in meeting.url else ""
+        return f"{index}. {title} ({meeting.date}){link} (chunk {citation.chunk_id}): {quote}"
     return f"{index}. `{source}` (chunk {citation.chunk_id}): {quote}"
 
 
@@ -279,8 +303,7 @@ def format_discord_answer(response: AnswerResponse, *, limit: int = DISCORD_MESS
     return rendered or "No answer text was returned."[:limit]
 
 
-async def read_thread_starter(message: discord.Message) -> str | None:
-    """Text of the message that opened this thread, when Discord still has it."""
+async def _thread_starter_message(message: discord.Message) -> discord.Message | None:
     channel = message.channel
     if not isinstance(channel, discord.Thread):
         return None
@@ -293,7 +316,61 @@ async def read_thread_starter(message: discord.Message) -> str | None:
             starter = None
     if starter is None or starter.id == message.id:
         return None
-    return starter.content
+    return starter
+
+
+async def read_thread_starter(message: discord.Message) -> str | None:
+    """Text of the message that opened this thread, when Discord still has it."""
+    starter = await _thread_starter_message(message)
+    return None if starter is None else starter.content
+
+
+def build_history(items: Iterable[tuple[str, str, datetime | None]]) -> list[Turn]:
+    """Turns for the answer model from ``(role, text, sent_at)`` thread messages, oldest first.
+
+    Service replies (failure, thanks, the add-answer invite) and empty messages are skipped.
+    Consecutive bot parts of one answer merge into one assistant turn. The last six turns
+    are kept, each capped at 1,500 characters.
+    """
+    turns: list[Turn] = []
+    for role, raw, sent_at in items:
+        text = (raw or "").replace(UNKNOWN_INVITE, "").strip()
+        if not text or text in {FAILURE_REPLY, THANKS_REPLY}:
+            continue
+        if role == "assistant" and turns and turns[-1].role == "assistant":
+            previous = turns[-1]
+            turns[-1] = Turn("assistant", f"{previous.text}\n{text}", previous.sent_at)
+        else:
+            turns.append(Turn(role, text, sent_at))
+    return [
+        Turn(turn.role, turn.text[:HISTORY_TURN_CHARACTERS], turn.sent_at)
+        for turn in turns[-HISTORY_TURN_LIMIT:]
+    ]
+
+
+async def read_thread_history(message: discord.Message, bot_user_id: int | None) -> list[Turn]:
+    """The thread so far as real turns: the starter, earlier people, and the bot's own answers."""
+    channel = message.channel
+    if not isinstance(channel, discord.Thread):
+        return []
+    collected: list[discord.Message] = []
+    starter = await _thread_starter_message(message)
+    if starter is not None:
+        collected.append(starter)
+    try:
+        earlier = [item async for item in channel.history(limit=HISTORY_FETCH_LIMIT, before=message)]
+    except discord.HTTPException:
+        logger.warning("Could not read the thread history for message %s.", message.id)
+        earlier = []
+    seen = {item.id for item in collected}
+    collected.extend(item for item in reversed(earlier) if item.id not in seen)
+    items: list[tuple[str, str, datetime | None]] = []
+    for item in collected:
+        if bot_user_id is not None and item.author.id == bot_user_id:
+            items.append(("assistant", item.content, item.created_at))
+        elif not item.author.bot:
+            items.append(("user", item.content, item.created_at))
+    return build_history(items)
 
 
 class AddAnswerModal(discord.ui.Modal, title="Add answer"):
@@ -504,11 +581,21 @@ class AskClient(discord.Client):
         self._agent = agent
         self._agent_lock = asyncio.Lock()
         self.tree = app_commands.CommandTree(self)
+        self._meeting_notes_task: asyncio.Task[None] | None = None
 
     async def setup_hook(self) -> None:
         self.add_view(AddAnswerView())
         self.tree.add_command(ask_command)
         await self.sync_commands()
+        from .config import FIREFLIES_API_KEY
+        from .meeting_notes import start_meeting_notes
+
+        self._meeting_notes_task = start_meeting_notes(self, FIREFLIES_API_KEY)
+
+    async def close(self) -> None:
+        if self._meeting_notes_task is not None:
+            self._meeting_notes_task.cancel()
+        await super().close()
 
     async def sync_commands(self) -> None:
         """Register `/ask` for one guild, or globally when no guild id is set."""
@@ -541,7 +628,23 @@ class AskClient(discord.Client):
             self.config.ask_channel_id,
         )
 
-    async def answer_question(self, question: str, *, thread_question: str | None = None) -> str:
+    def _call_agent(
+        self, question: str, thread_question: str | None, history: list[Turn] | None
+    ) -> AnswerResponse:
+        parameters = inspect.signature(self._agent).parameters
+        if history and "history" in parameters:
+            return self._agent(question, history=history)
+        if thread_question and "thread_question" in parameters:
+            return self._agent(question, thread_question=thread_question)
+        if history and "thread_question" in parameters:
+            first_user = next((turn.text for turn in history if turn.role == "user"), None)
+            if first_user:
+                return self._agent(question, thread_question=first_user)
+        return self._agent(question)
+
+    async def answer_question(
+        self, question: str, *, thread_question: str | None = None, history: list[Turn] | None = None
+    ) -> str:
         """Run the RAG agent and format the reply.
 
         Questions run one at a time. Usage telemetry is appended without a file
@@ -553,31 +656,29 @@ class AskClient(discord.Client):
             raise ValueError("question must not be empty.")
 
         def _invoke() -> AnswerResponse:
-            if thread_question and "thread_question" in inspect.signature(self._agent).parameters:
-                return self._agent(cleaned, thread_question=thread_question)
-            return self._agent(cleaned)
+            return self._call_agent(cleaned, thread_question, history)
 
         async with self._agent_lock:
             response = await asyncio.to_thread(_invoke)
         return format_discord_answer(response)
 
-    async def answer_messages(self, question: str, *, thread_question: str | None = None) -> list[str]:
+    async def answer_messages(
+        self, question: str, *, thread_question: str | None = None, history: list[Turn] | None = None
+    ) -> list[str]:
         """Format the reply as one Discord message per 2000 characters."""
         cleaned = question.strip()
         if not cleaned:
             raise ValueError("question must not be empty.")
 
         def _invoke() -> AnswerResponse:
-            if thread_question and "thread_question" in inspect.signature(self._agent).parameters:
-                return self._agent(cleaned, thread_question=thread_question)
-            return self._agent(cleaned)
+            return self._call_agent(cleaned, thread_question, history)
 
         async with self._agent_lock:
             response = await asyncio.to_thread(_invoke)
         return format_discord_messages(response)
 
     async def answer_bundle(
-        self, question: str, *, thread_question: str | None = None
+        self, question: str, *, thread_question: str | None = None, history: list[Turn] | None = None
     ) -> tuple[list[str], AnswerResponse]:
         """The Discord parts and the response, so an unknown answer can carry a button."""
         cleaned = question.strip()
@@ -585,9 +686,7 @@ class AskClient(discord.Client):
             raise ValueError("question must not be empty.")
 
         def _invoke() -> AnswerResponse:
-            if thread_question and "thread_question" in inspect.signature(self._agent).parameters:
-                return self._agent(cleaned, thread_question=thread_question)
-            return self._agent(cleaned)
+            return self._call_agent(cleaned, thread_question, history)
 
         async with self._agent_lock:
             response = await asyncio.to_thread(_invoke)
@@ -628,11 +727,8 @@ class AskClient(discord.Client):
         logger.info("Answering message %s in channel %s.", message.id, message.channel.id)
         try:
             async with message.channel.typing():
-                starter = await read_thread_starter(message)
-                parts, response = await self.answer_bundle(
-                    message.content,
-                    thread_question=thread_question_for(message.content, starter),
-                )
+                history = await read_thread_history(message, bot_user_id)
+                parts, response = await self.answer_bundle(message.content, history=history)
         except Exception:
             logger.exception("Failed to answer message %s.", message.id)
             try:

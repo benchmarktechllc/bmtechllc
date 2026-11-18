@@ -164,7 +164,7 @@ def replay_case(
         model_calls = [case.get("model")]
     trace: dict[str, Any] = {"prompts": []}
 
-    def _understand(question: str, thread_question: str | None = None) -> QueryPlan:
+    def _understand(question: str, thread_question: str | None = None, **_kwargs: Any) -> QueryPlan:
         del question, thread_question
         return plan
 
@@ -307,8 +307,8 @@ def record_questions(path: Path) -> dict[str, Any]:
     for question, thread in _read_questions(path):
         captured: dict[str, Any] = {"model_calls": []}
 
-        def _understand(current: str, thread_question: str | None = None) -> QueryPlan:
-            plan = understand_query(current, thread_question)
+        def _understand(current: str, thread_question: str | None = None, **kwargs: Any) -> QueryPlan:
+            plan = understand_query(current, thread_question, **kwargs)
             captured["plan"] = plan.model_dump()
             return plan
 

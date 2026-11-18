@@ -82,3 +82,90 @@ def test_permission_error_does_not_fail_the_caller(
     log_agent_diagnostic(outcome="answered", synthesis_attempts=0, log_path=blocked)
 
     assert not blocked.exists()
+
+
+@pytest.mark.unit
+def test_chat_tier_mapping() -> None:
+    from benchmark_cli.llm import _chat_tier
+
+    assert _chat_tier("synthesis") == "synthesis"
+    assert _chat_tier("embedding") == "embedding"
+    assert _chat_tier("flagship") == "cheap"
+    assert _chat_tier("cheap") == "cheap"
+
+
+@pytest.mark.unit
+def test_structured_call_sends_the_tier_model_and_no_caps(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from pydantic import BaseModel
+
+    from benchmark_cli import llm
+    from benchmark_cli.config import CHEAP_MODEL, get_model_config
+
+    class Out(BaseModel):
+        text: str = ""
+
+    requests: list[dict[str, object]] = []
+
+    def parse(**kwargs: object) -> object:
+        requests.append(kwargs)
+        message = SimpleNamespace(parsed=Out())
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=None)
+
+    client = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))))
+    monkeypatch.setattr(llm, "_get_client", lambda: client)
+    monkeypatch.setattr(llm, "log_usage", lambda **_k: None)
+    monkeypatch.setattr(llm, "SYNTHESIS_REASONING_EFFORT", "")
+    messages = [{"role": "user", "content": "q"}]
+    llm.call_llm_structured(tier="synthesis", messages=messages, response_schema=Out)
+    llm.call_llm_structured(tier="cheap", messages=messages, response_schema=Out)
+    assert requests[0]["model"] == get_model_config("synthesis").model
+    assert requests[1]["model"] == CHEAP_MODEL
+    for request in requests:
+        assert not {"max_tokens", "max_completion_tokens", "temperature", "reasoning_effort"} & set(request)
+
+
+@pytest.mark.unit
+def test_reasoning_effort_only_for_gpt5_models_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from pydantic import BaseModel
+
+    from benchmark_cli import llm
+    from benchmark_cli.config import ModelConfig
+
+    class Out(BaseModel):
+        text: str = ""
+
+    requests: list[dict[str, object]] = []
+
+    def parse(**kwargs: object) -> object:
+        requests.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=Out()))], usage=None)
+
+    client = SimpleNamespace(beta=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))))
+    monkeypatch.setattr(llm, "_get_client", lambda: client)
+    monkeypatch.setattr(llm, "log_usage", lambda **_k: None)
+    monkeypatch.setattr(llm, "SYNTHESIS_REASONING_EFFORT", "low")
+    messages = [{"role": "user", "content": "q"}]
+    llm.call_llm_structured(tier="synthesis", messages=messages, response_schema=Out)
+    assert requests[-1].get("reasoning_effort") == "low"
+    monkeypatch.setitem(llm.get_model_config.__globals__["MODEL_TIERS"], "synthesis", ModelConfig("gpt-4.1-mini", 0.4, 1.6))
+    llm.call_llm_structured(tier="synthesis", messages=messages, response_schema=Out)
+    assert "reasoning_effort" not in requests[-1]
+
+
+@pytest.mark.unit
+def test_synthesis_usage_is_logged_with_its_model_and_prices(tmp_path: Path) -> None:
+    from benchmark_cli.config import get_model_config
+
+    log_usage(
+        tier="synthesis", prompt_tokens=1_000_000, completion_tokens=1_000_000, latency_ms=1.0,
+        component="answer_synthesis", log_path=tmp_path / "usage.csv",
+    )
+    config = get_model_config("synthesis")
+    text = (tmp_path / "usage.csv").read_text(encoding="utf-8")
+    assert config.model in text and "synthesis" in text
+    expected = config.input_cost_per_million + config.output_cost_per_million
+    assert f"{expected:.10f}" in text

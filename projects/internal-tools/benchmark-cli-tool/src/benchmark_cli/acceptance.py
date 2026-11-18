@@ -17,6 +17,7 @@ from .agent import run_agent
 from .corpus import is_boilerplate_text, is_synthetic_canary
 from .grounding import (
     ACCEPTANCE_QUESTIONS,
+    ANSWER_PATH_REVISION,
     CHANNEL_ACCEPTANCE_QUESTIONS,
     CORE_TEAM_ACCEPTANCE_QUESTIONS,
     EMPLOYEE_ACCEPTANCE_QUESTIONS,
@@ -203,7 +204,7 @@ def run_acceptance() -> dict[str, object]:
                 }
             )
     return {
-        "revision": "2026-11-07-ask-retrieval",
+        "revision": ANSWER_PATH_REVISION,
         "portal_home": home,
         "dependencies": dependencies,
         "expectations": {

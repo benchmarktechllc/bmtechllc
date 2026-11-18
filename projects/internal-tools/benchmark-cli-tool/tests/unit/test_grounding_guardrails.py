@@ -1143,7 +1143,7 @@ def test_excerpt_fallback_keeps_only_the_chunk_that_answers(
 
     response = agent.run_agent("How do playbooks compare with runbooks?")
 
-    assert response.status == "no_relevant_information"
+    assert response.status == "answered"
     assert "homepage" not in response.answer.casefold()
     assert "tokenization" not in response.answer.casefold()
     assert "not in the page" not in response.answer

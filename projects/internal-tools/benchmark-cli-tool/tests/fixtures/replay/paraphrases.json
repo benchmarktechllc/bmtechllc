@@ -98,7 +98,7 @@
       "plan": {"searches": ["Fanuel Mengistu currently working"], "person": "Fanuel Mengistu"},
       "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.19, "keyword_overlap": 0},
       "model": {"status": "answered", "confidence": 0.8, "answer": "Fanuel Mengistu is currently working on [Kiosk MVP](https://trello.com/c/kiosk), which is in Doing."},
-      "expect": {"status": "answered", "titles": ["Kiosk MVP", "Retired kiosk notes"], "absent": ["Ship the portal", "Review the lobby copy"], "order": ["Kiosk MVP", "Retired kiosk notes"]}
+      "expect": {"status": "answered", "titles": ["Kiosk MVP"], "absent": ["Ship the portal", "Review the lobby copy"]}
     },
     {
       "id": "fano-current",
@@ -107,7 +107,7 @@
       "plan": {"searches": ["Fanuel Mengistu current work"], "person": "Fanuel Mengistu"},
       "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.16, "keyword_overlap": 0},
       "model": {"status": "answered", "confidence": 0.8, "answer": "Fanuel Mengistu is currently working on [Kiosk MVP](https://trello.com/c/kiosk), which is in Doing."},
-      "expect": {"status": "answered", "titles": ["Kiosk MVP", "Retired kiosk notes"], "absent": ["Ship the portal"], "order": ["Kiosk MVP", "Retired kiosk notes"]}
+      "expect": {"status": "answered", "titles": ["Kiosk MVP"], "absent": ["Ship the portal"]}
     },
     {
       "id": "fanuel-current-work",
@@ -116,7 +116,7 @@
       "plan": {"searches": ["Fanuel Mengistu current work"], "person": "Fanuel Mengistu"},
       "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.4, "keyword_overlap": 1},
       "model": {"status": "answered", "confidence": 0.8, "answer": "Fanuel Mengistu is currently working on [Kiosk MVP](https://trello.com/c/kiosk), which is in Doing."},
-      "expect": {"status": "answered", "titles": ["Kiosk MVP", "Retired kiosk notes"], "absent": ["Ship the portal"], "order": ["Kiosk MVP", "Retired kiosk notes"]}
+      "expect": {"status": "answered", "titles": ["Kiosk MVP"], "absent": ["Ship the portal"]}
     },
     {
       "id": "no-name-doing",
@@ -125,7 +125,7 @@
       "plan": {"searches": ["Which tickets are in Doing right now?"], "person": null},
       "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.12, "keyword_overlap": 0},
       "model_calls": [null],
-      "expect": {"status": "answered", "titles": ["Ship the portal", "Kiosk MVP", "Unassigned sample"], "absent": ["Old portal import", "Retired kiosk notes", "Review the lobby copy"]}
+      "expect": {"status": "no_relevant_information", "absent": ["Ship the portal", "Kiosk MVP", "Old portal import"]}
     },
     {
       "id": "no-name-backlog",
@@ -134,7 +134,7 @@
       "plan": {"searches": ["What's in Backlog?"], "person": null},
       "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": null, "keyword_overlap": 0},
       "model_calls": [null],
-      "expect": {"status": "answered", "titles": ["Review the lobby copy"], "absent": ["Ship the portal", "Kiosk MVP", "Old portal import"]}
+      "expect": {"status": "no_relevant_information", "absent": ["Ship the portal", "Kiosk MVP", "Old portal import"]}
     },
     {
       "id": "no-name-open",
@@ -143,7 +143,7 @@
       "plan": {"searches": ["Which tickets are still open?"], "person": null},
       "retrieval": {"status": "no_relevant_information", "top_cosine_similarity": 0.2, "keyword_overlap": 0},
       "model_calls": [null],
-      "expect": {"status": "answered", "titles": ["Ship the portal", "Kiosk MVP", "Review the lobby copy", "Unassigned sample"], "absent": ["Old portal import", "Retired kiosk notes"]}
+      "expect": {"status": "no_relevant_information", "absent": ["Ship the portal", "Kiosk MVP", "Review the lobby copy"]}
     },
     {
       "id": "saved-headcount-reask",
@@ -209,7 +209,7 @@
         ]
       },
       "model_calls": [null],
-      "expect": {"status": "answered", "titles": ["Kiosk MVP"], "absent": ["According to", "Dante is dantino12"]}
+      "expect": {"status": "no_relevant_information", "absent": ["According to", "Dante is dantino12"]}
     },
     {
       "id": "open-tickets-not-contribution",
@@ -242,7 +242,7 @@
         ]
       },
       "model_calls": [null],
-      "expect": {"status": "answered", "titles": ["Ship the portal"], "absent": ["According to"]}
+      "expect": {"status": "no_relevant_information", "absent": ["According to"]}
     }
   ]
 }

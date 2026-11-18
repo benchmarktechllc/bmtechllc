@@ -139,6 +139,4 @@ class AnswerResponse(BaseModel):
         if self.status == "no_relevant_information":
             if self.confidence != 0.0 or self.citations:
                 raise ValueError("Abstentions must have zero confidence and no citations.")
-        elif not self.citations:
-            raise ValueError("Answered responses require at least one citation.")
         return self

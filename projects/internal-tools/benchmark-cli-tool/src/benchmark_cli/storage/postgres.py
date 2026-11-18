@@ -192,6 +192,7 @@ def initialize_database() -> None:
     apply_sql("007_fireflies_sync.sql")
     apply_sql("008_fts_url_tokens.sql")
     apply_sql("009_github_sync.sql")
+    apply_sql("010_meeting_notes.sql")
 
 
 def create_indexes() -> None:
@@ -793,6 +794,50 @@ def delete_fathom_sync_state(recording_id: str) -> None:
         conn.commit()
 
 
+def meeting_notes_watermark() -> datetime | None:
+    """Return the meeting-notes watermark, or None before the first enable."""
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT watermark_at FROM meeting_notes_cursor WHERE id = 1")
+        row = cursor.fetchone()
+    return None if row is None else row[0]
+
+
+def set_meeting_notes_watermark(watermark_at: datetime) -> None:
+    """Create or move the singleton meeting-notes watermark."""
+    statement = """
+        INSERT INTO meeting_notes_cursor (id, watermark_at) VALUES (1, %s)
+        ON CONFLICT (id) DO UPDATE SET watermark_at = EXCLUDED.watermark_at
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (watermark_at,))
+        conn.commit()
+
+
+def meeting_notes_posted(transcript_id: str) -> bool:
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT 1 FROM meeting_notes_posts WHERE transcript_id = %s", (transcript_id,)
+        )
+        return cursor.fetchone() is not None
+
+
+def record_meeting_notes_post(
+    transcript_id: str, channel_id: str, message_ids: Sequence[str], title: str
+) -> bool:
+    """Record a sent post. False means the primary key already existed."""
+    _, _, Json = _dependencies()
+    statement = """
+        INSERT INTO meeting_notes_posts (transcript_id, channel_id, message_ids, title)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (transcript_id) DO NOTHING
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (transcript_id, channel_id, Json(list(message_ids)), title))
+        inserted = cursor.rowcount == 1
+        conn.commit()
+    return inserted
+
+
 def fireflies_sync_states() -> dict[str, FirefliesSyncState]:
     """Return every Fireflies transcript revision recorded by ``benchmark-sync-fireflies``."""
     statement = """
@@ -1073,6 +1118,54 @@ def select_context_window(
 
     selected = tuple(chunk for index, chunk in enumerate(chunks) if index in included)
     return selected, total, len(selected) == len(chunks)
+
+
+def list_meetings(source_file: str | None = None) -> list[tuple[str, str, str, str]]:
+    """Distinct indexed meetings as ``(source_file, title, date, url)``. Read only."""
+    statement = """
+        SELECT DISTINCT source_file, coalesce(metadata ->> 'title', ''),
+               coalesce(metadata ->> 'date', ''), coalesce(metadata ->> 'url', '')
+        FROM document_chunks
+        WHERE metadata ->> 'source_type' = 'transcript'
+          AND metadata ->> 'kind' = 'meeting_transcript'
+    """
+    parameters: tuple[str, ...] = ()
+    if source_file is not None:
+        statement += " AND source_file = %s"
+        parameters = (source_file,)
+    statement += " ORDER BY source_file"
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, parameters)
+        return [tuple(str(value) for value in row) for row in cursor.fetchall()]  # type: ignore[misc]
+
+
+def meeting_summary_chunks(source_file: str) -> list[SearchChunk]:
+    """The Overview and Summary chunks of one meeting, in document order."""
+    statement = """
+        SELECT id, source_file, chunk_index, chunk_text, metadata, 0.0 AS score,
+               NULL::integer AS token_count, content_sha256
+        FROM document_chunks
+        WHERE source_file = %s
+          AND metadata ->> 'section' IN ('Overview', 'Summary')
+        ORDER BY chunk_index ASC, id ASC
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (source_file,))
+        return [SearchChunk(*row) for row in cursor.fetchall()]
+
+
+def meeting_chunks(source_file: str) -> list[SearchChunk]:
+    """Every chunk of one meeting (Overview, Summary, each transcript chunk), in order."""
+    statement = """
+        SELECT id, source_file, chunk_index, chunk_text, metadata, 0.0 AS score,
+               NULL::integer AS token_count, content_sha256
+        FROM document_chunks
+        WHERE source_file = %s
+        ORDER BY chunk_index ASC, id ASC
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (source_file,))
+        return [SearchChunk(*row) for row in cursor.fetchall()]
 
 
 def read_doc(chunk_id: int, *, max_tokens: int = PARENT_CONTEXT_MAX_TOKENS) -> ParentContext | None:

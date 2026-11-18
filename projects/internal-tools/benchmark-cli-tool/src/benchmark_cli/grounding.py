@@ -32,7 +32,7 @@ from .storage.postgres import SearchChunk
 
 logger = logging.getLogger(__name__)
 
-ANSWER_PATH_REVISION = "2026-11-07-ask-retrieval"
+ANSWER_PATH_REVISION = "2026-11-14-ask-context-first-r2"
 PORTAL_ACCEPTANCE_QUESTIONS = (
     "What is the link to the knowledge base portal?",
     "Where do I open the knowledge base?",
@@ -1142,7 +1142,7 @@ def scrub_response(response: AnswerResponse) -> AnswerResponse:
         if not quote:
             continue
         citations.append(citation.model_copy(update={"quote": quote}))
-    if response.status == "answered" and not citations:
+    if response.status == "answered" and not answer:
         return AnswerResponse(
             status="no_relevant_information",
             answer=answer or _CREDENTIAL_REFUSAL,

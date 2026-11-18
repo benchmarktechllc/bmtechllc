@@ -19,7 +19,6 @@ from benchmark_cli.discord_ask import (
     AskClient,
     AskConfig,
     format_discord_answer,
-    thread_question_for,
 )
 from benchmark_cli.entailment import answers_question
 from benchmark_cli.grounding import (
@@ -31,10 +30,8 @@ from benchmark_cli.models import AnswerResponse, Citation
 from benchmark_cli.retrieval import HybridSearchResult, RetrievalDecision
 from benchmark_cli.storage.postgres import SearchChunk
 from benchmark_cli.trello_answers import (
-    OPEN_LISTS,
     TrelloCardRow,
     board_url_from_cards,
-    requested_trello_list,
     trello_list_answer,
 )
 
@@ -294,74 +291,6 @@ def test_project_status_and_roster_questions_keep_covering_chunks(
 
 
 @pytest.mark.unit
-def test_open_trello_tickets_list_every_list_except_done(
-    monkeypatch: pytest.MonkeyPatch, quiet_model: None
-) -> None:
-    rows = (
-        _row("Backlog", "Sample backlog card", "back", 1),
-        _row("Doing", "Sample doing card", "doing", 2),
-        _row("Review", "Sample review card", "review", 3),
-        _row("Done", "Sample done card", "done", 4),
-    )
-    monkeypatch.setattr(agent, "trello_card_rows", lambda: [_as_tuple(row) for row in rows])
-    monkeypatch.setattr(
-        agent,
-        "retrieve_evidence",
-        lambda *_a, **_k: RetrievalDecision("no_relevant_information", (), None, 0),
-    )
-    monkeypatch.setattr(agent, "call_llm", lambda **_k: _noop_completion())
-
-    assert requested_trello_list("Which Trello tickets are still open?") == OPEN_LISTS
-    assert requested_trello_list("Which tickets are not done?") == OPEN_LISTS
-    assert requested_trello_list("Which Trello cards are open?") == OPEN_LISTS
-
-    response = agent.run_agent("Which Trello tickets are still open?")
-
-    assert response.status == "answered"
-    assert "Trello cards in Backlog:" in response.answer
-    assert "Trello cards in Doing:" in response.answer
-    assert "Trello cards in Review:" in response.answer
-    assert "Trello cards in Done:" not in response.answer
-    assert "Sample done card" not in response.answer
-    assert "Sample backlog card" in response.answer
-    assert "Sample doing card" in response.answer
-    assert "Sample review card" in response.answer
-
-
-@pytest.mark.unit
-def test_trello_board_link_is_derived_and_not_an_invite(
-    monkeypatch: pytest.MonkeyPatch, quiet_model: None
-) -> None:
-    row = _row(
-        "Doing",
-        "Sample card",
-        "board",
-        5,
-        chunk_text=(
-            "Card: Sample card\n"
-            f"Board URL: {_BOARD}\n"
-            f"Invite: {_INVITE}\n"
-        ),
-    )
-    monkeypatch.setattr(agent, "trello_card_rows", lambda: [_as_tuple(row)])
-    monkeypatch.setattr(
-        agent,
-        "retrieve_evidence",
-        lambda *_a, **_k: RetrievalDecision("no_relevant_information", (), None, 0),
-    )
-    monkeypatch.setattr(agent, "call_llm", lambda **_k: _noop_completion())
-
-    response = agent.run_agent("link our trello board")
-    rendered = response.model_dump_json()
-
-    assert response.status == "answered"
-    assert response.answer == f"The Trello board is {_BOARD}."
-    assert "ATTI" not in rendered
-    assert "/invite/" not in rendered
-    assert _BOARD in response.citations[0].quote
-
-
-@pytest.mark.unit
 def test_invite_only_rows_become_the_canonical_board_url() -> None:
     row = _row(
         "Backlog",
@@ -399,35 +328,6 @@ def test_backlog_list_fits_eleven_cards_and_caps_a_longer_list() -> None:
     assert "…and " in wide_response.answer
     assert wide_response.answer.endswith("more.")
     assert len(wide_response.citations) < 25
-
-
-@pytest.mark.unit
-def test_bare_list_follow_up_matches_an_indexed_list(
-    monkeypatch: pytest.MonkeyPatch, quiet_model: None
-) -> None:
-    doing = _row("Doing", "Sample doing card", "doing", 2)
-    backlog = _row("Backlog", "Sample backlog card", "back", 1)
-    monkeypatch.setattr(
-        agent, "trello_card_rows", lambda: [_as_tuple(doing), _as_tuple(backlog)]
-    )
-    monkeypatch.setattr(agent, "call_llm", lambda **_kwargs: _noop_completion())
-    monkeypatch.setattr(
-        agent,
-        "retrieve_evidence",
-        lambda *_a, **_k: RetrievalDecision("no_relevant_information", (), None, 0),
-    )
-
-    response = agent.run_agent(
-        "In doing state?",
-        thread_question="Which Trello tickets are still open?",
-    )
-
-    assert response.status == "answered"
-    assert "Sample doing card" in response.answer
-    assert "Sample backlog card" not in response.answer
-    assert thread_question_for(
-        "In doing state?", "Which Trello tickets are still open?"
-    ) == "Which Trello tickets are still open?"
 
 
 @pytest.mark.unit
@@ -551,37 +451,6 @@ _STEPS = (
 
 
 @pytest.mark.unit
-def test_board_link_uses_another_chunk_when_cards_only_have_card_urls(
-    monkeypatch: pytest.MonkeyPatch, quiet_model: None
-) -> None:
-    row = _row("Doing", "Sample card", "card", 8, url="https://trello.com/c/card")
-    note = "Board link - https://trello.com/b/tIvVZqio/bmtech-general-board"
-    monkeypatch.setattr(agent, "trello_card_rows", lambda: [_as_tuple(row)])
-    monkeypatch.setattr(
-        agent,
-        "board_url_chunk_rows",
-        lambda limit=8: [(90, "discord-sample.json", "d" * 64, note)],
-    )
-    monkeypatch.setattr(
-        agent,
-        "retrieve_evidence",
-        lambda *_a, **_k: RetrievalDecision("no_relevant_information", (), None, 0),
-    )
-    monkeypatch.setattr(agent, "call_llm", lambda **_k: _noop_completion())
-
-    response = agent.run_agent("link our trello board")
-    rendered = response.model_dump_json()
-
-    assert response.status == "answered"
-    assert response.answer == f"The Trello board is {_BOARD}."
-    assert response.citations[0].quote == note
-    assert "trello/tIvVZqio/" in row.source_file
-    assert "ATTI" not in rendered
-    assert "/invite/" not in rendered
-    assert "https://trello.com/c/" not in response.answer
-
-
-@pytest.mark.unit
 def test_projects_question_returns_excerpts_without_work_or_bmtech_words(
     monkeypatch: pytest.MonkeyPatch, quiet_model: None
 ) -> None:
@@ -681,33 +550,6 @@ def test_status_excerpts_drop_extra_list_markers_and_join_card_headers(
     assert "Board: Sample Board / List: Doing" in response.answer
 
 
-@pytest.mark.unit
-def test_open_trello_answer_prefixes_a_per_list_count(
-    monkeypatch: pytest.MonkeyPatch, quiet_model: None
-) -> None:
-    rows = [
-        _row("Backlog", f"Sample backlog {index}", f"b{index}", index + 1) for index in range(2)
-    ]
-    rows.append(_row("Doing", "Sample doing card", "doing", 20))
-    rows.extend(_row("Sev 1", f"Sample sev {index}", f"s{index}", 30 + index) for index in range(3))
-    rows.append(_row("Done", "Sample done card", "done", 40))
-    monkeypatch.setattr(agent, "trello_card_rows", lambda: [_as_tuple(row) for row in rows])
-    monkeypatch.setattr(
-        agent,
-        "retrieve_evidence",
-        lambda *_a, **_k: RetrievalDecision("no_relevant_information", (), None, 0),
-    )
-    monkeypatch.setattr(agent, "call_llm", lambda **_k: _noop_completion())
-
-    response = agent.run_agent("Which Trello tickets are still open?")
-    rendered = format_discord_answer(response)
-
-    assert response.answer.splitlines()[0] == "Backlog 2, Doing 1, Sev 1 3"
-    assert "Done" not in response.answer.splitlines()[0]
-    assert "Sample done card" not in response.answer
-    assert len(rendered) <= DISCORD_MESSAGE_LIMIT
-
-
 _PAGE = """\
 1. Open the section the page belongs in, e.g.
 Guide or Projects.
@@ -798,90 +640,6 @@ def test_add_page_procedure_keeps_examples_and_table_fields(
     assert "[!NOTE]" not in response.answer
     assert " > " not in response.answer
     assert "Note: Raw HTML is rejected." in response.answer
-
-
-@pytest.mark.unit
-def test_project_status_reports_the_matching_card_list_and_link(
-    monkeypatch: pytest.MonkeyPatch, quiet_model: None
-) -> None:
-    title = "MVP definition and setting a timeline for the smart kiosk and cli-tool projects"
-    card = _row("Doing", title, "mvp", 70)
-    other = _row("Backlog", "Sample cafeteria refresh", "cafe", 71)
-    monkeypatch.setattr(agent, "trello_card_rows", lambda: [_as_tuple(card), _as_tuple(other)])
-    monkeypatch.setattr(agent, "call_llm", lambda **_k: _noop_completion())
-    monkeypatch.setattr(
-        agent,
-        "retrieve_evidence",
-        lambda *_a, **_k: RetrievalDecision("no_relevant_information", (), None, 0),
-    )
-
-    response = agent.run_agent("Current status of the smart kiosk project?")
-
-    assert response.status == "answered"
-    assert title in response.answer
-    assert "Doing" in response.answer
-    assert "https://trello.com/c/mvp" in response.answer
-    assert "cafeteria" not in response.answer.casefold()
-    assert "does not address" not in response.answer.casefold()
-    assert "- -" not in response.answer
-
-
-@pytest.mark.unit
-def test_working_on_projects_lists_doing_as_active_and_backlog_as_planned(
-    monkeypatch: pytest.MonkeyPatch, quiet_model: None
-) -> None:
-    doing_bot = _row(
-        "Doing",
-        "Discord bot hooked into RAG",
-        "bot",
-        82,
-        chunk_text=(
-            "Card: Discord bot hooked into RAG\n"
-            "List: Doing\n"
-            "URL: https://trello.com/c/bot\n"
-            "\n"
-            "The bot answers company questions from retrieved notes."
-        ),
-    )
-    doing_kiosk = _row(
-        "Doing",
-        "MVP definition for the smart kiosk and cli-tool projects",
-        "mvp2",
-        83,
-    )
-    planned = _row("Backlog", "Phase 2 portfolio projects", "phase", 84)
-    chore = _row("Backlog", "Order sticky notes", "notes", 85)
-    monkeypatch.setattr(
-        agent,
-        "trello_card_rows",
-        lambda: [_as_tuple(card) for card in (doing_bot, doing_kiosk, planned, chore)],
-    )
-    monkeypatch.setattr(agent, "call_llm", lambda **_k: _noop_completion())
-    monkeypatch.setattr(
-        agent,
-        "retrieve_evidence",
-        lambda *_a, **_k: RetrievalDecision("no_relevant_information", (), None, 0),
-    )
-
-    response = agent.run_agent("What projects is BMTech working on?")
-
-    assert response.status == "answered"
-    active_at = response.answer.index("Active work:")
-    planned_at = response.answer.index("Backlog (planned), not active:")
-    assert active_at < planned_at
-    assert "Discord bot hooked into RAG" in response.answer
-    assert "smart kiosk and cli-tool" in response.answer
-    assert "Doing (active)" in response.answer
-    assert "Phase 2 portfolio projects" in response.answer
-    assert "Backlog (planned)" in response.answer
-    assert "not active" in response.answer.casefold()
-    assert "sticky" not in response.answer.casefold()
-    assert "current" not in response.answer.casefold()
-    assert "- Card:" not in response.answer
-    cited = {citation.quote for citation in response.citations}
-    assert "Card: Discord bot hooked into RAG" in cited
-    assert "Card: Phase 2 portfolio projects" in cited
-    assert "Card: Order sticky notes" not in cited
 
 
 @pytest.mark.unit
