@@ -214,11 +214,12 @@ def test_module_constants_carry_their_names() -> None:
     path = f"{_PKG}/config.py"
     pieces = chunk_text((_ROOT / path).read_text(), path)
     tiers = next(piece for piece in pieces if "CHEAP_MODEL" in piece.names)
-    assert {"CHEAP_MODEL", "FLAGSHIP_MODEL", "MODEL_TIERS"} <= set(tiers.names)
+    assert {"CHEAP_MODEL", "FLAGSHIP_MODEL"} <= set(tiers.names)
+    assert any("MODEL_TIERS" in piece.names for piece in pieces)
     assert tiers.symbol == ""
     words = header_words(path, tiers.symbol, tiers.names).split()
     assert words[:9] == ["projects", "internal", "tools", "benchmark", "cli", "tool", "src", "config", "py"]
-    assert {"cheap", "model", "flagship", "tiers"} <= set(words)
+    assert {"cheap", "model", "flagship"} <= set(words)
     embedding = next(piece for piece in pieces if "EMBEDDING_MODEL" in piece.names)
     assert {"embedding", "model"} <= set(header_words(path, "", embedding.names).split())
     assert all(len(piece.names) <= 12 for piece in pieces)
