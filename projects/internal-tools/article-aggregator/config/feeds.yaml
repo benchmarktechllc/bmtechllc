@@ -1,0 +1,31 @@
+# RSS/Atom feeds polled for the digest: high-signal AI and agentic engineering sources.
+# Edit through a pull request. URLs checked with a live dry run on 2026-11-18.
+- name: Hugging Face Blog
+  url: https://huggingface.co/blog/feed.xml
+- name: LangChain Blog
+  url: https://www.langchain.com/blog/rss.xml
+  # Publishes several agent-heavy posts a day; took 6 of 10 slots uncapped.
+  max_per_digest: 3
+- name: Anthropic News (unofficial mirror)
+  # Anthropic publishes no RSS feed. This is a community-scraped mirror (github.com/Olshansk/rss-feeds):
+  # it can lag by days or stop updating, and its content is not controlled by Anthropic.
+  url: https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_anthropic_news.xml
+- name: OpenAI News
+  url: https://openai.com/news/rss.xml
+- name: Google DeepMind Blog
+  url: https://deepmind.google/blog/rss.xml
+- name: Lil'Log (Lilian Weng)
+  url: https://lilianweng.github.io/index.xml
+- name: Microsoft Research
+  url: https://www.microsoft.com/en-us/research/feed/
+- name: InfoQ AI, ML & Data Engineering
+  url: https://feed.infoq.com/ai-ml-data-eng/news/
+- name: TechCrunch AI
+  url: https://techcrunch.com/category/artificial-intelligence/feed/
+  # "agents" appears in most AI funding stories; cap so engineering content gets the slots.
+  max_per_digest: 2
+- name: arXiv cs.AI
+  # export.arxiv.org is arXiv's host for automated clients.
+  url: https://export.arxiv.org/rss/cs.AI
+  # Hundreds of keyword-dense abstracts a day; without a cap it fills every slot.
+  max_per_digest: 2

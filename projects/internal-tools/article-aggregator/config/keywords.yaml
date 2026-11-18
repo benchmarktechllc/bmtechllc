@@ -1,0 +1,22 @@
+# Case-insensitive whole words or phrases matched against title + RSS summary.
+# Whole-word means "agent" does not match "agents": list plural forms explicitly if wanted.
+- agent
+- agents
+- agentic
+- multi-agent
+- autonomous
+- tool use
+- function calling
+- mcp
+- model context protocol
+- langgraph
+- crewai
+- autogen
+- orchestration
+- reasoning
+- swarm
+- swarms
+- llama_index
+- llamaindex
+- vector database
+- vector db

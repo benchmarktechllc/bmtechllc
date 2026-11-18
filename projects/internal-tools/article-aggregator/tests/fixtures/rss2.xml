@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Example Security News</title>
+    <link>https://news.example.com/</link>
+    <description>Fixture feed</description>
+    <item>
+      <title>Hospital hit by ransomware attack</title>
+      <link>https://news.example.com/2026/11/hospital-ransomware?utm_source=rss</link>
+      <guid isPermaLink="false">example-1001</guid>
+      <pubDate>Wed, 18 Nov 2026 04:00:00 GMT</pubDate>
+      <description><![CDATA[<p>A regional hospital &amp; clinic network said a <b>ransomware</b> gang encrypted its systems.</p><script>alert(1)</script>]]></description>
+    </item>
+    <item>
+      <title>Vendor patches Zero  Day in VPN appliance</title>
+      <link>https://news.example.com/2026/11/vpn-zero-day</link>
+      <guid>https://news.example.com/2026/11/vpn-zero-day</guid>
+      <pubDate>Tue, 17 Nov 2026 10:00:00 GMT</pubDate>
+      <description>Attackers exploited the flaw before a fix shipped.</description>
+    </item>
+    <item>
+      <title>Old story about a data breach</title>
+      <link>https://news.example.com/2026/10/old-breach</link>
+      <pubDate>Mon, 02 Nov 2026 09:00:00 GMT</pubDate>
+      <description>This is older than 24 hours.</description>
+    </item>
+    <item>
+      <title>Undated item mentioning ransomware</title>
+      <link>https://news.example.com/undated</link>
+      <description>No pubDate, so slice 1 skips it.</description>
+    </item>
+    <item>
+      <title>Chef said the new menu is great</title>
+      <link>https://news.example.com/2026/11/menu</link>
+      <pubDate>Wed, 18 Nov 2026 05:00:00 GMT</pubDate>
+      <description>Nothing to see here.</description>
+    </item>
+    <item>
+      <description>Item with no title or link is dropped.</description>
+    </item>
+  </channel>
+</rss>
