@@ -221,3 +221,30 @@ def test_non_pr_question_makes_no_github_calls(monkeypatch: pytest.MonkeyPatch) 
     agent.run_agent("What is the BMTech portal?")
     assert calls == []
     assert "github_live" not in _pack(seen["calls"][0])
+
+
+def _saved_match() -> Any:
+    from benchmark_cli.contributions import ContributionMatch
+
+    response = AnswerResponse(status="answered", answer="Not it has not.", confidence=1.0, citations=[])
+    return ContributionMatch(response=response, tier="exact", chunk_id=5, similarity=None)
+
+
+def test_live_status_outranks_saved_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = _install(monkeypatch, [_draft("Yes, approved.", status="no_relevant_information")])
+    monkeypatch.setattr(agent, "contribution_match", lambda *_a, **_k: _saved_match())
+    _stub_live(monkeypatch, agent)
+    result = agent.run_agent("Has PR 68 been approved yet?")
+    assert result.answer != "Not it has not."
+    assert seen["calls"] and "github_live" in _pack(seen["calls"][0])
+    assert seen.get("outcome") != "user_contributed"
+
+
+def test_saved_answer_shortcut_without_live_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = _install(monkeypatch, [_draft("model", status="no_relevant_information")])
+    monkeypatch.setattr(agent, "contribution_match", lambda *_a, **_k: _saved_match())
+    calls: list[str] = []
+    monkeypatch.setattr(github_live, "_get", _fake_api({}, calls))
+    result = agent.run_agent("Has the portal launched yet?")
+    assert result.answer == "Not it has not."
+    assert seen["calls"] == [] and calls == []

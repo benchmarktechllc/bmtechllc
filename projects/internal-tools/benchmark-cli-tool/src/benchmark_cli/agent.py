@@ -853,6 +853,12 @@ def run_agent(
         and not asks_for_synced_channels(question)
         and not asks_for_portal_link(question)
     )
+    # Live PR/issue status outranks a saved answer: those go stale (e.g. "not approved yet").
+    live_numbers = referenced_numbers(
+        " ".join([*(turn.text for turn in turns if turn.role == "user"), question])
+    )
+    live_chunks = live_status_chunks(live_numbers) if live_numbers else []
+
     match = (
         contribution_match(
             question, () if decision is None else decision.results, allow_paraphrase=paraphrase_ok
@@ -860,6 +866,8 @@ def run_agent(
         if standalone
         else None
     )
+    if live_chunks:
+        match = None
     count_decision: RetrievalDecision | None = None
     if match is None and standalone and asks_for_employee_count(question):
         count_decision = _with_phrase(decision, "employees")
@@ -958,11 +966,6 @@ def run_agent(
             pack["github_live"] = [chunk_entry(chunk, label="Live GitHub status") for chunk in live_chunks]
             evidence.update({chunk.id: chunk for chunk in live_chunks})
         return pack, evidence
-
-    live_numbers = referenced_numbers(
-        " ".join([*(turn.text for turn in turns if turn.role == "user"), question])
-    )
-    live_chunks = live_status_chunks(live_numbers) if live_numbers else []
 
     pack, evidence = _build(all_meeting)
     if not (rows or all_meeting or pack["saved_answers"] or pack["retrieved"] or live_chunks):
