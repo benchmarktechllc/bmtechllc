@@ -405,3 +405,29 @@ def test_code_lane_accepts_summary_line_quote(monkeypatch: pytest.MonkeyPatch) -
     assert cleaned is not None
     stored = cleaned.citations[0].quote
     assert stored in _summary(chunk.chunk_text) and "merged on 2026-11-19" in stored
+
+
+def _tiers_used(monkeypatch: pytest.MonkeyPatch, question: str, retrieval: CodeRetrieval) -> list[str]:
+    tiers: list[str] = []
+
+    def fake(**kwargs: Any) -> AnswerResponse:
+        tiers.append(kwargs["tier"])
+        return AnswerResponse(status="no_relevant_information", answer="", confidence=0.0, citations=[])
+
+    monkeypatch.setattr(github_answers, "call_llm_structured", fake)
+    answer_from_retrieval(question, retrieval)
+    return tiers
+
+
+def test_live_chunks_draft_on_synthesis_tier(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_live(monkeypatch, github_answers)
+    tiers = _tiers_used(monkeypatch, "Has PR 68 been approved yet?", CodeRetrieval(status="no_relevant_information"))
+    assert tiers == ["synthesis"]
+
+
+def test_non_live_code_answers_stay_on_cheap_tier(monkeypatch: pytest.MonkeyPatch) -> None:
+    from test_github_code_answers import _github_chunk
+
+    retrieval = CodeRetrieval(status="accepted", chunks=(_github_chunk(),), ranking=())
+    tiers = _tiers_used(monkeypatch, "Where is the sync code?", retrieval)
+    assert tiers == ["cheap"]

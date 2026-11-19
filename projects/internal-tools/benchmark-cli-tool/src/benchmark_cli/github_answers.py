@@ -14,6 +14,7 @@ import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import Any
 
 from .config import MIN_COSINE_SIMILARITY
@@ -515,11 +516,11 @@ def code_messages(question: str, chunks: Sequence[SearchChunk]) -> list[dict[str
     ]
 
 
-def draft_code_answer(messages: list[dict[str, Any]]) -> AnswerResponse | None:
-    """One cheap structured call. Provider failures become None (quota is re-raised)."""
+def draft_code_answer(messages: list[dict[str, Any]], tier: str = "cheap") -> AnswerResponse | None:
+    """One structured call (cheap tier by default). Provider failures become None (quota is re-raised)."""
     try:
         return call_llm_structured(
-            tier="cheap", messages=messages, response_schema=AnswerResponse, component="code_answer"
+            tier=tier, messages=messages, response_schema=AnswerResponse, component="code_answer"
         )
     except ModelQuotaError:
         raise
@@ -713,6 +714,8 @@ def answer_from_retrieval(
         return CodeAnswer(_no_information(), "code_abstained", 0, ("no indexed pull requests",))
     live = _live_chunks(question)
     if live:
+        if draft is draft_code_answer:
+            draft = partial(draft_code_answer, tier="synthesis")
         retrieval = replace(
             retrieval,
             status="accepted",
