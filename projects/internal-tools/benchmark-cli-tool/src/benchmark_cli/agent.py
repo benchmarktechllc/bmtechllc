@@ -20,6 +20,7 @@ from .context_pack import (
     Turn,
     budgeted_meeting_chunks,
     card_entry,
+    chunk_entry,
     clean_history,
     compact_board,
     conversation_messages,
@@ -29,6 +30,7 @@ from .context_pack import (
 )
 from .contributions import contribution_match
 from .github_answers import answer_code_question, is_code_question
+from .github_live import live_line_quote, live_status_chunks, referenced_numbers
 from .grounding import (
     ANSWER_PATH_REVISION,
     SyncedDiscordChannel,
@@ -117,6 +119,9 @@ from the transcript". Follow such an instruction by leaving that source out of y
   the given date.
 - retrieved: knowledge-base pages, chat, other transcripts, and policy documents.
 - code: repository files, when present.
+- github_live: live status chunks for pull requests and issues named in the conversation.
+  They are current and authoritative for state, reviews, merge and checks; prefer them
+  over older indexed pull request chunks.
 When sources differ, say so; do not hide the conflict. Prefer current structured data over
 old chat messages and say when a note is dated.
 
@@ -646,6 +651,8 @@ def _canonical_citations(
         if not chunk.content_sha256:
             continue
         exact = _exact_quote_variant(item.quote, chunk.chunk_text)
+        if (exact is None or not exact.strip()) and chunk.metadata.get("live"):
+            exact = live_line_quote(item.quote, chunk.chunk_text)
         if exact is None or not exact.strip():
             exact = _closest_line(item.quote, chunk.chunk_text)
         if exact is None or not exact.strip():
@@ -848,6 +855,12 @@ def run_agent(
         and not asks_for_synced_channels(question)
         and not asks_for_portal_link(question)
     )
+    # Live PR/issue status outranks a saved answer: those go stale (e.g. "not approved yet").
+    live_numbers = referenced_numbers(
+        " ".join([*(turn.text for turn in turns if turn.role == "user"), question])
+    )
+    live_chunks = live_status_chunks(live_numbers) if live_numbers else []
+
     match = (
         contribution_match(
             question, () if decision is None else decision.results, allow_paraphrase=paraphrase_ok
@@ -855,6 +868,8 @@ def run_agent(
         if standalone
         else None
     )
+    if live_chunks:
+        match = None
     count_decision: RetrievalDecision | None = None
     if match is None and standalone and asks_for_employee_count(question):
         count_decision = _with_phrase(decision, "employees")
@@ -949,10 +964,13 @@ def run_agent(
             }
         evidence = _context_evidence(decision, rows)
         evidence.update({chunk.id: chunk for chunk in meeting})
+        if live_chunks:
+            pack["github_live"] = [chunk_entry(chunk, label="Live GitHub status") for chunk in live_chunks]
+            evidence.update({chunk.id: chunk for chunk in live_chunks})
         return pack, evidence
 
     pack, evidence = _build(all_meeting)
-    if not (rows or all_meeting or pack["saved_answers"] or pack["retrieved"]):
+    if not (rows or all_meeting or pack["saved_answers"] or pack["retrieved"] or live_chunks):
         _log_retrieval("retrieval_rejected", decision)
         return _finish(_no_information(), outcome="retrieval_rejected", synthesis_attempts=0)
     _log_retrieval("model", decision)
