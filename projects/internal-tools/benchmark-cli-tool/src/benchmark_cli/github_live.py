@@ -71,6 +71,7 @@ def _pull_status(repo: str, number: int, pull: dict[str, Any]) -> dict[str, Any]
         "merged_at": pull.get("merged_at"),
         "merged_by": _login(pull.get("merged_by")),
         "created_at": pull.get("created_at"),
+        "closed_at": pull.get("closed_at"),
         "updated_at": pull.get("updated_at"),
         "draft": bool(pull.get("draft")),
         "requested_reviewers": [_login(item) for item in pull.get("requested_reviewers") or []],
@@ -167,7 +168,7 @@ def _summary_line(status: dict[str, Any]) -> str:
         by = f" by {status['merged_by']}" if status.get("merged_by") else ""
         head = f"PR #{number} merged on {_day(status.get('merged_at'))}{by}"
     elif status["state"] == "closed":
-        head = f"PR #{number} closed without merging on {_day(status.get('updated_at'))}"
+        head = f"PR #{number} closed without merging on {_day(status.get('closed_at') or status.get('updated_at'))}"
     else:
         head = f"PR #{number} {status['state']}{' draft' if status['draft'] else ''}"
     parts = [head]

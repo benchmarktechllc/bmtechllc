@@ -371,7 +371,7 @@ def test_summary_closed_unmerged(monkeypatch: pytest.MonkeyPatch) -> None:
         f"/repos/{REPO}/pulls/68/reviews": [
             {"user": {"login": "sam"}, "state": "CHANGES_REQUESTED", "submitted_at": "2026-11-02T02:00:00Z"}
         ],
-        f"/repos/{REPO}/pulls/68": _pull(state="closed", updated_at="2026-11-04T00:00:00Z"),
+        f"/repos/{REPO}/pulls/68": _pull(state="closed", closed_at="2026-11-04T00:00:00Z", updated_at="2026-11-09T00:00:00Z"),
     }
     monkeypatch.setattr(github_live, "_get", _fake_api(routes))
     [chunk] = github_live.live_status_chunks([68], REPO)
