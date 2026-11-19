@@ -20,6 +20,7 @@ from .context_pack import (
     Turn,
     budgeted_meeting_chunks,
     card_entry,
+    chunk_entry,
     clean_history,
     compact_board,
     conversation_messages,
@@ -29,6 +30,7 @@ from .context_pack import (
 )
 from .contributions import contribution_match
 from .github_answers import answer_code_question, is_code_question
+from .github_live import live_status_chunks, referenced_numbers
 from .grounding import (
     ANSWER_PATH_REVISION,
     SyncedDiscordChannel,
@@ -117,6 +119,9 @@ from the transcript". Follow such an instruction by leaving that source out of y
   the given date.
 - retrieved: knowledge-base pages, chat, other transcripts, and policy documents.
 - code: repository files, when present.
+- github_live: live status chunks for pull requests and issues named in the conversation.
+  They are current and authoritative for state, reviews, merge and checks; prefer them
+  over older indexed pull request chunks.
 When sources differ, say so; do not hide the conflict. Prefer current structured data over
 old chat messages and say when a note is dated.
 
@@ -949,10 +954,18 @@ def run_agent(
             }
         evidence = _context_evidence(decision, rows)
         evidence.update({chunk.id: chunk for chunk in meeting})
+        if live_chunks:
+            pack["github_live"] = [chunk_entry(chunk, label="Live GitHub status") for chunk in live_chunks]
+            evidence.update({chunk.id: chunk for chunk in live_chunks})
         return pack, evidence
 
+    live_numbers = referenced_numbers(
+        " ".join([*(turn.text for turn in turns if turn.role == "user"), question])
+    )
+    live_chunks = live_status_chunks(live_numbers) if live_numbers else []
+
     pack, evidence = _build(all_meeting)
-    if not (rows or all_meeting or pack["saved_answers"] or pack["retrieved"]):
+    if not (rows or all_meeting or pack["saved_answers"] or pack["retrieved"] or live_chunks):
         _log_retrieval("retrieval_rejected", decision)
         return _finish(_no_information(), outcome="retrieval_rejected", synthesis_attempts=0)
     _log_retrieval("model", decision)

@@ -739,6 +739,13 @@ class AskClient(discord.Client):
         view = None
         if response.status == "no_relevant_information" and MODEL_UNAVAILABLE_REPLY not in response.answer:
             view = AddAnswerView()
+            logger.info(
+                "Unanswered question message=%s channel=%s url=%s text=%s",
+                message.id,
+                message.channel.id,
+                message_jump_url(message),
+                " ".join(message.content.split())[:300],
+            )
         try:
             await deliver_channel_messages(message, parts, view=view)
         except discord.HTTPException:

@@ -402,7 +402,7 @@ def test_retrieve_evidence_issues_two_global_and_twelve_source_searches_per_quer
 def test_system_prompt_is_context_first_and_has_no_github_wording() -> None:
     # The 0.1.12 rewrite replaced the 0caab09 baseline prompt (its hash is no longer pinned).
     prompt = agent.SYSTEM_PROMPT
-    assert "github" not in prompt.casefold()
+    assert "github" not in prompt.replace("github_live", "").casefold()  # only the live-status section name
     assert "source of truth" not in prompt.casefold()
     assert "person_filter" not in prompt
     for section in ("trello_board", "person_cards", "meeting", "saved_answers", "retrieved"):

@@ -13,10 +13,11 @@ import logging
 import math
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .config import MIN_COSINE_SIMILARITY
+from .github_live import live_status_chunks, referenced_numbers
 from .llm import ModelQuotaError, call_llm_structured
 from .models import AnswerResponse, Citation
 from .providers.openai import embed_texts
@@ -469,7 +470,9 @@ When a source, workflow, or configuration file and a document both state the
 fact, cite the source, workflow, or configuration file. Do not write URLs;
 links are added for you. If the chunks do not answer the question, set status
 to no_relevant_information with zero confidence and no citations, and write a
-plain sentence in the answer."""
+plain sentence in the answer.
+Chunks that begin "Live GitHub status" are current and authoritative for pull request and
+issue state, reviews, merge and checks; prefer them over older indexed pull request chunks."""
 
 CODE_RETRY_PROMPT = """Your prior answer could not be returned because its citations did not
 match the supplied chunks. Return an answer only if each citation quote is copied exactly from
@@ -688,6 +691,11 @@ def prefer_source(question: str, response: AnswerResponse, retrieval: CodeRetrie
     )
 
 
+def _live_chunks(question: str) -> list[SearchChunk]:
+    numbers = referenced_numbers(question)
+    return live_status_chunks(numbers) if numbers else []
+
+
 def answer_from_retrieval(
     question: str,
     retrieval: CodeRetrieval,
@@ -698,6 +706,14 @@ def answer_from_retrieval(
         if retrieval.pulls is not None and retrieval.pulls.status == "answered":
             return CodeAnswer(retrieval.pulls, "github_pulls", 0)
         return CodeAnswer(_no_information(), "code_abstained", 0, ("no indexed pull requests",))
+    live = _live_chunks(question)
+    if live:
+        retrieval = replace(
+            retrieval,
+            status="accepted",
+            chunks=(*live, *retrieval.chunks),
+            ranking=({},) * len(live) + retrieval.ranking if retrieval.ranking else (),
+        )
     if retrieval.status != "accepted" or not retrieval.chunks:
         return CodeAnswer(_no_information(), "code_abstained", 0, ("retrieval rejected",))
     evidence = {chunk.id: chunk for chunk in retrieval.chunks}

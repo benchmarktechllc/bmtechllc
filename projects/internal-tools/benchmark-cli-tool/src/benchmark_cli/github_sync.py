@@ -347,9 +347,9 @@ def _fit(text: str) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _get_json(url: str, headers: dict[str, str]) -> Any:
+def _get_json(url: str, headers: dict[str, str], timeout: float = 30) -> Any:
     request = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
