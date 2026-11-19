@@ -71,6 +71,7 @@ def _pull_status(repo: str, number: int, pull: dict[str, Any]) -> dict[str, Any]
         "merged_at": pull.get("merged_at"),
         "merged_by": _login(pull.get("merged_by")),
         "created_at": pull.get("created_at"),
+        "closed_at": pull.get("closed_at"),
         "updated_at": pull.get("updated_at"),
         "draft": bool(pull.get("draft")),
         "requested_reviewers": [_login(item) for item in pull.get("requested_reviewers") or []],
@@ -151,12 +152,43 @@ def _state_line(status: dict[str, Any]) -> str:
     return f"{status['state']}{' (draft)' if status['draft'] else ''}"
 
 
+def _day(value: Any) -> str:
+    return str(value or "")[:10] or "unknown date"
+
+
+def _summary_line(status: dict[str, Any]) -> str:
+    number = status["number"]
+    if status["kind"] == "issue":
+        day = f" on {_day(status.get('closed_at'))}" if status["state"] == "closed" else ""
+        return f"Summary: Issue #{number} {status['state']}{day}; state {status['state']}"
+    reviews = status.get("reviews") or []
+    approved = [item["user"] for item in reviews if item.get("state") == "APPROVED"]
+    changes = [item["user"] for item in reviews if item.get("state") == "CHANGES_REQUESTED"]
+    if status["merged"]:
+        by = f" by {status['merged_by']}" if status.get("merged_by") else ""
+        head = f"PR #{number} merged on {_day(status.get('merged_at'))}{by}"
+    elif status["state"] == "closed":
+        head = f"PR #{number} closed without merging on {_day(status.get('closed_at') or status.get('updated_at'))}"
+    else:
+        head = f"PR #{number} {status['state']}{' draft' if status['draft'] else ''}"
+    parts = [head]
+    if approved:
+        parts.append(f"approved by {', '.join(approved)}")
+    if changes:
+        parts.append(f"changes requested by {', '.join(changes)}")
+    if not approved and not changes:
+        parts.append("no approvals")
+    parts.append(f"state {status['state']}")
+    return "Summary: " + "; ".join(parts)
+
+
 def format_status(status: dict[str, Any], fetched_at: str) -> str:
     """One fact per line; the core facts are adjacent so a quote of them is contiguous."""
     number = status["number"]
     kind = "Issue" if status["kind"] == "issue" else "Pull request"
     lines = [
         f"{kind} #{number}: {status['title']}",
+        _summary_line(status),
         f"URL: {status['url']}",
         f"Author: {status['author'] or 'unknown'}",
         f"State: {_state_line(status)}",

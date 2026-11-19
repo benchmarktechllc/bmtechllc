@@ -14,6 +14,7 @@ import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import Any
 
 from .config import MIN_COSINE_SIMILARITY
@@ -472,7 +473,8 @@ links are added for you. If the chunks do not answer the question, set status
 to no_relevant_information with zero confidence and no citations, and write a
 plain sentence in the answer.
 Chunks whose last line says "Live GitHub status fetched" are current and authoritative for pull request and
-issue state, reviews, merge and checks; prefer them over older indexed pull request chunks."""
+issue state, reviews, merge and checks; prefer them over older indexed pull request chunks.
+For a question about a pull request or issue, answer what was asked and also give its overall state (merged with date, closed, or open) from the Summary line of its live status chunk, citing that Summary line; for example: Yes, PR #N was approved by X, and it was merged on <date>."""
 
 CODE_RETRY_PROMPT = """Your prior answer could not be returned because its citations did not
 match the supplied chunks. Return an answer only if each citation quote is copied exactly from
@@ -514,11 +516,11 @@ def code_messages(question: str, chunks: Sequence[SearchChunk]) -> list[dict[str
     ]
 
 
-def draft_code_answer(messages: list[dict[str, Any]]) -> AnswerResponse | None:
-    """One cheap structured call. Provider failures become None (quota is re-raised)."""
+def draft_code_answer(messages: list[dict[str, Any]], tier: str = "cheap") -> AnswerResponse | None:
+    """One structured call (cheap tier by default). Provider failures become None (quota is re-raised)."""
     try:
         return call_llm_structured(
-            tier="cheap", messages=messages, response_schema=AnswerResponse, component="code_answer"
+            tier=tier, messages=messages, response_schema=AnswerResponse, component="code_answer"
         )
     except ModelQuotaError:
         raise
@@ -712,6 +714,8 @@ def answer_from_retrieval(
         return CodeAnswer(_no_information(), "code_abstained", 0, ("no indexed pull requests",))
     live = _live_chunks(question)
     if live:
+        if draft is draft_code_answer:
+            draft = partial(draft_code_answer, tier="synthesis")
         retrieval = replace(
             retrieval,
             status="accepted",
