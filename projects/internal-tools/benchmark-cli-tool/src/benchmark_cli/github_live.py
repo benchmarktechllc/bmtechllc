@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Citation requires chunk_id > 0; this base sits far above every database id sequence.
 LIVE_ID_BASE = 9_000_000_000_000
+LIVE_MARKER = "Live GitHub status fetched"
 MAX_NUMBERS = 3
 CACHE_SECONDS = 120.0
 TIMEOUT_SECONDS = 5
@@ -151,39 +152,66 @@ def _state_line(status: dict[str, Any]) -> str:
 
 
 def format_status(status: dict[str, Any], fetched_at: str) -> str:
+    """One fact per line; the core facts are adjacent so a quote of them is contiguous."""
     number = status["number"]
+    kind = "Issue" if status["kind"] == "issue" else "Pull request"
     lines = [
-        f"Live GitHub status (fetched {fetched_at}) for {status['kind']} #{number}: {status['title']}",
+        f"{kind} #{number}: {status['title']}",
         f"URL: {status['url']}",
         f"Author: {status['author'] or 'unknown'}",
         f"State: {_state_line(status)}",
-        f"Created: {status.get('created_at')}  Updated: {status.get('updated_at')}",
     ]
     if status["kind"] == "issue":
         lines.append(f"Labels: {', '.join(status['labels']) or 'none'}")
         lines.append(f"Assignees: {', '.join(status['assignees']) or 'none'}")
-        return "\n".join(lines) + "\n"
-    reviews = status.get("reviews")
-    if reviews is None:
-        lines.append("Reviews: unavailable")
-    elif not reviews:
-        lines.append("Reviews: none")
     else:
-        lines.append(
-            "Reviews: " + "; ".join(f"{item['user']}: {item['state']} at {item['at']}" for item in reviews)
-        )
-    if status.get("requested_reviewers"):
-        lines.append(f"Review requested from: {', '.join(status['requested_reviewers'])}")
-    checks = status.get("checks")
-    if checks is None:
-        lines.append("Checks: unavailable")
-    elif not checks["counts"]:
-        lines.append("Checks: none")
-    else:
-        lines.append("Checks: " + ", ".join(f"{count} {name}" for name, count in sorted(checks["counts"].items())))
-        if checks["failing"]:
-            lines.append(f"Failing checks: {', '.join(checks['failing'])}")
+        reviews = status.get("reviews")
+        if reviews is None:
+            lines.append("Reviews: unavailable")
+        elif not reviews:
+            lines.append("Reviews: none")
+        else:
+            lines.append(
+                "Reviews: " + "; ".join(f"{item['user']}: {item['state']} at {item['at']}" for item in reviews)
+            )
+        if status.get("requested_reviewers"):
+            lines.append(f"Requested reviewers: {', '.join(status['requested_reviewers'])}")
+        checks = status.get("checks")
+        if checks is None:
+            lines.append("Checks: unavailable")
+        elif not checks["counts"]:
+            lines.append("Checks: none")
+        else:
+            lines.append("Checks: " + ", ".join(f"{count} {name}" for name, count in sorted(checks["counts"].items())))
+            if checks["failing"]:
+                lines.append(f"Failing checks: {', '.join(checks['failing'])}")
+    lines.append(f"Created: {status.get('created_at')}")
+    lines.append(f"Updated: {status.get('updated_at')}")
+    lines.append(f"{LIVE_MARKER} {fetched_at}")
     return "\n".join(lines) + "\n"
+
+
+def live_line_quote(quote: str, chunk_text: str) -> str | None:
+    """Exact chunk text for a quote whose lines each sit inside some chunk line.
+
+    Only for live status chunks. Matching lines are rebuilt from the chunk in chunk order; when
+    they are not adjacent, the longest adjacent run is kept so the result is a chunk substring.
+    """
+    wanted = [line.strip() for line in quote.splitlines() if line.strip()]
+    chunk_lines = chunk_text.split("\n")
+    hits: set[int] = set()
+    for line in wanted:
+        index = next((i for i, text in enumerate(chunk_lines) if line in text), None)
+        if index is None:
+            return None
+        hits.add(index)
+    best: list[int] = []
+    run: list[int] = []
+    for index in sorted(hits):
+        run = [*run, index] if run and index == run[-1] + 1 else [index]
+        if len(run) > len(best):
+            best = run
+    return "\n".join(chunk_lines[i] for i in best) if best else None
 
 
 def live_status_chunks(numbers: list[int], repo: str = DEFAULT_REPO) -> list[SearchChunk]:

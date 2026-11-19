@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .config import MIN_COSINE_SIMILARITY
-from .github_live import live_status_chunks, referenced_numbers
+from .github_live import live_line_quote, live_status_chunks, referenced_numbers
 from .llm import ModelQuotaError, call_llm_structured
 from .models import AnswerResponse, Citation
 from .providers.openai import embed_texts
@@ -471,7 +471,7 @@ fact, cite the source, workflow, or configuration file. Do not write URLs;
 links are added for you. If the chunks do not answer the question, set status
 to no_relevant_information with zero confidence and no citations, and write a
 plain sentence in the answer.
-Chunks that begin "Live GitHub status" are current and authoritative for pull request and
+Chunks whose last line says "Live GitHub status fetched" are current and authoritative for pull request and
 issue state, reviews, merge and checks; prefer them over older indexed pull request chunks."""
 
 CODE_RETRY_PROMPT = """Your prior answer could not be returned because its citations did not
@@ -576,6 +576,10 @@ def validate_code_answer(
             continue
         ordered = [cited, *(chunk for chunk in chunks if chunk.id != cited.id)]
         match = _find_quote(citation.quote, ordered) or _find_quote(_unescape(citation.quote), ordered)
+        if match is None and cited.metadata.get("live"):
+            live = live_line_quote(_unescape(citation.quote), cited.chunk_text)
+            if live:
+                match = (cited, live)
         if match is None:
             line = _verbatim_line(_unescape(citation.quote), cited)
             if line is not None:

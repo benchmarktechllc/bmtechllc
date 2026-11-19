@@ -93,7 +93,8 @@ def test_approved_pull_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
     assert chunk.id == github_live.LIVE_ID_BASE + 68 and chunk.content_sha256
     assert chunk.metadata["url"] == f"https://github.com/{REPO}/pull/68"
     text = chunk.chunk_text
-    assert "Live GitHub status (fetched " in text and "pull request #68: Add widget" in text
+    assert text.startswith("Pull request #68: Add widget\n")
+    assert text.rstrip("\n").splitlines()[-1].startswith("Live GitHub status fetched 20")
     assert "Author: alex" in text and "State: open" in text
     assert "sam: APPROVED at 2026-11-02T02:00:00Z" in text and "COMMENTED" not in text
     assert "Checks: 1 failure, 1 success" in text and "Failing checks: tests" in text
@@ -128,7 +129,7 @@ def test_issue_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     }
     monkeypatch.setattr(github_live, "_get", _fake_api(routes))
     [chunk] = github_live.live_status_chunks([12], REPO)
-    assert "issue #12: Bug" in chunk.chunk_text and "closed at 2026-11-05" in chunk.chunk_text
+    assert "Issue #12: Bug" in chunk.chunk_text and "closed at 2026-11-05" in chunk.chunk_text
     assert "Labels: bug" in chunk.chunk_text and "Assignees: sam" in chunk.chunk_text
 
 
@@ -226,7 +227,7 @@ def test_non_pr_question_makes_no_github_calls(monkeypatch: pytest.MonkeyPatch) 
 def _saved_match() -> Any:
     from benchmark_cli.contributions import ContributionMatch
 
-    response = AnswerResponse(status="answered", answer="Not it has not.", confidence=1.0, citations=[])
+    response = AnswerResponse(status="answered", answer="Saved answer: not yet approved.", confidence=1.0, citations=[])
     return ContributionMatch(response=response, tier="exact", chunk_id=5, similarity=None)
 
 
@@ -235,7 +236,7 @@ def test_live_status_outranks_saved_answer(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(agent, "contribution_match", lambda *_a, **_k: _saved_match())
     _stub_live(monkeypatch, agent)
     result = agent.run_agent("Has PR 68 been approved yet?")
-    assert result.answer != "Not it has not."
+    assert result.answer != "Saved answer: not yet approved."
     assert seen["calls"] and "github_live" in _pack(seen["calls"][0])
     assert seen.get("outcome") != "user_contributed"
 
@@ -246,5 +247,94 @@ def test_saved_answer_shortcut_without_live_chunks(monkeypatch: pytest.MonkeyPat
     calls: list[str] = []
     monkeypatch.setattr(github_live, "_get", _fake_api({}, calls))
     result = agent.run_agent("Has the portal launched yet?")
-    assert result.answer == "Not it has not."
+    assert result.answer == "Saved answer: not yet approved."
     assert seen["calls"] == [] and calls == []
+
+
+def _live_chunk(monkeypatch: pytest.MonkeyPatch) -> Any:
+    monkeypatch.setattr(github_live, "_get", _fake_api(_approved_routes()))
+    return github_live.live_status_chunks([68], REPO)[0]
+
+
+def _code_validate(chunk: Any, quote: str) -> tuple[Any, list[str]]:
+    response = AnswerResponse(
+        status="answered",
+        answer="Alex opened it.",
+        confidence=0.9,
+        citations=[Citation(source_file="x", chunk_id=chunk.id, content_sha256="0" * 64, quote=quote)],
+    )
+    return github_answers.validate_code_answer(response, [chunk])
+
+
+def test_core_facts_are_contiguous(monkeypatch: pytest.MonkeyPatch) -> None:
+    text = _live_chunk(monkeypatch).chunk_text
+    assert "Author: alex\nState: open\nReviews: sam: APPROVED" in text
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        "Author: alex\nState: open\nReviews: sam",
+        "Pull request #68\nURL\nAuthor: alex",
+        "Pull request #68\\nAuthor: alex\\nState: open",
+    ],
+)
+def test_code_lane_accepts_line_wise_live_quotes(monkeypatch: pytest.MonkeyPatch, quote: str) -> None:
+    chunk = _live_chunk(monkeypatch)
+    cleaned, _ = _code_validate(chunk, quote)
+    assert cleaned is not None
+    stored = cleaned.citations[0].quote
+    assert stored in chunk.chunk_text and "Author: alex" in stored
+
+
+def test_live_quote_rewritten_to_exact_chunk_lines(monkeypatch: pytest.MonkeyPatch) -> None:
+    chunk = _live_chunk(monkeypatch)
+    cleaned, _ = _code_validate(chunk, "Author: alex\nState: open\nReviews: sam\nChecks: 1")
+    assert cleaned is not None
+    assert cleaned.citations[0].quote == (
+        "Author: alex\nState: open\nReviews: sam: APPROVED at 2026-11-02T02:00:00Z\nChecks: 1 failure, 1 success"
+    )
+
+
+def test_live_title_and_core_lines(monkeypatch: pytest.MonkeyPatch) -> None:
+    chunk = _live_chunk(monkeypatch)
+    cleaned, _ = _code_validate(chunk, "Pull request #68: Add widget\nAuthor: alex\nState: open")
+    assert cleaned is not None and cleaned.citations[0].quote in chunk.chunk_text
+
+
+def test_non_live_chunk_noncontiguous_quote_still_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    live = _live_chunk(monkeypatch)
+    plain = live.__class__(
+        id=5,
+        source_file="github/pulls/68",
+        chunk_index=0,
+        chunk_text=live.chunk_text,
+        metadata={"source_type": "github"},
+        score=1.0,
+        token_count=None,
+        content_sha256="a" * 64,
+    )
+    cleaned, reasons = _code_validate(plain, "Author: alex\nState: open\nReviews: sam\nChecks: 1")
+    assert cleaned is None and any("matches no lane chunk" in r for r in reasons)
+
+
+def test_agent_canonical_citations_accept_live_line_quote(monkeypatch: pytest.MonkeyPatch) -> None:
+    from benchmark_cli import agent
+
+    chunk = _live_chunk(monkeypatch)
+    draft = AnswerResponse(
+        status="answered",
+        answer="Open.",
+        confidence=0.9,
+        citations=[
+            Citation(
+                source_file=chunk.source_file,
+                chunk_id=chunk.id,
+                content_sha256=chunk.content_sha256,
+                quote="Author: alex\nState: open\nReviews: sam",
+            )
+        ],
+    )
+    result = agent._canonical_citations(draft, {chunk.id: chunk}, {})
+    assert result.citations and result.citations[0].quote in chunk.chunk_text
+    assert agent._citations_are_exact(result, {chunk.id: chunk})

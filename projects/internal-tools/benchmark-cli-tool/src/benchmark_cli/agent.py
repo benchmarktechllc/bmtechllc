@@ -30,7 +30,7 @@ from .context_pack import (
 )
 from .contributions import contribution_match
 from .github_answers import answer_code_question, is_code_question
-from .github_live import live_status_chunks, referenced_numbers
+from .github_live import live_line_quote, live_status_chunks, referenced_numbers
 from .grounding import (
     ANSWER_PATH_REVISION,
     SyncedDiscordChannel,
@@ -651,6 +651,8 @@ def _canonical_citations(
         if not chunk.content_sha256:
             continue
         exact = _exact_quote_variant(item.quote, chunk.chunk_text)
+        if (exact is None or not exact.strip()) and chunk.metadata.get("live"):
+            exact = live_line_quote(item.quote, chunk.chunk_text)
         if exact is None or not exact.strip():
             exact = _closest_line(item.quote, chunk.chunk_text)
         if exact is None or not exact.strip():
