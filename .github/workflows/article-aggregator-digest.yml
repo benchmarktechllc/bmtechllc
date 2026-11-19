@@ -1,0 +1,45 @@
+name: Article aggregator digest
+
+on:
+  schedule:
+    # Schedules use UTC: 05:53 UTC is 08:53 EAT. Avoid the top of the hour, when GitHub can delay jobs.
+    - cron: "53 5 * * *"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Channel to post to"
+        type: choice
+        options: [test, production]
+        default: test
+
+permissions:
+  contents: read
+
+concurrency:
+  group: article-aggregator-digest
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: projects/internal-tools/article-aggregator
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    environment: article-aggregator
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: projects/internal-tools/article-aggregator/pyproject.toml
+      - run: python -m pip install .
+      - run: article-aggregator digest --target "$TARGET"
+        env:
+          # Scheduled runs always post to production; manual runs default to the test channel.
+          TARGET: ${{ github.event_name == 'schedule' && 'production' || inputs.target }}
+          DISCORD_DIGEST_BOT_TOKEN: ${{ secrets.DISCORD_DIGEST_BOT_TOKEN }}
+          DISCORD_DIGEST_CHANNEL_ID: ${{ vars.DISCORD_DIGEST_CHANNEL_ID }}
+          DISCORD_DIGEST_TEST_CHANNEL_ID: ${{ vars.DISCORD_DIGEST_TEST_CHANNEL_ID }}
