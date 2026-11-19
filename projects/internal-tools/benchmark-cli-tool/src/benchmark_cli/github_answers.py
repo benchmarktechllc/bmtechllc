@@ -473,8 +473,7 @@ to no_relevant_information with zero confidence and no citations, and write a
 plain sentence in the answer.
 Chunks whose last line says "Live GitHub status fetched" are current and authoritative for pull request and
 issue state, reviews, merge and checks; prefer them over older indexed pull request chunks.
-When answering about a pull request or issue's status, reviews or approval, also state its overall state
-(merged, closed or open) from the live status summary line, alongside what was asked."""
+For a question about a pull request or issue, answer what was asked and also give its overall state (merged with date, closed, or open) from the Summary line of its live status chunk, citing that Summary line; for example: Yes, PR #N was approved by X, and it was merged on <date>."""
 
 CODE_RETRY_PROMPT = """Your prior answer could not be returned because its citations did not
 match the supplied chunks. Return an answer only if each citation quote is copied exactly from
