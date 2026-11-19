@@ -338,3 +338,70 @@ def test_agent_canonical_citations_accept_live_line_quote(monkeypatch: pytest.Mo
     result = agent._canonical_citations(draft, {chunk.id: chunk}, {})
     assert result.citations and result.citations[0].quote in chunk.chunk_text
     assert agent._citations_are_exact(result, {chunk.id: chunk})
+
+
+def _summary(text: str) -> str:
+    lines = text.splitlines()
+    assert lines[1].startswith("Summary: ")
+    return lines[1]
+
+
+def test_summary_merged_and_approved(monkeypatch: pytest.MonkeyPatch) -> None:
+    routes = _approved_routes()
+    routes[f"/repos/{REPO}/pulls/68"] = _pull(
+        state="closed", merged=True, merged_at="2026-11-19T10:00:00Z", merged_by={"login": "sam"}
+    )
+    monkeypatch.setattr(github_live, "_get", _fake_api(routes))
+    [chunk] = github_live.live_status_chunks([68], REPO)
+    assert _summary(chunk.chunk_text) == (
+        "Summary: PR #68 merged on 2026-11-19 by sam; approved by sam; state closed"
+    )
+    assert chunk.chunk_text.splitlines()[0].startswith("Pull request #68")
+
+
+def test_summary_open_without_reviews(monkeypatch: pytest.MonkeyPatch) -> None:
+    routes = {f"/repos/{REPO}/pulls/68/reviews": [], f"/repos/{REPO}/pulls/68": _pull(draft=True)}
+    monkeypatch.setattr(github_live, "_get", _fake_api(routes))
+    [chunk] = github_live.live_status_chunks([68], REPO)
+    assert _summary(chunk.chunk_text) == "Summary: PR #68 open draft; no approvals; state open"
+
+
+def test_summary_closed_unmerged(monkeypatch: pytest.MonkeyPatch) -> None:
+    routes = {
+        f"/repos/{REPO}/pulls/68/reviews": [
+            {"user": {"login": "sam"}, "state": "CHANGES_REQUESTED", "submitted_at": "2026-11-02T02:00:00Z"}
+        ],
+        f"/repos/{REPO}/pulls/68": _pull(state="closed", updated_at="2026-11-04T00:00:00Z"),
+    }
+    monkeypatch.setattr(github_live, "_get", _fake_api(routes))
+    [chunk] = github_live.live_status_chunks([68], REPO)
+    assert _summary(chunk.chunk_text) == (
+        "Summary: PR #68 closed without merging on 2026-11-04; changes requested by sam; state closed"
+    )
+
+
+def test_summary_issue(monkeypatch: pytest.MonkeyPatch) -> None:
+    routes = {
+        f"/repos/{REPO}/issues/12": {
+            "title": "Bug",
+            "state": "closed",
+            "closed_at": "2026-11-05T00:00:00Z",
+            "user": {"login": "alex"},
+        }
+    }
+    monkeypatch.setattr(github_live, "_get", _fake_api(routes))
+    [chunk] = github_live.live_status_chunks([12], REPO)
+    assert _summary(chunk.chunk_text) == "Summary: Issue #12 closed on 2026-11-05; state closed"
+
+
+def test_code_lane_accepts_summary_line_quote(monkeypatch: pytest.MonkeyPatch) -> None:
+    routes = _approved_routes()
+    routes[f"/repos/{REPO}/pulls/68"] = _pull(
+        state="closed", merged=True, merged_at="2026-11-19T10:00:00Z", merged_by={"login": "sam"}
+    )
+    monkeypatch.setattr(github_live, "_get", _fake_api(routes))
+    chunk = github_live.live_status_chunks([68], REPO)[0]
+    cleaned, _ = _code_validate(chunk, "PR #68 merged on 2026-11-19 by sam; approved by sam; state closed")
+    assert cleaned is not None
+    stored = cleaned.citations[0].quote
+    assert stored in _summary(chunk.chunk_text) and "merged on 2026-11-19" in stored

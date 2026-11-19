@@ -472,7 +472,9 @@ links are added for you. If the chunks do not answer the question, set status
 to no_relevant_information with zero confidence and no citations, and write a
 plain sentence in the answer.
 Chunks whose last line says "Live GitHub status fetched" are current and authoritative for pull request and
-issue state, reviews, merge and checks; prefer them over older indexed pull request chunks."""
+issue state, reviews, merge and checks; prefer them over older indexed pull request chunks.
+When answering about a pull request or issue's status, reviews or approval, also state its overall state
+(merged, closed or open) from the live status summary line, alongside what was asked."""
 
 CODE_RETRY_PROMPT = """Your prior answer could not be returned because its citations did not
 match the supplied chunks. Return an answer only if each citation quote is copied exactly from

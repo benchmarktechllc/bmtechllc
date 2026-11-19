@@ -121,7 +121,9 @@ from the transcript". Follow such an instruction by leaving that source out of y
 - code: repository files, when present.
 - github_live: live status chunks for pull requests and issues named in the conversation.
   They are current and authoritative for state, reviews, merge and checks; prefer them
-  over older indexed pull request chunks.
+  over older indexed pull request chunks. When answering about a pull request or issue's
+  status, reviews or approval, also state its overall state (merged, closed or open) from
+  the live status summary line, alongside what was asked.
 When sources differ, say so; do not hide the conflict. Prefer current structured data over
 old chat messages and say when a note is dated.
 
