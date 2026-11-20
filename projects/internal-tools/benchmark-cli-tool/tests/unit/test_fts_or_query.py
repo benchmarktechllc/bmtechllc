@@ -1,4 +1,4 @@
-"""Ensure full-sentence FTS uses alternatives rather than all-term conjunction."""
+"""Legacy OR query remains the fallback when the query yields no lexeme groups."""
 
 from __future__ import annotations
 
@@ -23,6 +23,9 @@ def test_fts_search_converts_websearch_conjunctions_to_or(monkeypatch: pytest.Mo
         def execute(self, statement: str, parameters: tuple[object, ...]) -> None:
             captured["statement"] = statement
             captured["parameters"] = parameters
+
+        def fetchone(self) -> None:
+            return None
 
         def fetchall(self) -> list[tuple[object, ...]]:
             return []
