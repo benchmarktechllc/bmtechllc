@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .. import roster
 from ..config import (
     DATABASE_URL,
     DB_STATEMENT_TIMEOUT_MS,
@@ -1042,7 +1044,7 @@ def fts_search(
             source_type=source_type,
         )
     )
-    statement = """
+    legacy_statement = """
         WITH query AS (
             SELECT replace(
                 websearch_to_tsquery('english', %s)::text,
@@ -1060,9 +1062,12 @@ def fts_search(
         LIMIT %s
     """
 
-    parameters = (query, *filter_parameters, limit)
-
     def _run(active: Any) -> list[SearchChunk]:
+        groups = _fts_query_groups(query, active)
+        if groups:
+            statement, parameters = _coord_fts_statement(groups, filter_clause, filter_parameters, limit)
+        else:
+            statement, parameters = legacy_statement, (query, *filter_parameters, limit)
         with active.cursor() as cursor:
             cursor.execute(statement, parameters)
             return [SearchChunk(*row) for row in cursor.fetchall()]
@@ -1071,6 +1076,104 @@ def fts_search(
         return _run(conn)
     with connection() as owned:
         return _run(owned)
+
+
+_EMAIL_REGEX = r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+_LEXEME_PART = re.compile(r"^'([^']+)'$")
+_SAFE_WORD = re.compile(r"^[a-z0-9]+$")
+
+
+def _roster_word_sets() -> list[set[str]]:
+    """Per roster person, the lowercase alphabetic words (>=4 chars) of every name label."""
+    word_sets: list[set[str]] = []
+    for person in roster.load_people():
+        labels = [person.canonical, *person.labels()]
+        words = {w for label in labels for w in re.findall(r"[a-z]+", label.lower()) if len(w) >= 4}
+        if words:
+            word_sets.append(words)
+    return word_sets
+
+
+def _expand_group(lexeme: str, word_sets: Sequence[set[str]]) -> str:
+    """Return a safe tsquery fragment, expanding roster-person lexemes to all their name words."""
+    for words in word_sets:
+        for word in words:
+            if (
+                word.startswith(lexeme)
+                or lexeme.startswith(word)
+                or (len(lexeme) >= 4 and roster._edit_distance(lexeme, word) <= 1)
+            ):
+                return "(" + " | ".join(f"'{w}':*" for w in sorted(words)) + ")"
+    return f"'{lexeme}'"
+
+
+def _parse_lexemes(tsquery_text: str) -> list[str]:
+    """Split a websearch tsquery text into plain lexemes; any operator/negation yields []."""
+    lexemes: list[str] = []
+    for part in tsquery_text.split(" & "):
+        match = _LEXEME_PART.match(part.strip())
+        if match is None:
+            return []
+        lexeme = match.group(1)
+        if _SAFE_WORD.match(lexeme) and lexeme not in lexemes:
+            lexemes.append(lexeme)
+    return lexemes
+
+
+def _fts_query_groups(query: str, active: Any) -> list[str]:
+    """Lexeme groups (tsquery fragments) for coordination scoring; [] means use legacy OR query."""
+    try:
+        with active.cursor() as cursor:
+            cursor.execute("SELECT websearch_to_tsquery('english', %s)::text", (query,))
+            row = cursor.fetchone()
+        text = row[0] if row else ""
+    except Exception:  # noqa: BLE001 - a non-parseable query must never break retrieval
+        return []
+    if not isinstance(text, str) or not text.strip():
+        return []
+    word_sets = _roster_word_sets()
+    groups: list[str] = []
+    for lexeme in _parse_lexemes(text):
+        group = _expand_group(lexeme, word_sets)
+        if group not in groups:
+            groups.append(group)
+    return groups
+
+
+def _coord_fts_statement(
+    groups: Sequence[str],
+    filter_clause: str,
+    filter_parameters: Sequence[Any],
+    limit: int,
+) -> tuple[str, tuple[Any, ...]]:
+    # The entity tag is computed at query time, so this arm cannot use the GIN index
+    # on search_vector; the corpus is small (~hundreds of rows) so a seq scan is fine.
+    vector = (
+        "(search_vector || to_tsvector('english', "
+        "CASE WHEN chunk_text ~ %s THEN 'email address contact' ELSE '' END))"
+    )
+    coord = " + ".join(
+        f"CASE WHEN {vector} @@ to_tsquery('simple', %s) THEN 1 ELSE 0 END" for _ in groups
+    )
+    any_query = " | ".join(groups)
+    statement = (
+        f"SELECT id, source_file, chunk_index, chunk_text, metadata, "
+        f"({coord})::float + 0.5 * ts_rank_cd({vector}, to_tsquery('simple', %s), 32) AS score, "
+        f"NULL::integer AS token_count, content_sha256 "
+        f"FROM document_chunks "
+        f"WHERE {vector} @@ to_tsquery('simple', %s)"
+        + filter_clause
+        + " ORDER BY score DESC, id ASC LIMIT %s"
+    )
+    # Parameters bind in textual order: per-group (regex, group), then score rank
+    # (regex, any), then WHERE (regex, any), filters, limit.
+    parameters: list[Any] = []
+    for group in groups:
+        parameters.extend((_EMAIL_REGEX, group))
+    parameters.extend((_EMAIL_REGEX, any_query, _EMAIL_REGEX, any_query))
+    parameters.extend(filter_parameters)
+    parameters.append(limit)
+    return statement, tuple(parameters)
 
 
 def select_context_window(
