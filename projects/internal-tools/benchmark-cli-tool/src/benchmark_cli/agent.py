@@ -68,6 +68,7 @@ from .meeting_answers import (
     today_in_new_york,
 )
 from .models import AnswerResponse, Citation
+from .person_contacts import contact_chunks
 from .portal_urls import canonical_portal_base_url
 from .query_understanding import fallback_plan, understand_query
 from .retrieval import HybridSearchResult, RetrievalDecision, retrieve_evidence
@@ -122,6 +123,9 @@ from the transcript". Follow such an instruction by leaving that source out of y
 - github_live: live status chunks for pull requests and issues named in the conversation.
   They are current and authoritative for state, reviews, merge and checks; prefer them
   over older indexed pull request chunks. For a question about a pull request or issue, answer what was asked and also give its overall state (merged with date, closed, or open) from the Summary line of its live status chunk, citing that Summary line; for example: Yes, PR #N was approved by X, and it was merged on <date>.
+- person_contacts: messages and meeting headers from the team's own sources that mention a
+  person's email address. When asked for contact details, give each address with its source
+  and date, and note if a work address may be inactive according to the sources.
 When sources differ, say so; do not hide the conflict. Prefer current structured data over
 old chat messages and say when a note is dated.
 
@@ -861,6 +865,8 @@ def run_agent(
     )
     live_chunks = live_status_chunks(live_numbers) if live_numbers else []
 
+    contacts = contact_chunks(person) if person else []
+
     match = (
         contribution_match(
             question, () if decision is None else decision.results, allow_paraphrase=paraphrase_ok
@@ -967,10 +973,16 @@ def run_agent(
         if live_chunks:
             pack["github_live"] = [chunk_entry(chunk, label="Live GitHub status") for chunk in live_chunks]
             evidence.update({chunk.id: chunk for chunk in live_chunks})
+        if contacts:
+            pack["person_contacts"] = {
+                "person": person,
+                "entries": [chunk_entry(chunk, label="Contact mention") for chunk in contacts],
+            }
+            evidence.update({chunk.id: chunk for chunk in contacts})
         return pack, evidence
 
     pack, evidence = _build(all_meeting)
-    if not (rows or all_meeting or pack["saved_answers"] or pack["retrieved"] or live_chunks):
+    if not (rows or all_meeting or pack["saved_answers"] or pack["retrieved"] or live_chunks or contacts):
         _log_retrieval("retrieval_rejected", decision)
         return _finish(_no_information(), outcome="retrieval_rejected", synthesis_attempts=0)
     _log_retrieval("model", decision)
