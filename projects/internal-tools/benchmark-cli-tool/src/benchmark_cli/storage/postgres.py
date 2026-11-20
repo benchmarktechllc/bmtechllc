@@ -1154,6 +1154,31 @@ def meeting_summary_chunks(source_file: str) -> list[SearchChunk]:
         return [SearchChunk(*row) for row in cursor.fetchall()]
 
 
+def person_email_rows(name_parts: Sequence[str], limit: int = 6) -> list[SearchChunk]:
+    """Chunks containing an email address whose local part contains one of ``name_parts``.
+
+    Full-text search indexes an address as a single token, so a first name never matches it.
+    Parts are restricted to letters, so the alternation needs no regex escaping.
+    """
+    parts = sorted({part.lower() for part in name_parts if part and part.isascii() and part.isalpha()})
+    if not parts:
+        return []
+    pattern = (
+        "[A-Za-z0-9._%+-]*(" + "|".join(parts) + ")[A-Za-z0-9._%+-]*@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"
+    )
+    statement = """
+        SELECT id, source_file, chunk_index, chunk_text, metadata, 0.0 AS score,
+               NULL::integer AS token_count, content_sha256
+        FROM document_chunks
+        WHERE chunk_text ~* %s
+        ORDER BY coalesce(metadata ->> 'date', '') DESC, id DESC
+        LIMIT %s
+    """
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(statement, (pattern, max(1, int(limit))))
+        return [SearchChunk(*row) for row in cursor.fetchall()]
+
+
 def meeting_chunks(source_file: str) -> list[SearchChunk]:
     """Every chunk of one meeting (Overview, Summary, each transcript chunk), in order."""
     statement = """
