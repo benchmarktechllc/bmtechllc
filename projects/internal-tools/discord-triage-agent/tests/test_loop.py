@@ -270,7 +270,7 @@ async def test_agent_request_shape(seeded_database_url: str, db: Db) -> None:
     assert req.model == "claude-sonnet-5-5"
     assert req.max_tokens == AGENT_MAX_TOKENS == 1024
     assert req.output_config == {"effort": "low"}
-    assert sorted(t["name"] for t in req.tools) == ["get_ticket", "search_kb"]
+    assert sorted(t["name"] for t in req.tools) == ["close_ticket", "get_ticket", "search_kb"]
     assert req.messages[0]["role"] == "user"
     assert "what's the status of T-1002?" in json.dumps(req.messages[0]["content"])
 
@@ -284,13 +284,13 @@ async def test_unknown_tool_is_denied_with_an_error_result(
         db,
         [
             ONE_CONCERN,
-            tool_turn(tool_call("close_ticket", {"ticket_id": "T-1002"}, "tu_x")),
-            text_reply("I can't close tickets."),
+            tool_turn(tool_call("delete_ticket", {"ticket_id": "T-1002"}, "tu_x")),
+            text_reply("I can't delete tickets."),
         ],
     )
     (result,) = list(run.agent_requests[1].messages[-1]["content"])  # type: ignore[arg-type]
     assert result["is_error"] is True  # type: ignore[index]
-    (row,) = [t for t in agent_traces(db, run.session_id) if t[6] == "close_ticket"]
+    (row,) = [t for t in agent_traces(db, run.session_id) if t[6] == "delete_ticket"]
     assert row[9] == "deny"
     assert db.execute("SELECT status FROM tickets WHERE id = 'T-1002'").fetchone() == ("open",)
 

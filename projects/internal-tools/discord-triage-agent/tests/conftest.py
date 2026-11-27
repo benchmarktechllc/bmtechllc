@@ -9,6 +9,7 @@ import os
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -26,7 +27,7 @@ from psycopg.conninfo import make_conninfo
 
 from triage_agent.agent.client import ModelRequest
 from triage_agent.app import create_app
-from triage_agent.config import Settings
+from triage_agent.config import ApprovalConfig, Settings
 from triage_agent.db.migrate import apply_migrations
 from triage_agent.db.seed import apply_seed
 
@@ -89,12 +90,16 @@ def seeded_database_url(database_url: str) -> str:
 
 
 def insert_test_session(
-    db: psycopg.Connection[tuple[Any, ...]], question: str = "what's the status of T-1002?"
+    db: psycopg.Connection[tuple[Any, ...]],
+    question: str = "what's the status of T-1002?",
+    *,
+    asker: str = "u",
+    channel: str = "c",
 ) -> UUID:
     row = db.execute(
         "INSERT INTO sessions (interaction_id, guild_id, channel_id, asker_user_id, question)"
-        " VALUES (%s, 'g', 'c', 'u', %s) RETURNING id",
-        (f"i-{uuid4().hex}", question),
+        " VALUES (%s, 'g', %s, %s, %s) RETURNING id",
+        (f"i-{uuid4().hex}", channel, asker, question),
     ).fetchone()
     assert row is not None
     session_id: UUID = row[0]
@@ -109,7 +114,7 @@ class FakeAnthropic:
     """Scripted stand-in for the model client: returns (or raises) the scripted items in order
     and records a deep copy of every request. Never touches the network."""
 
-    script: list[Message | Exception] = field(default_factory=list)
+    script: list[Message | BaseException] = field(default_factory=list)
     requests: list[ModelRequest] = field(default_factory=list)
     on_call: Callable[[ModelRequest], None] | None = None
 
@@ -120,9 +125,14 @@ class FakeAnthropic:
         if not self.script:
             raise AssertionError(f"FakeAnthropic: no scripted response left for {request.model}")
         item = self.script.pop(0)
-        if isinstance(item, Exception):
+        if isinstance(item, BaseException):
             raise item
         return item
+
+
+class SimulatedCrash(BaseException):
+    """Stands in for the process dying mid-session. It is not an Exception, so no handler in
+    the app catches it, and the database is left exactly as the crash found it."""
 
 
 @pytest.fixture
@@ -206,19 +216,84 @@ def api_timeout() -> anthropic.APIError:
 # --- Discord ----------------------------------------------------------------
 
 
+APPROVER_CHANNEL = "1700000000000000099"
+APPROVER_ROLE = "1800000000000000001"
+ASKER = "1500000000000000001"
+# Seeded teammates (seed/synthetic.sql), both approvers.
+AVERY = "900000000000000001"
+BLAKE = "900000000000000002"
+
+
+@dataclass(frozen=True)
+class PostedMessage:
+    channel_id: str
+    message_id: str
+    content: str
+    components: list[dict[str, Any]] | None
+    allowed_mentions: dict[str, Any] | None
+
+
 @dataclass
 class FakeDiscordRest:
-    """Mocked Discord REST client. Records every call; never touches the network."""
+    """Mocked Discord REST client. Records every call; never touches the network.
+
+    `log` records the order of calls. `fail_with` makes interaction edits fail,
+    `fail_get_channel` the startup check, and `fail_post_in[channel]` posts to that channel."""
 
     edits: list[tuple[str, str, str]] = field(default_factory=list)
     fail_with: Exception | None = None
+    channel_fetches: list[str] = field(default_factory=list)
+    fail_get_channel: Exception | None = None
+    posts: list[PostedMessage] = field(default_factory=list)
+    fail_post_in: dict[str, Exception] = field(default_factory=dict)
+    channel_edits: list[tuple[str, str, str, list[dict[str, Any]]]] = field(default_factory=list)
+    log: list[str] = field(default_factory=list)
 
     async def edit_original_response(
         self, application_id: str, interaction_token: str, content: str
     ) -> None:
+        self.log.append("edit_original_response")
         self.edits.append((application_id, interaction_token, content))
         if self.fail_with is not None:
             raise self.fail_with
+
+    async def get_channel(self, channel_id: str) -> dict[str, Any]:
+        self.log.append("get_channel")
+        self.channel_fetches.append(channel_id)
+        if self.fail_get_channel is not None:
+            raise self.fail_get_channel
+        return {"id": channel_id, "type": 0}
+
+    async def post_channel_message(
+        self,
+        channel_id: str,
+        content: str,
+        *,
+        components: list[dict[str, Any]] | None = None,
+        allowed_mentions: dict[str, Any] | None = None,
+    ) -> str:
+        self.log.append("post_channel_message")
+        if channel_id in self.fail_post_in:
+            raise self.fail_post_in[channel_id]
+        message_id = f"m{len(self.posts) + 1}"
+        self.posts.append(
+            PostedMessage(channel_id, message_id, content, components, allowed_mentions)
+        )
+        return message_id
+
+    async def edit_channel_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        content: str,
+        *,
+        components: list[dict[str, Any]],
+    ) -> None:
+        self.log.append("edit_channel_message")
+        self.channel_edits.append((channel_id, message_id, content, components))
+
+    def posts_in(self, channel_id: str) -> list[PostedMessage]:
+        return [p for p in self.posts if p.channel_id == channel_id]
 
 
 @pytest.fixture
@@ -252,8 +327,17 @@ def signer() -> DiscordSigner:
 
 
 @pytest.fixture
-def settings(signer: DiscordSigner, database_url: str) -> Settings:
-    return Settings(discord_public_key=signer.public_key_hex, database_url=database_url)
+def approvals() -> ApprovalConfig:
+    return ApprovalConfig(
+        channel_id=APPROVER_CHANNEL, role_id=APPROVER_ROLE, ttl=timedelta(minutes=5)
+    )
+
+
+@pytest.fixture
+def settings(signer: DiscordSigner, database_url: str, approvals: ApprovalConfig) -> Settings:
+    return Settings(
+        discord_public_key=signer.public_key_hex, database_url=database_url, approvals=approvals
+    )
 
 
 @pytest.fixture
@@ -291,3 +375,28 @@ def ask_payload(
 
 def encode(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, separators=(",", ":")).encode()
+
+
+def component_payload(
+    request_id: UUID | str,
+    action: str = "approve",
+    user_id: str = AVERY,
+    roles: list[str] | None = None,
+    message_id: str = "m1",
+) -> dict[str, Any]:
+    """A MESSAGE_COMPONENT interaction: a click on an approval button in the guild."""
+    return {
+        "id": f"19{uuid4().int % 10**17:017d}",
+        "application_id": "1200000000000000001",
+        "type": 3,
+        "token": "click-token",
+        "version": 1,
+        "guild_id": "1300000000000000001",
+        "channel_id": APPROVER_CHANNEL,
+        "member": {
+            "user": {"id": user_id, "username": "clicker"},
+            "roles": [APPROVER_ROLE] if roles is None else roles,
+        },
+        "message": {"id": message_id, "channel_id": APPROVER_CHANNEL},
+        "data": {"custom_id": f"approval:{request_id}:{action}", "component_type": 2},
+    }

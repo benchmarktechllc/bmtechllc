@@ -41,4 +41,23 @@ SEARCH_KB: Final[ToolParam] = {
     "strict": True,
 }
 
-TOOLS: Final[list[ToolParam]] = [GET_TICKET, SEARCH_KB]
+CLOSE_TICKET: Final[ToolParam] = {
+    "name": "close_ticket",
+    "description": (
+        "Ask to close one support ticket by its id (for example T-1002). Use it only when the "
+        "asker asks for that ticket to be closed. Every call goes to a human approver, who "
+        "approves or denies it; the result says what happened (closed, already closed, "
+        "denied, expired, or not found). Report that result to the asker as it is."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "ticket_id": {"type": "string", "description": "Ticket id, like T-1002."},
+        },
+        "required": ["ticket_id"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+
+TOOLS: Final[list[ToolParam]] = [GET_TICKET, SEARCH_KB, CLOSE_TICKET]

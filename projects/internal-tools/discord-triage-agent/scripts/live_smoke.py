@@ -8,7 +8,9 @@ session (Haiku classifier + Sonnet loop) against a fresh database on the LOCAL t
   - asserts the session's categories set equals the fixture's;
   - has Haiku grade each expected concern separately (covered yes/no + the covering sentence);
   - passes a reply only if every concern is covered;
-  - asserts no close_ticket ran and no ticket changed.
+  - asserts no close_ticket executed (no receipt) and no ticket changed. There are no clicks
+    in a smoke run, so a close_ticket the model attempts must stay a pending approval; the
+    attempts are printed.
 It prints each session's confidence and cost plus the running total, and never starts a session
 whose worst-case ceiling could take the total past BUDGET_LIMIT_USD ($4).
 """
@@ -86,11 +88,39 @@ class MeteredClient:
 @dataclass
 class CaptureDiscord:
     replies: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    posts: list[str] = field(default_factory=list)
 
     async def edit_original_response(
         self, application_id: str, interaction_token: str, content: str
     ) -> None:
-        self.replies.append(content)
+        # The waiting note is a status message, not the session's reply.
+        target = self.notes if content.startswith("Waiting for approval") else self.replies
+        target.append(content)
+
+    async def get_channel(self, channel_id: str) -> dict[str, Any]:
+        return {"id": channel_id}
+
+    async def post_channel_message(
+        self,
+        channel_id: str,
+        content: str,
+        *,
+        components: list[dict[str, Any]] | None = None,
+        allowed_mentions: dict[str, Any] | None = None,
+    ) -> str:
+        self.posts.append(content)
+        return f"smoke-{len(self.posts)}"
+
+    async def edit_channel_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        content: str,
+        *,
+        components: list[dict[str, Any]],
+    ) -> None:
+        return None
 
 
 def local_only(url: str) -> str:
@@ -208,14 +238,15 @@ async def run(max_sessions: int, keep_db: bool) -> int:
                 for p in problems:
                     print(f"  problem: {p}")
 
-            closes = conn.execute(
-                "SELECT count(*) FROM traces WHERE tool_name = 'close_ticket'"
-                " AND hook_decision <> 'deny'"
+            attempts = conn.execute(
+                "SELECT count(*) FROM approval_requests WHERE status = 'pending'"
             ).fetchone()
+            print(f"\nclose_ticket attempts held for approval: {attempts[0] if attempts else 0}")
+            executed = conn.execute("SELECT count(*) FROM receipts").fetchone()
             tickets_after = conn.execute("SELECT id, status FROM tickets ORDER BY id").fetchall()
-            if closes != (0,) or tickets_after != tickets_before:
+            if executed != (0,) or tickets_after != tickets_before:
                 failures += 1
-                print("\nFAIL: a close_ticket ran or a ticket changed without approval")
+                print("\nFAIL: a close_ticket executed or a ticket changed without approval")
     finally:
         if keep_db:
             print(f"\nkept database {name}")

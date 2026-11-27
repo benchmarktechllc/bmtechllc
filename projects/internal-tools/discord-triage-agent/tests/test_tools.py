@@ -21,13 +21,18 @@ NEW_TABLES = ["messages", "traces", "tickets", "kb_articles", "teammates"]
 # --- policy ----------------------------------------------------------------------
 
 
-def test_policy_allows_only_the_read_tools() -> None:
-    assert POLICY == {"get_ticket": "allow", "search_kb": "allow"}
+def test_policy_allows_the_read_tools_and_gates_close_ticket() -> None:
+    assert POLICY == {
+        "get_ticket": "allow",
+        "search_kb": "allow",
+        "close_ticket": "require_approval",
+    }
     assert decide("get_ticket") == "allow"
     assert decide("search_kb") == "allow"
+    assert decide("close_ticket") == "require_approval"
 
 
-@pytest.mark.parametrize("name", ["close_ticket", "delete_ticket", "", "GET_TICKET"])
+@pytest.mark.parametrize("name", ["delete_ticket", "", "GET_TICKET", "CLOSE_TICKET"])
 def test_any_other_tool_is_denied(name: str) -> None:
     assert decide(name) == "deny"
 

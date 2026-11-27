@@ -3,7 +3,7 @@
 A Discord `/ask` command that classifies a support question, looks up synthetic tickets and KB articles, and replies. The one irreversible action (`close_ticket`) waits for a human approval in Discord. Everything is stored in Postgres for audit. The design lives in `docs/SPEC.md`, `docs/DECISIONS.md` and `docs/TASKS.md`.
 
 - **Owner:** fanuel-mengistu
-- **Status:** in development. Slices 1 (local skeleton on a tunnel URL) and 2 (classify and answer with read tools) are built; slice 3 (gated `close_ticket`) is next.
+- **Status:** in development. Slices 1 (local skeleton on a tunnel URL), 2 (classify and answer with read tools) and 3 (gated `close_ticket` with approval and resume) are built; the live checks for slices 2 and 3 and the Fly.io deploy are next.
 - **Data:** synthetic only. No customer or production data.
 
 ## Services and cost
@@ -31,7 +31,10 @@ cp .env.example .env   # then fill in the values; .env is git-ignored
 - `DISCORD_GUILD_ID`: the test server's ID (Discord developer mode → right-click the server → Copy Server ID).
 - `DATABASE_URL`: the Supabase project's Postgres connection string.
 - `TEST_DATABASE_URL`: the local test Postgres (see *Tests*), never the Supabase project.
-- `ANTHROPIC_API_KEY`: required to start the app (Slice 2+). The `APPROVER_*` and `APPROVAL_TTL` values are used from Slice 3.
+- `ANTHROPIC_API_KEY`: required to start the app.
+- `APPROVER_CHANNEL_ID`: the private approvals channel (right-click the channel → Copy Channel ID). Required: at startup the app fetches it with the bot token and refuses to start if it can't, so the bot must be able to view and post in it.
+- `APPROVER_ROLE_ID`: the role allowed to approve (Server Settings → Roles → right-click → Copy Role ID). Required.
+- `APPROVAL_TTL`: how long an approval waits before it expires. Optional, default `24h`; set `5m` locally to watch an expiry.
 
 Apply the schema (only ever through `migrations/`; never edit tables in the Supabase dashboard):
 
@@ -61,6 +64,18 @@ cloudflared tunnel --url http://localhost:8000    # terminal 2: prints https://<
 
 The quick-tunnel URL changes every time `cloudflared` starts, so step 2 is repeated each session.
 
+## Approvals, the sweep and recovery
+
+`close_ticket` is the only write tool, and it never runs on the model's say-so. The gate is plain code (`tools/policy.py`): `get_ticket` and `search_kb` run, `close_ticket` needs approval, and anything else is denied.
+
+1. `/ask question: please close T-1002`. The asker's reply becomes "Waiting for approval on 1 action(s) — session <id>", and an Approve/Deny message appears in the approvals channel.
+2. A member with `APPROVER_ROLE_ID` clicks. Anyone else gets a private "not authorized" and nothing changes. An asker who holds the role may approve their own request; it is stored with `self_approved = true`.
+3. Once every request of that turn is decided, the same session resumes: the ticket closes (exactly once, with a row in `receipts`), and the asker gets one answer. Within 15 min it replaces the waiting note; later, or after a restart, it is posted in the asker's channel by the bot. If that post fails, `sessions.reply_error` is set and a notice mentioning the asker goes to the approvals channel.
+
+A sweep runs at startup and every 5 min. It expires requests older than `APPROVAL_TTL` (the session resumes with "approval expired"), and it recovers sessions left `running` with no heartbeat for 10 min (a crash or restart): it finishes a session whose approvals were all decided, or marks it `failed` with an apology listing anything already done, such as "T-1002 was closed". While the app or tunnel is down, Discord shows "This interaction failed" for clicks; click again once it is back.
+
+Audit with SQL: `approval_requests` (who decided what, when), `receipts` (what actually executed), `traces.hook_decision` (the gate's call for every tool use).
+
 ## Tests
 
 Tests use a throwaway local Postgres, never the Supabase project, and make no live model or Discord calls.
@@ -85,7 +100,7 @@ python scripts/live_smoke.py                 # all fixtures (max 5)
 python scripts/live_smoke.py --max-sessions 1
 ```
 
-It needs `ANTHROPIC_API_KEY` and `TEST_DATABASE_URL`. For each session it prints PASS/FAIL, the classifier confidence, the session cost and the running total. Each expected concern must be covered in the one reply, the session's categories must match the fixture, and no `close_ticket` may run. Before each session it compares a worst-case ceiling (about $0.40: 8 Sonnet calls at the token caps plus the Haiku calls) with what's left, and stops before the total could pass $4. Prices live in `src/triage_agent/budget.py` with the date they were checked.
+It needs `ANTHROPIC_API_KEY` and `TEST_DATABASE_URL`. For each session it prints PASS/FAIL, the classifier confidence, the session cost and the running total. Each expected concern must be covered in the one reply, the session's categories must match the fixture, and no `close_ticket` may execute (no receipt, no ticket change). There are no clicks in a smoke run, so a close the model attempts stays a pending approval; the run prints how many there were. Before each session it compares a worst-case ceiling (about $0.40: 8 Sonnet calls at the token caps plus the Haiku calls) with what's left, and stops before the total could pass $4. Prices live in `src/triage_agent/budget.py` with the date they were checked.
 
 ## Backup
 

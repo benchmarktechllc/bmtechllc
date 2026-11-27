@@ -66,6 +66,8 @@ Out of scope: `close_ticket`, approvals, resume, the sweep.
 ---
 
 ## Slice 3: Gated close_ticket with approval and resume
+**Status:** 🟡 Code done (2026-11-27). Tests (202), lint and typecheck pass with the fakes. Still to do by hand: apply `003` to Supabase, set `APPROVER_CHANNEL_ID`/`APPROVER_ROLE_ID` in `.env`, and check a live close in the test guild (Approve, Deny and an expiry with `APPROVAL_TTL=5m`).
+
 Goal: Asking to close one or more tickets posts Approve/Deny buttons for each. Once every one is decided, by a click or by expiry, the same session closes the approved tickets exactly once and sends one reply in the asker's channel. A session interrupted by a crash or restart is either finished, or marked `failed` with an apology that says what was already done.
 
 Context: SPEC.md sections 4 and 5; follow the pattern in `src/triage_agent/agent/loop.py`

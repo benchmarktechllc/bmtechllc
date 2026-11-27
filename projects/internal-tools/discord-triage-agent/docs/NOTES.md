@@ -1,5 +1,30 @@
 # Notes
 
+## 2026-11-27: Slice 3 code done (live checks pending)
+
+State:
+- New: `migrations/003_approvals_and_receipts.sql`, `tools/close_ticket.py` (executor), `db/approvals.py` (`decide_request`, the one decision transaction), `agent/resume.py` (resume, clicks, apology), `agent/approval_flow.py` (acts on a loop outcome), `agent/reply.py` (`TokenStore`, reply routing), `agent/deps.py`, `discord/components.py`, `sweep.py`.
+- Changed: `loop.py` (gate + pause; `run_loop` wraps `continue_loop`), `pipeline.py`, `prompts.py` (describes close_ticket), `app.py` (type-3 clicks, startup channel check, sweep task), `config.py` (`ApprovalConfig`, `parse_ttl`), `discord/rest.py` (bot-token methods), `scripts/live_smoke.py`, README, `.env.example`.
+- `pytest` 202 passed; `ruff check`, `ruff format --check`, `mypy --strict src` clean. No new dependencies. No live call made.
+
+Design choices made this slice:
+- The waiting note is edited **before** the buttons are posted, so a fast click's final reply can't be overwritten by a late note. On a second pause after a resume, the note is shown only if the token is still valid.
+- The paused turn is found by the `tool_use_id`s of the latest assistant message, not by iteration. If its results message is already stored, resume skips the append.
+- Interaction tokens live only in memory (`TokenStore` on `app.state`). The token window is 14 min, checked in SQL against `sessions.created_at`. After a restart, replies go by bot-token REST.
+- A click on a request past `expires_at` expires it (same as the sweep would), so it can't approve late.
+- Approval results aren't written back to `traces`: the `require_approval` trace row has no result; `approval_requests` + `receipts` are the audit of the decision and what ran.
+- The startup sweep runs as the first pass of the background task, so a resume at startup never blocks PINGs.
+- A resume that raises an Exception fails the session with the apology at once; only a process crash is left to recovery.
+- `live_smoke.py` now checks for no receipts and unchanged tickets (a gated attempt is a pending approval, not a failure) and prints the number of held attempts.
+
+Known gap (accepted): if the app dies after the pause commits but before an approval message is posted, that request has no buttons; it expires after `APPROVAL_TTL` and the session resumes with "approval expired".
+
+Next (by hand):
+1. `.env`: set `APPROVER_CHANNEL_ID`, `APPROVER_ROLE_ID`, `APPROVAL_TTL=5m`; invite check: the bot must view and post in the approvals channel, or the app refuses to start.
+2. Supabase: `python -m triage_agent.db.migrate` (applies 002 if still pending, and 003), `python -m triage_agent.db.seed`.
+3. Live: `/ask please close T-1002` → Approve; `/ask please close T-1005` → Deny; one left to expire. Check `approval_requests`, `receipts`, one reply each. Also the Slice 2 items below (live smoke run) once a key exists.
+4. Then the Fly.io deploy (TASKS.md, after Slice 3).
+
 ## 2026-11-27: Slice 2 code done (live run pending)
 
 State:

@@ -99,3 +99,13 @@ async def finish_session(
         """,
         (status, reply_error, session_id),
     )
+
+
+async def set_status(
+    conn: psycopg.AsyncConnection[Any], session_id: UUID, status: SessionStatus
+) -> None:
+    """Change the status (and heartbeat) without touching reply_error."""
+    await conn.execute(
+        "UPDATE sessions SET status = %s, heartbeat_at = now(), updated_at = now() WHERE id = %s",
+        (status, session_id),
+    )

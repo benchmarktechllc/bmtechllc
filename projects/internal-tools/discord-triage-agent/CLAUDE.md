@@ -61,3 +61,9 @@ Run from `projects/internal-tools/discord-triage-agent/` with `.venv` active (`p
 - Discord rejects message content over 2000 characters. Send model text through `fit_message` (`discord/rest.py`), with `allowed_mentions: {"parse": []}`.
 - httpx error messages include the request URL, which contains the interaction token. Remove the token before storing or logging the error (see `agent/pipeline.py`).
 - Seed data loads with `python -m triage_agent.db.seed`, never as a migration. Like `MIGRATIONS_DIR`, `SEED_FILE` resolves relative to the source tree.
+- A query parameter that can be NULL, used in `IS NULL` or `CASE`, needs a cast (`%s::text`), or Postgres can't determine its type.
+- Per-request state (e.g. the `TokenStore`) goes on `app.state` in `create_app`, not in the lifespan: `test_ack_is_sent_before_the_discord_edit_finishes` calls the ASGI app without running the lifespan.
+- Tests simulate a process crash with `SimulatedCrash` (a `BaseException`, `tests/conftest.py`). App handlers catch `Exception` only; widening them to `BaseException` breaks the recovery tests.
+- Decision lock order: the `sessions` row (`FOR UPDATE`) first, then `approval_requests`. New code that locks both must follow the same order to avoid deadlocks.
+- The `client` fixture's database isn't seeded. Tests that need tickets must also request `seeded_database_url`.
+- The app refuses to start unless the bot token can fetch `APPROVER_CHANNEL_ID`, so a local run needs `DISCORD_BOT_TOKEN` and both `APPROVER_*` values in `.env`.
