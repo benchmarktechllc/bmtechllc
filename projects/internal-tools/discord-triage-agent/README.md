@@ -3,7 +3,7 @@
 A Discord `/ask` command that classifies a support question, looks up synthetic tickets and KB articles, and replies. The one irreversible action (`close_ticket`) waits for a human approval in Discord. Everything is stored in Postgres for audit. The design lives in `docs/SPEC.md`, `docs/DECISIONS.md` and `docs/TASKS.md`.
 
 - **Owner:** fanuel-mengistu
-- **Status:** in development. Slices 1 (local skeleton on a tunnel URL), 2 (classify and answer with read tools) and 3 (gated `close_ticket` with approval and resume) are built; the live checks for slices 2 and 3 and the Fly.io deploy are next.
+- **Status:** in development. Slices 1–3 are built and verified live in the test guild; the Fly.io deploy is next.
 - **Data:** synthetic only. No customer or production data.
 
 ## Services and cost

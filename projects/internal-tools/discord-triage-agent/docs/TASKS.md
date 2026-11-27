@@ -38,7 +38,7 @@ Out of scope: model calls, classification, tools, traces, approvals, `Dockerfile
 ---
 
 ## Slice 2: Classify and answer with read tools
-**Status:** 🟡 Code done and live smoke passed (2026-11-27). `scripts/live_smoke.py`: 20/20 sessions over the last 4 full runs, after two classifier prompt fixes; $0.46 total live spend (details in NOTES.md). Still to do by hand: apply `002` + seed to Supabase and check one live `/ask` in the test guild.
+**Status:** ✅ Done (2026-11-27). Live smoke passed: 20/20 sessions over the last 4 full runs, after two classifier prompt fixes, $0.46 total live spend. On Supabase (002 + seed applied), a live `/ask` about T-1002 in the test guild completed with one `get_ticket` call and one reply. Details in NOTES.md.
 
 Goal: A question about one or more synthetic tickets, such as `/ask what's the status of T-1002?`, gets one reply grounded in `get_ticket` and `search_kb` results that covers every concern, checked by a capped live run.
 
@@ -66,7 +66,7 @@ Out of scope: `close_ticket`, approvals, resume, the sweep.
 ---
 
 ## Slice 3: Gated close_ticket with approval and resume
-**Status:** 🟡 Code done (2026-11-27). Tests (202), lint and typecheck pass with the fakes. Still to do by hand: apply `003` to Supabase, set `APPROVER_CHANNEL_ID`/`APPROVER_ROLE_ID` in `.env`, and check a live close in the test guild (Approve, Deny and an expiry with `APPROVAL_TTL=5m`).
+**Status:** ✅ Done (2026-11-27). Tests, lint and typecheck pass with the fakes. Live in the test guild, with 003 on Supabase and `APPROVAL_TTL=5m`: an approved close of T-1002 (self-approved, one receipt, ticket closed), a denied close of T-1005 and an expired close of T-1006 (both still open, no receipt). Each session resumed once, with continuous `seq` and no `reply_error`. Covered by automated tests only: a click without the role, the REST reply after 15 min, and restart recovery.
 
 Goal: Asking to close one or more tickets posts Approve/Deny buttons for each. Once every one is decided, by a click or by expiry, the same session closes the approved tickets exactly once and sends one reply in the asker's channel. A session interrupted by a crash or restart is either finished, or marked `failed` with an apology that says what was already done.
 

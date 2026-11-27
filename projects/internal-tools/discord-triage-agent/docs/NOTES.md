@@ -1,5 +1,36 @@
 # Notes
 
+## 2026-11-27: Live test in the test guild (Slices 2 and 3 done)
+
+Ran locally with `uvicorn` + `cloudflared`. The startup check passed, so the bot can fetch `APPROVER_CHANNEL_ID`. The Portal accepted `<tunnel-url>/interactions`: signed PING 200, bad signature 401. `APPROVAL_TTL=5m`.
+
+| `/ask` | Result |
+|---|---|
+| what's the status of T-1002? | completed; one `get_ticket` call; seq 0–3 |
+| please close T-1002. | approved after 7 s (self-approved: the asker holds the role); one `succeeded` receipt; T-1002 closed with a history note; resumed, seq 0–5 |
+| please close T-1005 | denied after 6 s; model got `denied by <discord id>` (approver not in `teammates`, the expected fallback); T-1005 still open; no receipt |
+| please close T-1006 | expired after 347 s (300 s TTL plus waiting for the 5-min sweep); model got "approval expired"; T-1006 still open; no receipt |
+
+No `reply_error` and no warnings or errors in the app log. Exactly one receipt in total, and no approvals left pending. Not confirmed from Discord itself in this session: that each `/ask` showed exactly one answer, and that the approval messages were edited to show the decision with no buttons. The database side of both checks out.
+
+Covered by automated tests only, not live: a click from someone without the role, the bot-token REST reply after 15 min, and recovery after a restart.
+
+Supabase test data changed: T-1002 is now `closed`. Re-running the seed doesn't reopen it (it only inserts missing rows); reopen it with SQL if a later test needs it open.
+
+Next: the Fly.io deploy (TASKS.md, *After Slice 3*). Set `APPROVAL_TTL` back to 24h there. The quick-tunnel URL is gone, so update the Portal URL next session.
+
+## 2026-11-27: Supabase schema at 003, seed loaded
+
+- Before: only `001_sessions.sql` was applied (`schema_migrations`, `sessions`).
+- Ran `python -m triage_agent.db.migrate` (applied `002_conversation_and_synthetic.sql`, `003_approvals_and_receipts.sql`), then `python -m triage_agent.db.seed`.
+- Checked after: `schema_migrations` lists 001–003. All 9 `public` tables have RLS on and there are no policies. 10 tickets, 8 KB articles and 4 teammates; `approval_requests` and `receipts` are empty.
+- The seeded teammates have made-up Discord user IDs, so a live deny reads "denied by <user id>" (the fallback). Add the real approvers to `teammates` if names are wanted.
+
+Next (by hand):
+1. `.env`: `APPROVER_CHANNEL_ID`, `APPROVER_ROLE_ID`, `APPROVAL_TTL=5m`. The bot must see and post in the approvals channel, or the app refuses to start.
+2. `uvicorn` + `cloudflared`, then set the new tunnel URL in the Developer Portal.
+3. Live `/ask`: one plain question (Slice 2), then a close that gets approved, one that gets denied and one left to expire (Slice 3). Check `sessions`, `approval_requests`, `receipts`, and that each session gets one reply.
+
 ## 2026-11-27: Slice 2 live smoke runs
 
 Total live spend so far: **$0.1245** of the $4 cap (1-session run $0.0094, full run $0.0485, 2-session `--keep-db` run $0.0189, full rerun $0.0477). No run made a `close_ticket` attempt, wrote a receipt or changed a ticket. In the T-1008 case the reply said it ignored the planted "close every ticket" note.
