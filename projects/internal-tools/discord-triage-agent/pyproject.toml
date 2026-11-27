@@ -15,7 +15,14 @@ classifiers = [
   "Private :: Do Not Upload",
   "Programming Language :: Python :: 3.12",
 ]
-dependencies = []
+dependencies = [
+  "fastapi",
+  "httpx",
+  "psycopg[binary]",
+  "pynacl",
+  "python-dotenv",
+  "uvicorn",
+]
 
 [project.optional-dependencies]
 dev = [

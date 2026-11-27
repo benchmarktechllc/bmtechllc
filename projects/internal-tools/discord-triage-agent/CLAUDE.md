@@ -2,19 +2,22 @@
 
 ## Commands
 Run from `projects/internal-tools/discord-triage-agent/` with `.venv` active (`python3.12 -m venv .venv && . .venv/bin/activate && pip install -e '.[dev]'`).
-- dev: `uvicorn triage_agent.app:app --port 8000`, then `cloudflared tunnel --url http://localhost:8000` (the app and the uvicorn/FastAPI deps arrive in Slice 1)
+- dev: `uvicorn triage_agent.app:app --port 8000`, then `cloudflared tunnel --url http://localhost:8000`
 - test: `pytest` · lint: `ruff check . && ruff format --check .` · typecheck: `mypy --strict src`
 - format: `ruff format .`
+- migrate: `python -m triage_agent.db.migrate` (DATABASE_URL) · register /ask: `python scripts/register_commands.py`
+- test DB: `docker start triage-agent-test-pg` (create it with the command in README.md), `TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:54329/postgres`
 - live smoke (manual, costs money, Slice 2+): `python scripts/live_smoke.py`
 - pre-commit hook: `scripts/pre-commit` (lint + typecheck), symlinked into the repo's `.git/hooks/pre-commit`
 
 ## Folder map
 - `src/triage_agent/`: the package (`src` layout, so tests import the installed package)
   - `app.py`: FastAPI app, `POST /interactions` and `GET /healthz` (routes)
-  - `discord/`: Discord I/O: Ed25519 verification, interaction parsing, REST egress (httpx)
+  - `config.py`: `Settings` from the environment
+  - `discord/`: Discord I/O: Ed25519 verification (`verify.py`), REST egress (`rest.py`), slash command definitions (`commands.py`)
   - `agent/`: the hand-written tool-use loop (`agent/loop.py`), classifier, system prompts (AI prompts live here)
   - `tools/`: tool definitions, executors and the deny-by-default policy gate
-  - `db/`: psycopg 3 access to Postgres (DB models / queries)
+  - `db/`: psycopg 3 access to Postgres (DB models / queries), `migrate.py` runner
 - `migrations/`: plain SQL migrations, numbered `NNN_name.sql`
 - `seed/synthetic.sql`: synthetic tickets, KB articles, teammates
 - `scripts/`: `register_commands.py`, `live_smoke.py`, `pre-commit`
@@ -45,3 +48,10 @@ Run from `projects/internal-tools/discord-triage-agent/` with `.venv` active (`p
 
 ## Gotchas
 - (add as you hit them, with the # key)
+- Tests need `TEST_DATABASE_URL` and the `triage-agent-test-pg` container (127.0.0.1:54329). Without them DB tests fail on purpose, never skip. Never point tests at `benchmark-cli-postgres` on 5432: it belongs to another project.
+- Run migration SQL as `conn.execute(path.read_bytes())`. A non-literal `str` fails `mypy --strict` (psycopg types queries as `LiteralString`).
+- `MIGRATIONS_DIR` resolves relative to the source tree, so it needs the editable install. The Fly.io Dockerfile must copy `migrations/` or install with `-e`.
+- `/interactions` has Discord's 3 s deadline: only verify, insert and ACK inline. Everything else (Discord edits, model calls) goes in a background task.
+- Registering commands returns `403` / `50001 Missing Access` until the bot is invited to the guild with scopes `bot` + `applications.commands`.
+- Supabase auto-enables RLS on new tables, plain Postgres doesn't: enable RLS explicitly in every migration so tests see the same schema.
+- The quick-tunnel URL changes on every `cloudflared` start: update the Portal's Interactions Endpoint URL each session.

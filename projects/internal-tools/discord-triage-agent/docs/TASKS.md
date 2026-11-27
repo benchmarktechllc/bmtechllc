@@ -18,6 +18,8 @@ mypy --strict src
 ---
 
 ## Slice 1: Local skeleton on a public tunnel URL
+**Status:** ✅ Done (2026-11-27). Code and tests pass; manually verified `/healthz` on the tunnel URL, the Developer Portal accepting `<tunnel-url>/interactions`, and `/ask` in the test guild replying "Received — session <id>" with one `sessions` row in Supabase.
+
 Goal: Running `/ask <question>` in the test guild returns "Received — session <id>" from the app running locally behind a public tunnel URL.
 
 Context: SPEC.md section 2 (steps 1 and 4) and section 4.
