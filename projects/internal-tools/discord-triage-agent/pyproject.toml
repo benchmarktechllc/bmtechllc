@@ -16,6 +16,7 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
+  "anthropic",
   "fastapi",
   "httpx",
   "psycopg[binary]",

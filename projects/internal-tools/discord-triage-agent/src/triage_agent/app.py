@@ -6,24 +6,22 @@ Run locally: uvicorn triage_agent.app:app --port 8000
 from __future__ import annotations
 
 import json
-import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
-from uuid import UUID
 
 import psycopg
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from triage_agent.agent.client import AnthropicModelClient, ModelClient
+from triage_agent.agent.pipeline import AskJob, handle_ask
 from triage_agent.config import Settings
 from triage_agent.db.sessions import NewSession, insert_session
 from triage_agent.discord.rest import DiscordRest, HttpDiscordRest
 from triage_agent.discord.verify import verify_signature
-
-log = logging.getLogger(__name__)
 
 # Discord interaction and response types.
 PING = 1
@@ -86,23 +84,13 @@ def parse_ask(payload: dict[str, Any]) -> AskInteraction:
     )
 
 
-def received_message(session_id: UUID) -> str:
-    return f"Received — session {session_id}"
-
-
-async def send_received(
-    discord: DiscordRest, application_id: str, token: str, session_id: UUID
-) -> None:
-    """Background task: edit the deferred response. Runs after the ACK has been sent."""
-    try:
-        await discord.edit_original_response(application_id, token, received_message(session_id))
-    except Exception:
-        log.exception("failed to edit original response for session %s", session_id)
-
-
-def create_app(settings: Settings | None = None, discord: DiscordRest | None = None) -> FastAPI:
-    """Build the app. Tests pass settings and a fake Discord client; uvicorn passes neither,
-    and the app loads both from the environment (.env) at startup."""
+def create_app(
+    settings: Settings | None = None,
+    discord: DiscordRest | None = None,
+    model: ModelClient | None = None,
+) -> FastAPI:
+    """Build the app. Tests pass settings and fake Discord and model clients; uvicorn passes
+    none, and the app builds all three from the environment (.env) at startup."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -111,6 +99,8 @@ def create_app(settings: Settings | None = None, discord: DiscordRest | None = N
             app.state.settings = Settings.from_env()
         if not hasattr(app.state, "discord"):
             app.state.discord = HttpDiscordRest(app.state.settings.discord_bot_token)
+        if not hasattr(app.state, "model"):
+            app.state.model = AnthropicModelClient(app.state.settings.anthropic_api_key)
         yield
 
     app = FastAPI(title="triage-agent", lifespan=lifespan)
@@ -118,6 +108,8 @@ def create_app(settings: Settings | None = None, discord: DiscordRest | None = N
         app.state.settings = settings
     if discord is not None:
         app.state.discord = discord
+    if model is not None:
+        app.state.model = model
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -157,9 +149,19 @@ def create_app(settings: Settings | None = None, discord: DiscordRest | None = N
             session_id, created = await insert_session(conn, ask.session)
 
         if created:
-            discord_client: DiscordRest = request.app.state.discord
+            # Everything past the ACK (model calls, the Discord reply) runs after the response.
+            job = AskJob(
+                session_id=session_id,
+                question=ask.session.question,
+                application_id=ask.application_id,
+                token=ask.token,
+            )
             background.add_task(
-                send_received, discord_client, ask.application_id, ask.token, session_id
+                handle_ask,
+                cfg.database_url,
+                request.app.state.model,
+                request.app.state.discord,
+                job,
             )
         return JSONResponse({"type": DEFERRED_CHANNEL_MESSAGE})
 

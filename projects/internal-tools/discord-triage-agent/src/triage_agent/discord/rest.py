@@ -9,6 +9,17 @@ import httpx
 DISCORD_API = "https://discord.com/api/v10"
 # Every Discord call is capped well under the 2 min limit (SPEC.md section 2).
 REQUEST_TIMEOUT_S = 30.0
+# Discord rejects message content over 2000 characters.
+MAX_MESSAGE_CHARS = 2000
+# Replies carry model text, which is untrusted: never let it ping @everyone, roles or users.
+NO_MENTIONS: dict[str, list[str]] = {"parse": []}
+
+
+def fit_message(content: str) -> str:
+    """Cut content to Discord's limit, marking the cut with an ellipsis."""
+    if len(content) <= MAX_MESSAGE_CHARS:
+        return content
+    return content[: MAX_MESSAGE_CHARS - 1] + "…"
 
 
 class DiscordRest(Protocol):
@@ -35,5 +46,6 @@ class HttpDiscordRest:
 
     @staticmethod
     async def _patch(client: httpx.AsyncClient, url: str, content: str) -> None:
-        resp = await client.patch(url, json={"content": content}, timeout=REQUEST_TIMEOUT_S)
+        body = {"content": fit_message(content), "allowed_mentions": NO_MENTIONS}
+        resp = await client.patch(url, json=body, timeout=REQUEST_TIMEOUT_S)
         resp.raise_for_status()

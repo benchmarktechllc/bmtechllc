@@ -1,4 +1,4 @@
-"""PING, /ask routing to a deferred ACK, the "Received" edit, duplicates and /healthz."""
+"""PING, /ask routing to a deferred ACK, the reply edit, duplicates and /healthz."""
 
 from __future__ import annotations
 
@@ -12,7 +12,15 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.conftest import DiscordSigner, FakeDiscordRest, ask_payload, encode
+from tests.conftest import (
+    DiscordSigner,
+    FakeAnthropic,
+    FakeDiscordRest,
+    ask_payload,
+    classifier_reply,
+    encode,
+    text_reply,
+)
 from triage_agent.app import create_app
 from triage_agent.config import Settings
 
@@ -34,12 +42,19 @@ def test_healthz(client: TestClient) -> None:
     assert resp.json() == {"status": "ok"}
 
 
-def test_ask_gets_deferred_ack_then_received_edit(
+def answer(text: str) -> list[Any]:
+    """Scripted model responses for one session: a classification, then a final reply."""
+    return [classifier_reply([("ticket status", "other")]), text_reply(text)]
+
+
+def test_ask_gets_deferred_ack_then_the_reply_edit(
     client: TestClient,
     signer: DiscordSigner,
     fake_discord: FakeDiscordRest,
+    fake_anthropic: FakeAnthropic,
     db: psycopg.Connection[tuple[Any, ...]],
 ) -> None:
+    fake_anthropic.script = answer("T-1002 is open.")
     start = time.monotonic()
     resp = post(client, signer, ask_payload())
     elapsed = time.monotonic() - start
@@ -60,10 +75,10 @@ def test_ask_gets_deferred_ack_then_received_edit(
     assert channel_id == "1400000000000000001"
     assert asker == "1500000000000000001"
     assert question == "what's the status of T-1002?"
-    assert status == "running"
+    assert status == "completed"
 
     assert fake_discord.edits == [
-        ("1200000000000000001", "interaction-token-abc", f"Received — session {session_id}")
+        ("1200000000000000001", "interaction-token-abc", "T-1002 is open.")
     ]
 
 
@@ -71,8 +86,10 @@ def test_duplicate_interaction_inserts_one_row_and_edits_once(
     client: TestClient,
     signer: DiscordSigner,
     fake_discord: FakeDiscordRest,
+    fake_anthropic: FakeAnthropic,
     db: psycopg.Connection[tuple[Any, ...]],
 ) -> None:
+    fake_anthropic.script = answer("once")
     first = post(client, signer, ask_payload())
     second = post(client, signer, ask_payload())
 
@@ -86,14 +103,16 @@ def test_distinct_interactions_get_distinct_sessions(
     client: TestClient,
     signer: DiscordSigner,
     fake_discord: FakeDiscordRest,
+    fake_anthropic: FakeAnthropic,
     db: psycopg.Connection[tuple[Any, ...]],
 ) -> None:
+    fake_anthropic.script = [*answer("first"), *answer("second")]
     post(client, signer, ask_payload(interaction_id="1"))
     post(client, signer, ask_payload(interaction_id="2", token="t2"))
 
     ids = [r[0] for r in db.execute("SELECT id FROM sessions ORDER BY interaction_id")]
     assert len(set(ids)) == 2
-    assert [e[2] for e in fake_discord.edits] == [f"Received — session {i}" for i in ids]
+    assert [e[2] for e in fake_discord.edits] == ["first", "second"]
 
 
 def test_dm_ask_uses_top_level_user(
@@ -156,7 +175,8 @@ async def test_ack_is_sent_before_the_discord_edit_finishes(
             await anyio.sleep(0.5)
             events.append("edit-done")
 
-    app = create_app(settings=settings, discord=SlowDiscord())
+    model = FakeAnthropic(script=answer("slow"))
+    app = create_app(settings=settings, discord=SlowDiscord(), model=model)
     body = encode(ask_payload())
     headers = [(k.lower().encode(), v.encode()) for k, v in signer.headers(body).items()]
     headers.append((b"content-length", str(len(body)).encode()))

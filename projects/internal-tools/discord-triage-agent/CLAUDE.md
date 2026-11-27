@@ -55,3 +55,9 @@ Run from `projects/internal-tools/discord-triage-agent/` with `.venv` active (`p
 - Registering commands returns `403` / `50001 Missing Access` until the bot is invited to the guild with scopes `bot` + `applications.commands`.
 - Supabase auto-enables RLS on new tables, plain Postgres doesn't: enable RLS explicitly in every migration so tests see the same schema.
 - The quick-tunnel URL changes on every `cloudflared` start: update the Portal's Interactions Endpoint URL each session.
+- The Anthropic SDK retries timed-out requests, so a call can take `timeout × (max_retries + 1)`. Keep that under 2 min (now 45 s × 2, in `agent/client.py`).
+- Haiku 5.5 thinks by default. With a small `max_tokens` (the classifier's 256), set `thinking: {"type": "disabled"}` (allowed at effort `high` or below), or thinking can use up the answer.
+- `anthropic` 2.x is built on `httpx2`, not `httpx`. Test errors need `httpx2.Request`/`httpx2.Response`; `httpx` objects are rejected.
+- Discord rejects message content over 2000 characters. Send model text through `fit_message` (`discord/rest.py`), with `allowed_mentions: {"parse": []}`.
+- httpx error messages include the request URL, which contains the interaction token. Remove the token before storing or logging the error (see `agent/pipeline.py`).
+- Seed data loads with `python -m triage_agent.db.seed`, never as a migration. Like `MIGRATIONS_DIR`, `SEED_FILE` resolves relative to the source tree.

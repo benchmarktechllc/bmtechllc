@@ -31,7 +31,11 @@ async def test_edit_original_response_patches_the_webhook_message() -> None:
     req = seen[0]
     assert req.method == "PATCH"
     assert str(req.url) == f"{DISCORD_API}/webhooks/app-1/tok-1/messages/@original"
-    assert json.loads(req.content) == {"content": "Received — session abc"}
+    # Model text is untrusted: it must never ping @everyone, roles or users.
+    assert json.loads(req.content) == {
+        "content": "Received — session abc",
+        "allowed_mentions": {"parse": []},
+    }
     # Interaction webhooks are authorized by the token in the URL, not the bot token.
     assert "authorization" not in req.headers
     assert req.extensions["timeout"]["read"] == REQUEST_TIMEOUT_S
@@ -46,6 +50,23 @@ async def test_edit_original_response_raises_on_http_error() -> None:
         rest = HttpDiscordRest(bot_token=None, client=http)
         with pytest.raises(httpx.HTTPStatusError):
             await rest.edit_original_response("app-1", "tok-1", "x")
+
+
+@pytest.mark.anyio
+async def test_edit_original_response_caps_content_at_2000_characters() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"id": "m1"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        await HttpDiscordRest(bot_token=None, client=http).edit_original_response(
+            "app-1", "tok-1", "y" * 2500
+        )
+    content = json.loads(seen[0].content)["content"]
+    assert len(content) == 2000
+    assert content.endswith("…")
 
 
 def test_ask_command_definition() -> None:
