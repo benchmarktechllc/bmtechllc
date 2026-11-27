@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Pre-commit hook for projects/internal-tools/discord-triage-agent.
+# Install (from the repo root):
+#   ln -sf ../../projects/internal-tools/discord-triage-agent/scripts/pre-commit .git/hooks/pre-commit
+# Does nothing unless the commit stages files under this project.
+set -euo pipefail
+
+PROJECT="projects/internal-tools/discord-triage-agent"
+ROOT="$(git rev-parse --show-toplevel)"
+
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -q "^${PROJECT}/"; then
+  exit 0
+fi
+
+cd "${ROOT}/${PROJECT}"
+BIN=".venv/bin"
+if [[ ! -x "${BIN}/ruff" || ! -x "${BIN}/mypy" ]]; then
+  echo "pre-commit: missing ${PROJECT}/.venv; run: python3.12 -m venv .venv && .venv/bin/pip install -e '.[dev]'" >&2
+  exit 1
+fi
+
+echo "pre-commit: ruff check"
+"${BIN}/ruff" check .
+echo "pre-commit: ruff format --check"
+"${BIN}/ruff" format --check .
+echo "pre-commit: mypy --strict src"
+"${BIN}/mypy" --strict src

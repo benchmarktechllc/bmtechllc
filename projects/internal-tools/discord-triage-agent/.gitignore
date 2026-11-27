@@ -1,0 +1,13 @@
+# Secrets and local-only files
+.env
+CLAUDE.local.md
+
+# Python
+.venv/
+__pycache__/
+*.egg-info/
+build/
+dist/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/

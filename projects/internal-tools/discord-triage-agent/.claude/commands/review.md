@@ -1,0 +1,1 @@
+You didn't write this. Review the diff on this branch against docs/SPEC.md and the acceptance criteria for slice $ARGUMENTS in docs/TASKS.md. Find bugs, security holes, missing edge cases, performance problems and anything that doesn't match the spec. Rank by severity. Don't fix anything; write findings to docs/reviews/review-slice-$ARGUMENTS.md.
