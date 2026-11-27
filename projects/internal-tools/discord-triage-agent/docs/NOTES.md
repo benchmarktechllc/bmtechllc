@@ -15,6 +15,8 @@ Checks passed: `tool_use` continues the loop and `end_turn` stops it. A question
 
 Not confirmed from Discord itself: exactly one answer per `/ask`, and the approval message edited to show the decision with no buttons.
 
+Spend: the two demo sessions cost $0.0092 (two-part question) and $0.0124 (gated close). **Total live model spend so far: ≈ $0.52 of the $4 cap**, made up of $0.4585 for the Slice 2 live smoke (the script's own totals, grading included) and $0.0635 for all 6 Supabase sessions (4 from the Slice 3 live test, 2 from this demo; $0.0627 Sonnet, $0.0007 Haiku). The Supabase part is calculated from `traces` token counts at the `budget.py` prices (checked 2026-11-03), counting each model call once even when its turn ran parallel tools. It is not a billing figure; the Anthropic Console has the billed amount.
+
 Supabase test data changed: T-1001 is now `closed` (as T-1002 already was). Receipts in total: 2. Still open for later close tests: T-1005, T-1006, T-1008, T-1010 (T-1001 and T-1002 need reopening with SQL).
 
 Next: unchanged. The Fly.io deploy (TASKS.md, *After Slice 3*). The quick tunnel is stopped, so update the Portal URL next session.
