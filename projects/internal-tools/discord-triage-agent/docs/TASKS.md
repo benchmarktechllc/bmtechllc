@@ -38,7 +38,7 @@ Out of scope: model calls, classification, tools, traces, approvals, `Dockerfile
 ---
 
 ## Slice 2: Classify and answer with read tools
-**Status:** 🟡 Code done (2026-11-27). Tests, lint and typecheck pass with the scripted fake client. Still to do by hand: run `scripts/live_smoke.py` (costs money, capped at $4), then apply `002` + seed to Supabase and check one live `/ask` in the test guild.
+**Status:** 🟡 Code done and live smoke passed (2026-11-27). `scripts/live_smoke.py`: 20/20 sessions over the last 4 full runs, after two classifier prompt fixes; $0.46 total live spend (details in NOTES.md). Still to do by hand: apply `002` + seed to Supabase and check one live `/ask` in the test guild.
 
 Goal: A question about one or more synthetic tickets, such as `/ask what's the status of T-1002?`, gets one reply grounded in `get_ticket` and `search_kb` results that covers every concern, checked by a capped live run.
 

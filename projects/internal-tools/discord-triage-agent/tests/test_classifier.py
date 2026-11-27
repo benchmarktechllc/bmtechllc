@@ -280,3 +280,34 @@ async def test_classifier_api_error_becomes_other_and_is_traced(
         "SELECT stop_reason, error IS NOT NULL FROM traces WHERE session_id = %s", (session_id,)
     ).fetchone()
     assert row == (None, True)
+
+
+@pytest.mark.anyio
+async def test_classifier_prompt_keeps_a_problem_and_its_status_as_one_concern(
+    database_url: str, db: psycopg.Connection[tuple[Any, ...]]
+) -> None:
+    """Live smoke 2026-11-27: "the app crashes on PDFs (T-1005). Is there a fix yet?" was split
+    into a `bug` concern and an `other` "is there a fix" concern. The prompt must say a problem
+    and the question about its status/fix are one concern with the problem's category, and
+    `other` must no longer cover status questions in general."""
+    question = "Our iOS app keeps crashing when we open PDF attachments (T-1005). Is there a fix?"
+    session_id = insert_test_session(db, question)
+    model = FakeAnthropic(script=[classifier_reply([("crash on PDF attachments", "bug")])])
+    async with await psycopg.AsyncConnection.connect(database_url, autocommit=True) as conn:
+        await classify_session(conn, model, session_id, question)
+
+    system = model.requests[0].system or ""
+    assert "one concern" in system
+    assert "status, fix or next step" in system
+    assert "bare ticket status question" not in system
+
+
+def test_classifier_prompt_has_a_remediation_example_as_one_concern() -> None:
+    """Live smoke 2026-11-27 (2 of 4 runs): "Our webhooks stopped working… What do we need to
+    do?" split into bug + how_to. The prompt gives that shape, a broken thing plus "what do we
+    do", as an example of one concern in the problem's category, and says not to add a
+    separate how_to concern for the fix."""
+    from triage_agent.agent.prompts import CLASSIFIER_SYSTEM
+
+    assert "what do we need to do?" in CLASSIFIER_SYSTEM
+    assert "do not add a separate how_to concern" in CLASSIFIER_SYSTEM.lower()
