@@ -4,23 +4,24 @@
 
 | Area | Choice | Why |
 |---|---|---|
-| Language | Python 3.12 | Matches `article-aggregator` and `benchmark-cli-tool`. |
-| Packaging | `pyproject.toml` (hatchling), `src/triage_agent/{discord,agent,tools,db}/` | Same build backend and layout as sibling projects. |
+| Language | Python 3.12 | Mature `anthropic` SDK, PyNaCl and `psycopg`, and native asyncio for ACKing within 3 s while the loop runs in the background. |
+| Packaging | `pyproject.toml` (hatchling), `src/triage_agent/{discord,agent,tools,db}/` | One standard build config. The `src` layout makes tests import the installed package, and the four subpackages match the spec's boundaries (Discord I/O, loop, tools, database). |
 | Web framework | FastAPI + uvicorn | Async webhook that can ACK within Discord's 3 s deadline and hand the loop to a background task. |
 | Discord ingress | Slash-command interactions endpoint (no gateway), Ed25519 verification with PyNaCl | Needs no always-on socket and no privileged Message Content intent. Button clicks arrive at the same endpoint. |
 | Discord egress | `httpx` REST: edit the original response for replies within 15 min, bot token `POST /channels/{id}/messages` after that | Interaction tokens expire in 15 min, and approvals can take hours. |
 | Agent harness | `anthropic` SDK with a hand-written `while stop_reason == "tool_use"` loop | We own the gate, the trace per iteration and save/resume as plain, testable code. |
 | PreToolUse gate | A plain-code policy table checked before every tool execution, deny by default | Blocking must be deterministic and must not depend on prompts. |
 | Session resume | Reload the append-only `messages` rows from Supabase and append one user message holding every `tool_result` from the paused turn | The database *is* the session, so resume survives restarts, a closed laptop and later redeploys. |
-| Agent model | `claude-sonnet-5-5`, effort `low`, `max_tokens` 1024, 8-iteration cap, `fallbacks: "default"` (beta `server-side-fallback-2026-07-01`) | Good tool use at low cost within the ~$5 budget. The fallback retries refused requests on another model. |
+| Agent model | `claude-sonnet-5-5`, effort `low`, `max_tokens` 1024, 8-iteration cap, no server-side fallback | Good tool use at low cost within the ~$5 budget. Without a fallback, a refusal ends the session as the spec says, and every traced call ran on the named model at a known price. |
 | Classifier and fixture checks | `claude-haiku-5-5` with structured output (`output_config.format`), `max_tokens` 256 | A fixed-enum label at a tiny fraction of the agent's cost. |
-| Database | Supabase Postgres through `psycopg` 3, with plain SQL migrations in `migrations/` | Same driver as the sibling projects. A session-row lock plus a conditional `UPDATE … RETURNING` makes approvals race-safe and resumes each turn once, and RLS blocks the public API. |
-| Expiry and recovery | An asyncio sweep inside the app every 5 min and once at startup | A single process, with no separate scheduler. The startup pass catches approvals that expired while the app was stopped. |
+| Database | Supabase Postgres through `psycopg` 3, with plain SQL migrations in `migrations/` | `psycopg` 3 gives real transactions and async support over a plain Postgres connection. A session-row lock plus a conditional `UPDATE … RETURNING` makes approvals race-safe and resumes each turn once, and RLS blocks the public API. |
+| Expiry and recovery | An asyncio sweep inside the app every 5 min and once at startup, with an expiry pass and a recovery pass keyed on `sessions.heartbeat_at` | A single process, with no separate scheduler. The startup run catches approvals that expired and sessions that stalled while the app was stopped. |
+| Irreversible action | `close_ticket` updates the synthetic ticket and inserts its receipt in one transaction; running it again returns the stored receipt | A crash can't leave a closed ticket without a receipt, and a repeated resume can't close a ticket twice. |
 | Hosting, v1 | Local `uvicorn` plus a Cloudflare quick tunnel (`cloudflared tunnel --url http://localhost:8000`) | $0, no account needed, and a public HTTPS URL Discord can call. The URL changes on every start, so the Developer Portal endpoint is updated each session. |
 | Hosting, later | Fly.io, one `shared-cpu-1x` machine, `min_machines_running = 1` | A public HTTPS URL that doesn't sleep, so the 3 s PING never cold-starts. About $2–5/mo: Fly.io has no free tier for new accounts (only a short trial), so check first whether an older BMTech Fly organization still has the legacy free allowance and could run it at about $0. |
 | Test database | A local Postgres through the Supabase CLI (`supabase start`) or a Postgres container | Real transactions for the race tests, and tests never write to the hosted project. |
 | Tests | `pytest` with a scripted fake Anthropic client and mocked Discord; `scripts/live_smoke.py` for manual, capped live runs | CI costs $0, and live spend is bounded. |
-| Lint / types | `ruff`, `mypy --strict src` | Same quality gates as `article-aggregator`. |
+| Lint / types | `ruff`, `mypy --strict src` | Strict typing catches mistakes in the gate, resume and executor code, where a bug is costly. |
 | Secrets | A local `.env` that Git ignores in v1, then `fly secrets`, for `ANTHROPIC_API_KEY`, `DISCORD_PUBLIC_KEY`, `DISCORD_BOT_TOKEN` and `DATABASE_URL`, plus a committed `.env.example` | Keeps secrets out of Git at both stages. |
 
 ## Rejected
@@ -40,4 +41,5 @@
   - Actions stays the choice for CI.
 - **Oracle Cloud Always Free VM** as host: the only $0 option that is always on and meets the 3 s deadline without a rewrite, but we would run the server ourselves (HTTPS, OS updates, restarts) and signup needs a card. Fly.io's ~$2–5/mo is worth skipping that work.
 - **supabase-py / PostgREST**: it would put a service-role key in the app and lacks the transactions the approval race needs.
+- **Server-side model fallback** (`fallbacks: "default"`): it would retry refusals on another model, which contradicts the spec's refusal handling. It would also put calls into the trace and the cost meter at a model and price nobody chose.
 - **Opus for the agent**: costs more than this budget can absorb for a two-tool lookup task.
