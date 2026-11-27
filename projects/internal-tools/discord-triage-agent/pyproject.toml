@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "triage-agent"
+dynamic = ["version"]
+description = "Discord /ask triage agent with gated, approval-based ticket actions"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+  { name = "fanuel-mengistu" },
+]
+classifiers = [
+  "Private :: Do Not Upload",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "anthropic",
+  "fastapi",
+  "httpx",
+  "psycopg[binary]",
+  "pynacl",
+  "python-dotenv",
+  "uvicorn",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy",
+  "pytest",
+  "ruff",
+]
+
+[tool.hatch.version]
+path = "src/triage_agent/__about__.py"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
